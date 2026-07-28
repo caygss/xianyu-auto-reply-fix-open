@@ -180,6 +180,12 @@ docker compose up -d
 
 本项目按“现状”提供，不提供任何明示或暗示的保证；因使用本项目产生的风险、损失或责任，由使用者自行承担。
 
+## Windows compiled distribution
+
+This repository contains the complete corresponding source for the compiled Windows distribution. The Windows package may be sold as a compiled installation package or installation/support service, but it does not grant exclusive rights and does not prohibit modification or redistribution. See [open-source distribution notes](docs/open-source-distribution.md), [Windows distribution notes](docs/windows-distribution.md), and [listing copy](docs/xianyu-listing-copy.md).
+
+The compiled package contains no Python source files. Each release package includes `SOURCE-CODE.md` with the exact public source repository, release tag, and commit used to build it. Do not distribute runtime databases, cookies, browser sessions, logs, API keys, email credentials, or seller-specific links.
+
 ## Star History
 
 <a href="https://www.star-history.com/#GuDong2003/xianyu-auto-reply-fix&Date">

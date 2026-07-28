@@ -1015,7 +1015,8 @@ def get_updater() -> AutoUpdater:
         # 尝试从版本文件读取当前版本
         version = "1.0.0"
         try:
-            version_file = Path(__file__).parent / "static" / "version.txt"
+            from runtime_paths import app_root
+            version_file = app_root() / "static" / "version.txt"
             if version_file.exists():
                 version = version_file.read_text().strip()
         except:

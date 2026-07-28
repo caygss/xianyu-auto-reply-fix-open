@@ -6354,7 +6354,10 @@ Cookie数量: {cookie_count}
                             item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
                         except:
                             item_info['item_detail_parsed'] = {}
-                    logger.info(f"item_info: {item_info}")
+                    logger.info(
+                        f"item_info summary: cookie_id={cookie_id}, item_id={item_id}, "
+                        f"field_count={len(item_info)}, has_item_detail={bool(item_info.get('item_detail'))}"
+                    )
                     return item_info
                 return None
 

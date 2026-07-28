@@ -19,6 +19,14 @@ AUTO_REPLY:
   enabled: true
   max_retry: 3
   retry_interval: 5
+REPUBLISH:
+  enabled: false
+  dry_run: true
+  check_interval_seconds: 30
+  delay_seconds: 300
+  max_retries: 3
+  retry_backoff_seconds: [300, 900, 1800]
+  account_id: ''
 ITEM_DETAIL:
   auto_fetch:
     enabled: true  # 是否启用自动获取商品详情

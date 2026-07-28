@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Request, BackgroundTasks, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -23,6 +23,7 @@ import asyncio
 import concurrent.futures
 import queue
 from collections import defaultdict
+from dataclasses import replace
 
 import cookie_manager
 from db_manager import db_manager
@@ -53,6 +54,18 @@ from utils.notification_dispatcher import (
 )
 from chat_event_hub import chat_event_hub, publish_chat_message
 from order_event_hub import order_event_hub, publish_order_update_event
+from republish_models import RepublishTemplate
+from republish_store import (
+    RepublishStore,
+    RepublishStoreError,
+    RepublishTemplateConflictError,
+)
+from republish_template_service import (
+    build_template_from_item_info,
+    normalize_delivery_content,
+    safe_delivery_summary,
+)
+from runtime_paths import app_root
 
 from loguru import logger
 
@@ -65,7 +78,7 @@ except ImportError:
     CAPTCHA_ROUTER_AVAILABLE = False
 
 # 关键字文件路径
-KEYWORDS_FILE = Path(__file__).parent / "回复关键字.txt"
+KEYWORDS_FILE = app_root() / "回复关键字.txt"
 
 # 简单的用户认证配置
 ADMIN_USERNAME = "admin"
@@ -173,7 +186,7 @@ def _get_announcement_remote_url() -> str:
 
 def _get_announcement_local_path() -> Path:
     file_path = str(os.getenv('DASHBOARD_ANNOUNCEMENT_FILE') or 'announcement.json').strip().lstrip('/')
-    return Path(__file__).parent / file_path
+    return app_root() / file_path
 
 
 def _parse_announcement_datetime(value: Any) -> Optional[datetime]:
@@ -1252,7 +1265,7 @@ async def log_requests(request, call_next):
 
 # 提供前端静态文件
 import os
-static_dir = os.path.join(os.path.dirname(__file__), 'static')
+static_dir = str(app_root() / 'static')
 if not os.path.exists(static_dir):
     os.makedirs(static_dir, exist_ok=True)
 
@@ -15907,6 +15920,353 @@ async def toggle_scheduled_task(task_id: int, current_user: Dict[str, Any] = Dep
     except Exception as e:
         logger.error(f"切换定时任务状态异常: {str(e)}")
         return {"success": False, "message": f"操作异常: {str(e)}"}
+
+
+# ==================== 本地自动补发管理 API ====================
+
+_REPUBLISH_STORE = None
+_REPUBLISH_RUNTIME_INFO = {"dry_run": True}
+
+
+class RepublishTemplateCreateRequest(BaseModel):
+    cookie_id: str
+    item_id: str
+    delivery_content: str
+    sku_delivery: Optional[Dict[str, str]] = None
+    auto_delivery: Optional[bool] = True
+    auto_republish: Optional[bool] = True
+    auto_delivery_enabled: Optional[bool] = None
+    auto_republish_enabled: Optional[bool] = None
+    paused: bool = False
+
+
+class RepublishTemplateUpdateRequest(BaseModel):
+    delivery_content: Optional[str] = None
+    sku_delivery: Optional[Dict[str, str]] = None
+    auto_delivery: Optional[bool] = None
+    auto_republish: Optional[bool] = None
+    auto_delivery_enabled: Optional[bool] = None
+    auto_republish_enabled: Optional[bool] = None
+
+
+class RepublishPauseRequest(BaseModel):
+    paused: bool = True
+
+
+def _get_republish_store() -> RepublishStore:
+    """Open the shared local store lazily so importing the web app stays cheap."""
+
+    global _REPUBLISH_STORE
+    if _REPUBLISH_STORE is None:
+        _REPUBLISH_STORE = RepublishStore(os.path.join("data", "xianyu_data.db"))
+    return _REPUBLISH_STORE
+
+
+def set_republish_runtime_info(*, dry_run: bool) -> None:
+    """Expose only non-sensitive runtime state to the local management UI."""
+    global _REPUBLISH_RUNTIME_INFO
+    _REPUBLISH_RUNTIME_INFO = {"dry_run": bool(dry_run)}
+
+
+def _republish_fields_set(request: BaseModel) -> set[str]:
+    fields = getattr(request, "model_fields_set", None)
+    if fields is None:
+        fields = getattr(request, "__fields_set__", set())
+    return set(fields)
+
+
+def _republish_flag(request: BaseModel, primary: str, alias: str, default: Optional[bool]) -> Optional[bool]:
+    fields = _republish_fields_set(request)
+    if alias in fields:
+        return getattr(request, alias)
+    if primary in fields:
+        return getattr(request, primary)
+    return default
+
+
+def _public_republish_error(value: Any) -> Optional[str]:
+    """Expose only short internal reason codes, never raw logs or URLs."""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or len(text) > 80 or "://" in text:
+        return "redacted_error"
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", text):
+        return "redacted_error"
+    return text
+
+
+def _republish_job_summary(job: Any) -> Dict[str, Any]:
+    return {
+        "job_id": job.job_id,
+        "template_id": job.template_id,
+        "source_item_id": job.source_item_id,
+        "old_item_id": job.old_item_id,
+        "new_item_id": job.new_item_id,
+        "status": job.status,
+        "attempts": job.attempts,
+        "available_at": job.available_at,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "error": _public_republish_error(job.last_error),
+    }
+
+
+def _republish_template_summary(
+    store: RepublishStore,
+    template: RepublishTemplate,
+    latest_jobs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if latest_jobs is None:
+        latest_jobs = store.list_latest_jobs_by_template_ids([template.template_id])
+    latest_job = latest_jobs.get(template.template_id)
+    return {
+        "template_id": template.template_id,
+        "cookie_id": template.cookie_id,
+        "current_item_id": template.current_item_id,
+        "title": template.title,
+        "auto_delivery": template.auto_delivery,
+        "auto_republish": template.auto_republish,
+        "paused": template.paused,
+        "delivery_summary": safe_delivery_summary(template.delivery_content),
+        "last_result": (
+            {
+                "status": latest_job.status,
+                "job_id": latest_job.job_id,
+                "old_item_id": latest_job.old_item_id,
+                "new_item_id": latest_job.new_item_id,
+                "error": _public_republish_error(latest_job.last_error),
+            }
+            if latest_job is not None
+            else {"status": "ready", "job_id": None, "error": None}
+        ),
+    }
+
+
+def _republish_template_detail(store: RepublishStore, template: RepublishTemplate) -> Dict[str, Any]:
+    detail = _republish_template_summary(store, template)
+    detail.update(
+        {
+            "delivery_content": template.delivery_content,
+            "sku_delivery": dict(template.sku_delivery),
+        }
+    )
+    return detail
+
+
+def _ensure_republish_template_access(template_id: str, current_user: Dict[str, Any]) -> RepublishTemplate:
+    store = _get_republish_store()
+    template = store.get_template(template_id=str(template_id or "").strip())
+    if template is None:
+        raise HTTPException(status_code=404, detail="补发模板不存在")
+    _ensure_cookie_access(template.cookie_id, current_user)
+    return template
+
+
+def _ensure_single_owned_republish_account(cookie_id: str, current_user: Dict[str, Any]) -> None:
+    owned_cookie_ids = set(_get_user_cookies_map(current_user))
+    store = _get_republish_store()
+    other_accounts = {
+        template.cookie_id
+        for template in store.list_templates()
+        if template.cookie_id in owned_cookie_ids and template.cookie_id != cookie_id
+    }
+    if other_accounts:
+        raise HTTPException(status_code=400, detail="自动补发目前只支持一个闲鱼账号")
+
+
+def _build_republish_template_or_400(**kwargs: Any) -> RepublishTemplate:
+    try:
+        return build_template_from_item_info(**kwargs)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"商品模板配置无效: {str(exc)}") from exc
+
+
+@app.get("/api/republish/templates")
+def list_republish_templates(
+    cookie_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    cleaned_cookie_id = _ensure_cookie_access(cookie_id, current_user)
+    store = _get_republish_store()
+    try:
+        templates = store.list_templates(cookie_id=cleaned_cookie_id)
+        latest_jobs = store.list_latest_jobs_by_template_ids(
+            [template.template_id for template in templates]
+        )
+        return {
+            "templates": [
+                _republish_template_summary(store, template, latest_jobs) for template in templates
+            ],
+            "dry_run": bool(_REPUBLISH_RUNTIME_INFO.get("dry_run", True)),
+        }
+    except RepublishStoreError as exc:
+        logger.error(f"读取自动补发模板失败: {type(exc).__name__}")
+        raise HTTPException(status_code=500, detail="读取自动补发模板失败") from exc
+
+
+@app.get("/api/republish/templates/{template_id}")
+def get_republish_template_detail(
+    template_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    template = _ensure_republish_template_access(template_id, current_user)
+    store = _get_republish_store()
+    try:
+        return {
+            "template": _republish_template_detail(store, template),
+            "dry_run": bool(_REPUBLISH_RUNTIME_INFO.get("dry_run", True)),
+        }
+    except RepublishStoreError as exc:
+        logger.error(f"读取自动补发模板详情失败: {type(exc).__name__}")
+        raise HTTPException(status_code=500, detail="读取自动补发模板详情失败") from exc
+
+
+@app.post("/api/republish/templates")
+def create_republish_template(
+    request: RepublishTemplateCreateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    cleaned_cookie_id = _ensure_cookie_access(request.cookie_id, current_user)
+    cleaned_item_id = str(request.item_id or "").strip()
+    if not cleaned_item_id:
+        raise HTTPException(status_code=400, detail="商品 ID 不能为空")
+    _ensure_single_owned_republish_account(cleaned_cookie_id, current_user)
+    store = _get_republish_store()
+    item_info = db_manager.get_item_info(cleaned_cookie_id, cleaned_item_id)
+    if not item_info:
+        raise HTTPException(status_code=404, detail="商品不存在，请先同步商品详情")
+    delivery_content = request.delivery_content
+    auto_delivery = _republish_flag(request, "auto_delivery", "auto_delivery_enabled", True)
+    auto_republish = _republish_flag(request, "auto_republish", "auto_republish_enabled", True)
+    template = _build_republish_template_or_400(
+        cookie_id=cleaned_cookie_id,
+        item_id=cleaned_item_id,
+        item_info=item_info,
+        delivery_content=delivery_content,
+        sku_delivery=request.sku_delivery or {},
+        auto_delivery=bool(auto_delivery),
+        auto_republish=bool(auto_republish),
+        paused=bool(request.paused),
+    )
+    try:
+        saved = store.create_template(template)
+    except RepublishTemplateConflictError as exc:
+        raise HTTPException(status_code=409, detail="该商品已经配置自动补发模板") from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="保存自动补发模板失败") from exc
+    except RepublishStoreError as exc:
+        logger.error(f"保存自动补发模板失败: {type(exc).__name__}")
+        raise HTTPException(status_code=500, detail="保存自动补发模板失败") from exc
+    return {"template": _republish_template_summary(store, saved)}
+
+
+@app.patch("/api/republish/templates/{template_id}")
+def update_republish_template(
+    template_id: str,
+    request: RepublishTemplateUpdateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    template = _ensure_republish_template_access(template_id, current_user)
+    fields = _republish_fields_set(request)
+    if not fields:
+        raise HTTPException(status_code=400, detail="没有可更新的模板字段")
+    delivery_content = (
+        request.delivery_content
+        if "delivery_content" in fields
+        else template.delivery_content
+    )
+    sku_delivery = request.sku_delivery if "sku_delivery" in fields else template.sku_delivery
+    auto_delivery = _republish_flag(request, "auto_delivery", "auto_delivery_enabled", template.auto_delivery)
+    auto_republish = _republish_flag(request, "auto_republish", "auto_republish_enabled", template.auto_republish)
+    updated = _build_republish_template_or_400(
+        cookie_id=template.cookie_id,
+        item_id=template.current_item_id,
+        item_info=template.to_dict(),
+        delivery_content=delivery_content,
+        sku_delivery=sku_delivery or {},
+        auto_delivery=bool(auto_delivery),
+        auto_republish=bool(auto_republish),
+        paused=template.paused,
+        template_id=template.template_id,
+    )
+    try:
+        saved = _get_republish_store().upsert_template(updated)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="更新自动补发模板失败") from exc
+    except RepublishStoreError as exc:
+        logger.error(f"更新自动补发模板失败: {type(exc).__name__}")
+        raise HTTPException(status_code=500, detail="更新自动补发模板失败") from exc
+    return {"template": _republish_template_summary(_get_republish_store(), saved)}
+
+
+@app.post("/api/republish/templates/{template_id}/pause")
+def pause_republish_template(
+    template_id: str,
+    request: Optional[RepublishPauseRequest] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    template = _ensure_republish_template_access(template_id, current_user)
+    paused = True if request is None else bool(request.paused)
+    updated = replace(template, paused=paused)
+    store = _get_republish_store()
+    try:
+        saved = store.upsert_template(updated)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="更新自动补发暂停状态失败") from exc
+    except RepublishStoreError as exc:
+        logger.error(f"更新自动补发暂停状态失败: {type(exc).__name__}")
+        raise HTTPException(status_code=500, detail="更新自动补发暂停状态失败") from exc
+    return {"template": _republish_template_summary(store, saved)}
+
+
+@app.post("/api/republish/templates/{template_id}/check-now")
+def check_republish_template_now(
+    template_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    template = _ensure_republish_template_access(template_id, current_user)
+    if template.paused:
+        raise HTTPException(status_code=409, detail="模板已暂停，请先恢复后再检查")
+    store = _get_republish_store()
+    try:
+        job = store.enqueue_after_delivery(
+            template.template_id,
+            template.current_item_id,
+            f"manual-check-{uuid.uuid4().hex}",
+            available_at=time.time(),
+            order_context={},
+        )
+    except (TypeError, ValueError, RepublishStoreError) as exc:
+        logger.error(f"创建自动补发检查任务失败: {type(exc).__name__}")
+        raise HTTPException(status_code=400, detail="创建自动补发检查任务失败") from exc
+    if job is None:
+        raise HTTPException(status_code=409, detail="模板当前不可创建检查任务")
+    return {"job": _republish_job_summary(job), "dry_run_checked_by_worker": True}
+
+
+@app.get("/api/republish/jobs")
+def list_republish_jobs(
+    cookie_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    limit: int = Query(50, ge=1, le=100),
+):
+    cleaned_cookie_id = _ensure_cookie_access(cookie_id, current_user)
+    raw_limit = getattr(limit, "default", limit)
+    try:
+        normalized_limit = int(raw_limit)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="任务数量限制无效") from exc
+    if isinstance(raw_limit, bool) or normalized_limit < 1 or normalized_limit > 100:
+        raise HTTPException(status_code=400, detail="任务数量限制必须在 1 到 100 之间")
+    store = _get_republish_store()
+    try:
+        jobs = store.list_recent_jobs(cleaned_cookie_id, limit=normalized_limit)
+        return {"jobs": [_republish_job_summary(job) for job in jobs]}
+    except RepublishStoreError as exc:
+        logger.error(f"读取自动补发任务失败: {type(exc).__name__}")
+        raise HTTPException(status_code=500, detail="读取自动补发任务失败") from exc
 
 
 # ==================== 定时任务调度器 ====================

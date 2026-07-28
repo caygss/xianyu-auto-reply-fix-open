@@ -1937,7 +1937,8 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】清理日志文件时出错: {self._safe_str(e)}")
             return 0
 
-    def __init__(self, cookies_str=None, cookie_id: str = "default", user_id: int = None, *, register_instance: bool = True):
+    def __init__(self, cookies_str=None, cookie_id: str = "default", user_id: int = None, *,
+                 register_instance: bool = True, republish_coordinator: Any = None):
         """初始化闲鱼直播类"""
         logger.info(f"【{cookie_id}】开始初始化XianyuLive...")
 
@@ -1957,6 +1958,7 @@ class XianyuLive:
         self.cookies_str = cookies_str  # 保存原始cookie字符串
         self.user_id = user_id  # 保存用户ID，用于token刷新时保持正确的所有者关系
         self.register_instance = bool(register_instance)
+        self.republish_coordinator = republish_coordinator
         self.base_url = WEBSOCKET_URL
 
         if 'unb' not in self.cookies:
@@ -2205,6 +2207,95 @@ class XianyuLive:
     def get_instance_count(cls):
         """获取当前活跃实例数量"""
         return len(cls._instances)
+
+    def set_republish_coordinator(self, coordinator: Any = None) -> None:
+        """Attach the optional post-delivery republish coordinator."""
+        self.republish_coordinator = coordinator
+
+    @staticmethod
+    def _copy_republish_sku_fields(source: Any) -> Dict[str, Any]:
+        if not isinstance(source, dict):
+            return {}
+
+        fields = ('sku_id', 'skuId', 'sku_name', 'spec_id', 'spec_name')
+        result: Dict[str, Any] = {}
+        for field_name in fields:
+            value = source.get(field_name)
+            if isinstance(value, (str, int, float, bool)) and not (
+                isinstance(value, float) and (value != value or value in (float('inf'), float('-inf')))
+            ):
+                result[field_name] = value
+        return result
+
+    def _build_republish_order_context(self, order_id: str) -> Dict[str, Any]:
+        """Return only SKU selectors needed by the republish template resolver."""
+        if not order_id:
+            return {}
+
+        try:
+            order = db_manager.get_order_by_id(order_id)
+            if not isinstance(order, dict):
+                return {}
+            context = self._copy_republish_sku_fields(order)
+            sku_info = self._copy_republish_sku_fields(order.get('sku_info'))
+            if sku_info:
+                context['sku_info'] = sku_info
+            json.dumps(context, ensure_ascii=False, allow_nan=False)
+            return context
+        except Exception:
+            return {}
+
+    def _notify_republish_after_delivery_finalized(
+        self,
+        order_id: str,
+        item_id: str,
+        previous_status: str,
+        persisted_status: str,
+        order_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Best-effort enqueue after a newly persisted shipped order state."""
+        coordinator = getattr(self, 'republish_coordinator', None)
+        if coordinator is None or not order_id or not item_id:
+            return
+
+        normalized_previous = db_manager._normalize_order_status(previous_status)
+        normalized_persisted = db_manager._normalize_order_status(persisted_status)
+        if normalized_previous == 'shipped' or normalized_persisted != 'shipped':
+            return
+        if normalized_previous not in {
+            'processing',
+            'pending_payment',
+            'pending_ship',
+            'partial_success',
+            'partial_pending_finalize',
+        }:
+            return
+
+        try:
+            order = db_manager.get_order_by_id(order_id)
+            if not isinstance(order, dict):
+                return
+            current_status = db_manager._normalize_order_status(order.get('order_status'))
+            if current_status != 'shipped':
+                return
+            if current_status in {'refunding', 'refund_cancelled', 'cancelled', 'completed'}:
+                return
+            raw_context = order_context if order_context is not None else self._build_republish_order_context(order_id)
+            context = self._copy_republish_sku_fields(raw_context)
+            sku_info = self._copy_republish_sku_fields(
+                raw_context.get('sku_info') if isinstance(raw_context, dict) else None
+            )
+            if sku_info:
+                context['sku_info'] = sku_info
+            json.dumps(context, ensure_ascii=False, allow_nan=False)
+            coordinator.on_delivery_finalized(
+                order_id,
+                self.cookie_id,
+                item_id,
+                context,
+            )
+        except Exception:
+            logger.warning("delivery_republish_hook_failed")
 
     @classmethod
     def is_manual_refresh_active(cls, cookie_id: str, allow_handoff_recovery: bool = False) -> bool:
@@ -4305,6 +4396,15 @@ class XianyuLive:
                     logger.warning(
                         f"【{self.cookie_id}】发布部分发货实时事件失败: order_id={order_id}, error={self._safe_str(publish_e)}"
                     )
+            if success and status_to_write == 'shipped' and previous_status != 'shipped':
+                persisted_order = db_manager.get_order_by_id(order_id) if order_id else None
+                persisted_item_id = persisted_order.get('item_id') if isinstance(persisted_order, dict) else None
+                self._notify_republish_after_delivery_finalized(
+                    order_id=order_id,
+                    item_id=persisted_item_id,
+                    previous_status=previous_status,
+                    persisted_status=status_to_write,
+                )
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】写入订单聚合发货状态失败: {self._safe_str(e)}")
 
@@ -17766,7 +17866,14 @@ class XianyuLive:
             self._unregister_instance()
             logger.info(f"【{self.cookie_id}】XianyuLive主程序已完全退出")
 
-    async def get_item_list_info(self, page_number=1, page_size=20, retry_count=0, sync_item_details=False):
+    async def get_item_list_info(
+        self,
+        page_number=1,
+        page_size=20,
+        retry_count=0,
+        sync_item_details=False,
+        quiet=False,
+    ):
         """获取商品信息，自动处理token失效的情况
 
         Args:
@@ -17776,6 +17883,8 @@ class XianyuLive:
             sync_item_details (bool): 是否同步已存在商品的最新详情
         """
         if retry_count >= 4:  # 最多重试3次
+            if quiet:
+                return {"success": False, "error": "republish_active_item_query_failed"}
             logger.error("获取商品信息失败，重试次数过多")
             return {"error": "获取商品信息失败，重试次数过多"}
 
@@ -17812,11 +17921,12 @@ class XianyuLive:
         # 始终从最新的cookies中获取_m_h5_tk token（刷新后cookies会被更新）
         token = trans_cookies(self.cookies_str).get('_m_h5_tk', '').split('_')[0] if trans_cookies(self.cookies_str).get('_m_h5_tk') else ''
 
-        logger.warning(f"准备获取商品列表，token: {token}")
-        if token:
-            logger.warning(f"使用cookies中的_m_h5_tk token: {self._mask_secret_value(token, head=6, tail=4)}")
-        else:
-            logger.warning("cookies中没有找到_m_h5_tk token")
+        if not quiet:
+            logger.warning(f"准备获取商品列表，token: {token}")
+            if token:
+                logger.warning(f"使用cookies中的_m_h5_tk token: {self._mask_secret_value(token, head=6, tail=4)}")
+            else:
+                logger.warning("cookies中没有找到_m_h5_tk token")
 
         # 生成签名
         data_val = json.dumps(data, separators=(',', ':'))
@@ -17834,11 +17944,31 @@ class XianyuLive:
                 if await self._apply_response_cookie_updates(response.headers, "item_list"):
                     logger.warning("已更新Cookie到数据库")
 
-                logger.info(f"商品信息获取响应: {res_json}")
+                if not quiet:
+                    logger.info(f"商品信息获取响应: {res_json}")
 
                 # 检查响应是否成功
                 if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
                     items_data = res_json.get('data', {})
+                    if quiet:
+                        if not isinstance(items_data, dict):
+                            return {"success": False, "error": "republish_active_item_query_failed"}
+                        card_list = items_data.get('cardList')
+                        if not isinstance(card_list, list):
+                            return {"success": False, "error": "republish_active_item_query_failed"}
+                        item_ids = set()
+                        for card in card_list:
+                            if not isinstance(card, dict):
+                                return {"success": False, "error": "republish_active_item_query_failed"}
+                            card_data = card.get('cardData')
+                            if not isinstance(card_data, dict):
+                                return {"success": False, "error": "republish_active_item_query_failed"}
+                            item_id = card_data.get('id')
+                            if not isinstance(item_id, (str, int)) or isinstance(item_id, bool) or not str(item_id):
+                                return {"success": False, "error": "republish_active_item_query_failed"}
+                            item_ids.add(str(item_id))
+                        return {"success": True, "item_ids": item_ids}
+
                     # 从cardList中提取商品信息
                     card_list = items_data.get('cardList', [])
 
@@ -17912,19 +18042,34 @@ class XianyuLive:
                     # 检查是否是token失效
                     error_msg = res_json.get('ret', [''])[0] if res_json.get('ret') else ''
                     if 'FAIL_SYS_TOKEN_EXOIRED' in error_msg or 'token' in error_msg.lower():
-                        logger.warning(f"Token失效，准备重试: {error_msg}")
+                        if not quiet:
+                            logger.warning(f"Token失效，准备重试: {error_msg}")
                         await asyncio.sleep(0.5)
                         return await self.get_item_list_info(
                             page_number,
                             page_size,
                             retry_count + 1,
                             sync_item_details=sync_item_details,
+                            quiet=quiet,
                         )
                     else:
+                        if quiet:
+                            return {"success": False, "error": "republish_active_item_query_failed"}
                         logger.error(f"获取商品信息失败: {res_json}")
                         return {"error": f"获取商品信息失败: {error_msg}"}
 
         except Exception as e:
+            if quiet:
+                if retry_count >= 3:
+                    return {"success": False, "error": "republish_active_item_query_failed"}
+                await asyncio.sleep(0.5)
+                return await self.get_item_list_info(
+                    page_number,
+                    page_size,
+                    retry_count + 1,
+                    sync_item_details=False,
+                    quiet=True,
+                )
             logger.error(f"商品信息API请求异常: {self._safe_str(e)}")
             await asyncio.sleep(0.5)
             return await self.get_item_list_info(
@@ -17996,6 +18141,36 @@ class XianyuLive:
             "total_saved": total_saved,
             "items": all_items
         }
+
+    async def get_active_item_ids_for_republish(self):
+        """Return only active item IDs for the republish availability check."""
+        active_ids = set()
+        page_number = 1
+        page_size = 100
+        while page_number <= 100:
+            try:
+                result = await self.get_item_list_info(
+                    page_number=page_number,
+                    page_size=page_size,
+                    quiet=True,
+                )
+            except Exception:
+                raise RuntimeError("republish_active_item_query_failed") from None
+            if not isinstance(result, dict) or result.get('success') is not True:
+                raise RuntimeError("republish_active_item_query_failed")
+            item_ids = result.get('item_ids')
+            if not isinstance(item_ids, (set, frozenset, list, tuple)):
+                raise RuntimeError("republish_active_item_query_failed")
+            page_ids = {
+                str(item_id)
+                for item_id in item_ids
+                if isinstance(item_id, (str, int)) and not isinstance(item_id, bool)
+            }
+            active_ids.update(page_ids)
+            if len(page_ids) < page_size:
+                return active_ids
+            page_number += 1
+        raise RuntimeError("republish_active_item_query_failed")
 
     def _get_item_polish_module(self):
         from item_polish_module import ItemPolishModule

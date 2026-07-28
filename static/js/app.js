@@ -39,6 +39,11 @@ let totalItemsPages = 0; // 总页数
 let currentSearchKeyword = ''; // 当前搜索关键词
 let itemPublishPreviewUrls = [];
 let itemPublishInitialized = false;
+let republishTemplatesByItem = {};
+let republishJobsByCookie = {};
+let republishRuntimeInfo = { dry_run: true };
+let republishModalState = { cookieId: '', itemId: '', templateId: '' };
+let republishDataRequestId = 0;
 let itemPublishSubmitting = false;
 let itemPublishSavingMaterial = false;
 let itemPublishLoadedMaterialId = null;
@@ -11992,9 +11997,284 @@ async function loadItemsByCookie() {
 }
 
 // 显示商品列表
+function republishItemKey(cookieId, itemId) {
+    return `${String(cookieId || '')}::${String(itemId || '')}`;
+}
+
+function republishPayloadList(payload, key) {
+    if (Array.isArray(payload)) return payload;
+    if (Array.isArray(payload?.[key])) return payload[key];
+    if (Array.isArray(payload?.data?.[key])) return payload.data[key];
+    return [];
+}
+
+function republishShortText(value, maxLength = 80) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
+}
+
+function republishApiError(response, payload) {
+    const message = payload?.message || payload?.detail || `HTTP ${response.status}`;
+    const error = new Error(String(message));
+    error.status = response.status;
+    return error;
+}
+
+async function republishApiRequest(path, options = {}) {
+    const headers = {
+        ...(options.body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        'Authorization': `Bearer ${authToken}`,
+        ...(options.headers || {})
+    };
+    const response = await fetch(`${apiBase}${path}`, { ...options, headers });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw republishApiError(response, payload);
+    return payload;
+}
+
+function republishTemplateFromPayload(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    const template = payload.template && typeof payload.template === 'object' ? payload.template : payload;
+    if (!template.template_id || !template.cookie_id || !template.current_item_id) return null;
+    return template;
+}
+
+function getRepublishTemplate(cookieId, itemId) {
+    return republishTemplatesByItem[republishItemKey(cookieId, itemId)] || null;
+}
+
+function getRepublishJob(template) {
+    if (!template) return null;
+    const jobs = republishJobsByCookie[String(template.cookie_id)] || [];
+    return jobs.find(job => String(job.template_id || '') === String(template.template_id || '')) || null;
+}
+
+async function loadRepublishData(cookieIds) {
+    const requestId = ++republishDataRequestId;
+    const uniqueCookieIds = [...new Set((cookieIds || []).map(value => String(value || '').trim()).filter(Boolean))];
+    const templatesByItem = {};
+    const jobsByCookie = {};
+    let runtimeInfo = { dry_run: true };
+
+    await Promise.all(uniqueCookieIds.map(async cookieId => {
+        try {
+            const templatePayload = await republishApiRequest(`/api/republish/templates?cookie_id=${encodeURIComponent(cookieId)}`);
+            republishPayloadList(templatePayload, 'templates').forEach(template => {
+                const normalized = republishTemplateFromPayload(template);
+                if (normalized) templatesByItem[republishItemKey(normalized.cookie_id, normalized.current_item_id)] = normalized;
+            });
+            const candidate = templatePayload?.dry_run ?? templatePayload?.data?.dry_run;
+            if (typeof candidate === 'boolean') runtimeInfo.dry_run = candidate;
+        } catch (error) {
+            console.debug('republish template list unavailable', error.status || error.message);
+        }
+
+        try {
+            const jobPayload = await republishApiRequest(`/api/republish/jobs?cookie_id=${encodeURIComponent(cookieId)}`);
+            jobsByCookie[cookieId] = republishPayloadList(jobPayload, 'jobs');
+        } catch (error) {
+            jobsByCookie[cookieId] = [];
+            console.debug('republish job list unavailable', error.status || error.message);
+        }
+    }));
+
+    if (requestId !== republishDataRequestId) return;
+    republishTemplatesByItem = templatesByItem;
+    republishJobsByCookie = jobsByCookie;
+    republishRuntimeInfo = runtimeInfo;
+    displayCurrentPageItems();
+}
+
+function ensureRepublishTableHeader() {
+    const table = document.getElementById('itemsTableBody')?.closest('table');
+    const headerRow = table?.querySelector('thead tr');
+    if (!headerRow || headerRow.querySelector('[data-republish-column]')) return;
+    const header = document.createElement('th');
+    header.dataset.republishColumn = 'true';
+    header.style.width = '18%';
+    header.textContent = '自动发货 / 重新上架';
+    headerRow.insertBefore(header, headerRow.lastElementChild);
+}
+
+let republishEventDelegationInitialized = false;
+function initRepublishEventDelegation() {
+    if (republishEventDelegationInitialized || typeof document === 'undefined') return;
+    document.addEventListener('click', event => {
+        const actionElement = event.target.closest?.('[data-republish-action]');
+        if (!actionElement) return;
+        const action = actionElement.dataset.republishAction;
+        if (action === 'open') void openRepublishConfig(actionElement.dataset.cookieId, actionElement.dataset.itemId);
+        else if (action === 'pause') void toggleRepublishPause(actionElement.dataset.templateId, actionElement.dataset.paused === 'true');
+        else if (action === 'check') void checkRepublishNow(actionElement.dataset.templateId);
+        else if (action === 'save') void saveRepublishTemplate();
+        else if (action === 'add-sku') addRepublishSkuRow();
+        else if (action === 'remove-sku') actionElement.closest('.republish-sku-row')?.remove();
+    });
+    republishEventDelegationInitialized = true;
+}
+
+function displayRepublishStatus(item) {
+    initRepublishEventDelegation();
+    const cookieId = String(item.cookie_id || '');
+    const itemId = String(item.item_id || '');
+    const template = getRepublishTemplate(cookieId, itemId);
+    if (!template) {
+        return `<div class="republish-status republish-status-empty"><span class="badge text-bg-light">未配置</span>
+            <button type="button" class="btn btn-sm btn-outline-primary" data-republish-action="open" data-cookie-id="${escapeHtml(cookieId)}" data-item-id="${escapeHtml(itemId)}">配置</button></div>`;
+    }
+    const job = getRepublishJob(template);
+    const status = String(template.last_status || job?.status || '').toLowerCase();
+    const statusText = template.paused ? '已暂停' : (status === 'succeeded' ? '最近成功' :
+        status === 'manual_required' ? '需人工处理' : status === 'retrying' ? '等待重试' :
+        status === 'running' ? '执行中' : status === 'pending' ? '排队中' : '已配置');
+    const statusClass = template.paused ? 'text-bg-secondary' : status === 'succeeded' ? 'text-bg-success' :
+        status === 'manual_required' ? 'text-bg-warning' : status === 'retrying' || status === 'running' ? 'text-bg-info' : 'text-bg-primary';
+    const summary = republishShortText(template.delivery_summary || template.delivery_content_summary || '已保存网盘内容');
+    const result = republishShortText(template.last_result?.error || template.last_error_summary || template.last_result_summary || job?.error || job?.error_summary || '');
+    const pauseAction = template.paused
+        ? `<button type="button" class="btn btn-sm btn-outline-success" data-republish-action="pause" data-template-id="${escapeHtml(template.template_id)}" data-paused="true">恢复</button>`
+        : `<button type="button" class="btn btn-sm btn-outline-secondary" data-republish-action="pause" data-template-id="${escapeHtml(template.template_id)}" data-paused="false">暂停</button>`;
+    return `<div class="republish-status"><div class="republish-status-badges">
+        <span class="badge ${statusClass}">${statusText}</span>
+        <span class="badge ${template.auto_delivery ? 'text-bg-success' : 'text-bg-light'}">发货${template.auto_delivery ? '开' : '关'}</span>
+        <span class="badge ${template.auto_republish ? 'text-bg-success' : 'text-bg-light'}">补发${template.auto_republish ? '开' : '关'}</span>
+    </div><div class="republish-status-summary" title="${escapeHtml(summary)}">${escapeHtml(summary)}</div>
+    ${result ? `<div class="republish-status-result" title="${escapeHtml(result)}">${escapeHtml(result)}</div>` : ''}
+    <div class="republish-status-actions"><button type="button" class="btn btn-sm btn-outline-primary" data-republish-action="open" data-cookie-id="${escapeHtml(cookieId)}" data-item-id="${escapeHtml(itemId)}">配置</button>
+        ${pauseAction}<button type="button" class="btn btn-sm btn-outline-info" data-republish-action="check" data-template-id="${escapeHtml(template.template_id)}">立即检查</button>
+    </div></div>`;
+}
+
+function republishSkuRowsHtml(skuDelivery) {
+    const entries = skuDelivery && typeof skuDelivery === 'object' && !Array.isArray(skuDelivery) ? Object.entries(skuDelivery) : [];
+    return entries.map(([sku, content]) => `<div class="republish-sku-row input-group mb-2">
+        <input type="text" class="form-control" data-republish-sku-key value="${escapeHtml(sku)}" placeholder="SKU / 规格">
+        <input type="text" class="form-control" data-republish-sku-value value="${escapeHtml(content)}" placeholder="该 SKU 的网盘链接或文本">
+        <button type="button" class="btn btn-outline-danger" data-republish-action="remove-sku" aria-label="删除 SKU 覆盖">删除</button></div>`).join('');
+}
+
+function addRepublishSkuRow() {
+    const container = document.getElementById('republishSkuRows');
+    if (!container) return;
+    container.insertAdjacentHTML('beforeend', `<div class="republish-sku-row input-group mb-2">
+        <input type="text" class="form-control" data-republish-sku-key placeholder="SKU / 规格">
+        <input type="text" class="form-control" data-republish-sku-value placeholder="该 SKU 的网盘链接或文本">
+        <button type="button" class="btn btn-outline-danger" data-republish-action="remove-sku" aria-label="删除 SKU 覆盖">删除</button></div>`);
+}
+
+function collectRepublishSkuDelivery() {
+    const result = {};
+    document.querySelectorAll('#republishSkuRows .republish-sku-row').forEach(row => {
+        const key = row.querySelector('[data-republish-sku-key]')?.value.trim();
+        const value = row.querySelector('[data-republish-sku-value]')?.value.trim();
+        if (key && value) result[key] = value;
+    });
+    return result;
+}
+
+async function openRepublishConfig(cookieId, itemId) {
+    const normalizedCookieId = String(cookieId || '').trim();
+    const normalizedItemId = String(itemId || '').trim();
+    if (!normalizedCookieId || !normalizedItemId) return;
+    if (!getRepublishTemplate(normalizedCookieId, normalizedItemId)) await loadRepublishData([normalizedCookieId]);
+
+    let template = getRepublishTemplate(normalizedCookieId, normalizedItemId);
+    if (template?.template_id) {
+        const detailPayload = await republishApiRequest(`/api/republish/templates/${encodeURIComponent(template.template_id)}`);
+        const detailTemplate = republishTemplateFromPayload(detailPayload);
+        if (detailTemplate) {
+            template = { ...template, ...detailTemplate };
+            republishTemplatesByItem[republishItemKey(normalizedCookieId, normalizedItemId)] = template;
+        }
+        if (typeof detailPayload?.dry_run === 'boolean') republishRuntimeInfo.dry_run = detailPayload.dry_run;
+    }
+    const item = allItemsData.find(candidate => String(candidate.cookie_id) === normalizedCookieId && String(candidate.item_id) === normalizedItemId) || {};
+    republishModalState = { cookieId: normalizedCookieId, itemId: normalizedItemId, templateId: String(template?.template_id || '') };
+    document.getElementById('republishConfigModal')?.remove();
+    const dryRunNotice = republishRuntimeInfo.dry_run === false
+        ? '当前服务端已关闭 dry-run，请确认低价测试商品后再使用。'
+        : '当前为 dry-run 演练模式：只创建检查任务，不会真实发布新商品。';
+    const modalHtml = `<div class="modal fade" id="republishConfigModal" tabindex="-1" aria-labelledby="republishConfigModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable"><div class="modal-content republish-config">
+            <div class="modal-header"><div><h5 class="modal-title" id="republishConfigModalLabel">自动发货 / 重新上架配置</h5>
+                <div class="small text-muted">${escapeHtml(item.item_title || normalizedItemId)} · 商品 ID ${escapeHtml(normalizedItemId)}</div></div>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button></div>
+            <div class="modal-body"><div class="alert alert-warning republish-dry-run-notice" role="alert"><i class="bi bi-shield-check me-1"></i>${dryRunNotice}</div>
+                <div class="mb-3"><label class="form-label" for="republishDeliveryContent">默认网盘链接 / 发货文本</label>
+                    <textarea class="form-control" id="republishDeliveryContent" rows="3" placeholder="输入固定网盘链接或买家可见的发货文本">${escapeHtml(template?.delivery_content || '')}</textarea>
+                    <div class="form-text">列表仅显示链接摘要；完整内容只在此配置框中编辑。</div></div>
+                <div class="mb-3"><div class="d-flex justify-content-between align-items-center mb-2"><label class="form-label mb-0">SKU 覆盖（可选）</label>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" data-republish-action="add-sku"><i class="bi bi-plus"></i> 添加 SKU</button></div>
+                    <div id="republishSkuRows">${republishSkuRowsHtml(template?.sku_delivery)}</div>
+                    <div class="form-text">特殊规格可使用不同网盘链接；未配置的规格使用默认内容。</div></div>
+                <div class="row g-3"><div class="col-md-6"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="republishAutoDelivery" ${template?.auto_delivery !== false ? 'checked' : ''}>
+                    <label class="form-check-label" for="republishAutoDelivery">自动发货</label></div></div>
+                    <div class="col-md-6"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="republishAutoRepublish" ${template?.auto_republish !== false ? 'checked' : ''}>
+                    <label class="form-check-label" for="republishAutoRepublish">自动重新上架</label></div></div></div>
+                ${template ? `<div class="republish-config-recent mt-3"><span class="text-muted">最近状态：</span> ${escapeHtml(republishShortText(template.last_result?.error || template.last_error_summary || template.last_result_summary || template.last_status || '暂无结果'))}</div>` : ''}
+            </div><div class="modal-footer">${template ? `<button type="button" class="btn btn-outline-info me-auto" data-republish-action="check" data-template-id="${escapeHtml(template.template_id)}">立即检查</button>` : ''}
+                <button type="button" class="btn btn-primary" data-republish-action="save">保存配置</button><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button></div>
+        </div></div></div>`;
+    document.body.insertAdjacentHTML('beforeend', modalHtml);
+    new bootstrap.Modal(document.getElementById('republishConfigModal')).show();
+}
+
+async function saveRepublishTemplate() {
+    const { cookieId, itemId, templateId } = republishModalState;
+    const deliveryContent = document.getElementById('republishDeliveryContent')?.value.trim() || '';
+    if (!deliveryContent) {
+        showToast('请输入默认网盘链接或发货文本', 'warning');
+        return;
+    }
+    const body = { cookie_id: cookieId, item_id: itemId, delivery_content: deliveryContent,
+        sku_delivery: collectRepublishSkuDelivery(),
+        auto_delivery: Boolean(document.getElementById('republishAutoDelivery')?.checked),
+        auto_republish: Boolean(document.getElementById('republishAutoRepublish')?.checked) };
+    try {
+        const path = templateId ? `/api/republish/templates/${encodeURIComponent(templateId)}` : '/api/republish/templates';
+        const payload = await republishApiRequest(path, { method: templateId ? 'PATCH' : 'POST', body: JSON.stringify(body) });
+        const template = republishTemplateFromPayload(payload);
+        if (template) republishTemplatesByItem[republishItemKey(template.cookie_id, template.current_item_id)] = template;
+        bootstrap.Modal.getInstance(document.getElementById('republishConfigModal'))?.hide();
+        await loadRepublishData([cookieId]);
+        showToast('自动发货 / 重新上架配置已保存', 'success');
+    } catch (error) {
+        console.error('republish template save failed', error.status || error.message);
+        showToast(error.status === 403 ? '无权修改该账号配置' : '保存自动发货配置失败', 'danger');
+    }
+}
+
+async function toggleRepublishPause(templateId, currentlyPaused) {
+    if (!templateId) return;
+    try {
+        await republishApiRequest(`/api/republish/templates/${encodeURIComponent(templateId)}/pause`, { method: 'POST', body: JSON.stringify({ paused: !currentlyPaused }) });
+        await loadRepublishData([...new Set(allItemsData.map(item => item.cookie_id))]);
+        showToast(currentlyPaused ? '自动重新上架已恢复' : '自动重新上架已暂停', 'success');
+    } catch (error) {
+        console.error('republish pause toggle failed', error.status || error.message);
+        showToast(error.status === 403 ? '无权修改该配置' : '更新暂停状态失败', 'danger');
+    }
+}
+
+async function checkRepublishNow(templateId) {
+    if (!templateId) return;
+    try {
+        await republishApiRequest(`/api/republish/templates/${encodeURIComponent(templateId)}/check-now`, { method: 'POST', body: JSON.stringify({}) });
+        showToast('检查任务已创建；dry-run 和状态校验仍然生效', 'info');
+        bootstrap.Modal.getInstance(document.getElementById('republishConfigModal'))?.hide();
+        await loadRepublishData([...new Set(allItemsData.map(item => item.cookie_id))]);
+    } catch (error) {
+        console.error('republish check-now failed', error.status || error.message);
+        showToast(error.status === 403 ? '无权检查该配置' : '创建检查任务失败', 'danger');
+    }
+}
+
 function displayItems(items) {
     // 存储所有商品数据
     allItemsData = items || [];
+    ensureRepublishTableHeader();
+    void loadRepublishData(allItemsData.map(item => item.cookie_id));
 
     // 应用搜索过滤
     applyItemsFilter();
@@ -12052,7 +12332,7 @@ function displayCurrentPageItems() {
     const tbody = document.getElementById('itemsTableBody');
 
     if (!filteredItemsData || filteredItemsData.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted">暂无商品数据</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="11" class="text-center text-muted">暂无商品数据</td></tr>';
         resetItemsSelection();
         return;
     }
@@ -12102,8 +12382,9 @@ function displayCurrentPageItems() {
             <td title="${escapeHtml(getItemDetailText(item.item_detail || ''))}">${escapeHtml(itemDetailDisplay)}</td>
             <td>${escapeHtml(item.item_price || '未设置')}</td>
             <td>${multiSpecDisplay}</td>
-            <td>${multiQuantityDeliveryDisplay}</td>
-            <td>${formatDateTime(item.updated_at)}</td>
+        <td>${multiQuantityDeliveryDisplay}</td>
+        <td>${displayRepublishStatus(item)}</td>
+        <td>${formatDateTime(item.updated_at)}</td>
             <td>
                 <div class="btn-group" role="group">
                 <button class="btn btn-sm btn-outline-primary" onclick="editItem('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}')" title="编辑详情">

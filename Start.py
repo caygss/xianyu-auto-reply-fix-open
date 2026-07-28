@@ -8,7 +8,19 @@
 import os
 import sys
 import shutil
+import inspect
+import math
 from pathlib import Path
+from typing import Any, Mapping
+
+if getattr(sys, 'frozen', False):
+    os.environ.setdefault('XIANYU_APP_ROOT', str(Path(sys.executable).resolve().parent))
+else:
+    os.environ.setdefault('XIANYU_APP_ROOT', str(Path(__file__).resolve().parent))
+
+_bundled_node_dir = Path(os.environ['XIANYU_APP_ROOT']) / 'node'
+if _bundled_node_dir.is_dir():
+    os.environ['PATH'] = str(_bundled_node_dir) + os.pathsep + os.environ.get('PATH', '')
 
 # 设置标准输出编码为UTF-8（Windows兼容）
 def _setup_console_encoding():
@@ -144,6 +156,18 @@ except Exception as e:
     # 继续启动，因为可能是首次运行
 
 # ==================== 检查并安装Playwright浏览器 ====================
+def _find_bundled_chromium_executable(chromium_dir: Path):
+    """Support both Playwright's legacy chrome-win and newer chrome-win64 layouts."""
+    for relative_path in (
+        Path('chrome-win') / 'chrome.exe',
+        Path('chrome-win64') / 'chrome.exe',
+    ):
+        candidate = chromium_dir / relative_path
+        if candidate.exists() and candidate.stat().st_size > 0:
+            return candidate
+    return None
+
+
 def _check_and_install_playwright():
     """检查Playwright浏览器是否存在，如果不存在则自动安装"""
     print("检查Playwright浏览器...")
@@ -170,8 +194,8 @@ def _check_and_install_playwright():
             chromium_dirs = list(playwright_dir.glob('chromium-*'))
             if chromium_dirs:
                 chromium_dir = chromium_dirs[0]
-                chrome_exe = chromium_dir / 'chrome-win' / 'chrome.exe'
-                if chrome_exe.exists() and chrome_exe.stat().st_size > 0:
+                chrome_exe = _find_bundled_chromium_executable(chromium_dir)
+                if chrome_exe is not None:
                     print(f"{_OK} 找到已提取的Playwright浏览器: {chrome_exe}")
                     print(f"{_INFO} 浏览器版本: {chromium_dir.name}")
                     # 清除可能存在的旧环境变量，使用实际存在的浏览器
@@ -209,9 +233,8 @@ def _check_and_install_playwright():
             chromium_dirs = list(path.glob('chromium-*'))
             if chromium_dirs:
                 for chromium_dir in chromium_dirs:
-                    chrome_win = chromium_dir / 'chrome-win'
-                    chrome_exe = chrome_win / 'chrome.exe'
-                    if chrome_exe.exists():
+                    chrome_exe = _find_bundled_chromium_executable(chromium_dir)
+                    if chrome_exe is not None:
                         print(f"{_OK} 找到Playwright浏览器: {chrome_exe}")
                         # 设置环境变量
                         os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(path)
@@ -302,6 +325,12 @@ def _check_and_install_playwright():
         except Exception as e:
             print(f"{_WARN} 提取浏览器文件时出错: {e}")
     
+    # Compiled distributions must be self-contained; never recurse into the frozen EXE
+    # with `python -m playwright install` when a bundled browser is missing.
+    if not playwright_installed and getattr(sys, 'frozen', False):
+        print(f"{_WARN} 编译包内未找到可用的 Chromium，无法自动安装。请重新下载完整安装包。")
+        return False
+
     # 如果没找到，尝试安装
     if not playwright_installed:
         print(f"{_WARN} 未找到Playwright浏览器，正在自动安装...")
@@ -436,10 +465,331 @@ if sys.platform.startswith('linux'):
     except Exception as e:
         logger.debug(f"设置事件循环策略失败: {e}")
 
-from config import AUTO_REPLY, COOKIES_LIST
+from config import AUTO_REPLY, COOKIES_LIST, config as global_config
 import cookie_manager as cm
 from db_manager import db_manager
 from file_log_collector import setup_file_logging
+from republish_scheduler import RepublishScheduler
+from republish_service import (
+    ItemAvailability,
+    ItemPublisherAdapter,
+    RepublishCoordinator,
+)
+from republish_store import RepublishStore
+from utils.item_publisher import ItemPublisher
+
+
+_REPUBLISH_DEFAULTS = {
+    'enabled': False,
+    'dry_run': True,
+    'check_interval_seconds': 30.0,
+    'delay_seconds': 300.0,
+    'max_retries': 3,
+    'retry_backoff_seconds': (300.0, 900.0, 1800.0),
+    'account_id': '',
+}
+
+
+def _parse_republish_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if math.isfinite(float(value)) and value in (0, 1):
+            return bool(value)
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {'true', '1', 'yes', 'on'}:
+            return True
+        if normalized in {'false', '0', 'no', 'off'}:
+            return False
+    return default
+
+
+def _parse_republish_float(value: Any, default: float) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed) or parsed < 0:
+        return default
+    return parsed
+
+
+def _parse_republish_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed) or parsed < 0 or not parsed.is_integer():
+        return default
+    return int(parsed)
+
+
+def _parse_republish_backoff(value: Any) -> tuple[float, float, float]:
+    if isinstance(value, str):
+        value = [part.strip() for part in value.split(',')]
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return _REPUBLISH_DEFAULTS['retry_backoff_seconds']
+    parsed = tuple(_parse_republish_float(part, float('nan')) for part in value)
+    if any(not math.isfinite(part) for part in parsed):
+        return _REPUBLISH_DEFAULTS['retry_backoff_seconds']
+    return parsed
+
+
+def load_republish_config(raw_config: Any) -> dict[str, Any]:
+    """Normalize the opt-in republish configuration to safe runtime values."""
+    source = raw_config if isinstance(raw_config, Mapping) else {}
+    return {
+        'enabled': _parse_republish_bool(source.get('enabled'), _REPUBLISH_DEFAULTS['enabled']),
+        'dry_run': _parse_republish_bool(source.get('dry_run'), _REPUBLISH_DEFAULTS['dry_run']),
+        'check_interval_seconds': _parse_republish_float(
+            source.get('check_interval_seconds'), _REPUBLISH_DEFAULTS['check_interval_seconds']
+        ),
+        'delay_seconds': _parse_republish_float(
+            source.get('delay_seconds'), _REPUBLISH_DEFAULTS['delay_seconds']
+        ),
+        'max_retries': _parse_republish_int(source.get('max_retries'), _REPUBLISH_DEFAULTS['max_retries']),
+        'retry_backoff_seconds': _parse_republish_backoff(source.get('retry_backoff_seconds')),
+        'account_id': source.get('account_id').strip() if isinstance(source.get('account_id'), str) else '',
+    }
+
+
+class XianyuItemAvailabilityAdapter:
+    """Adapt the live account's sold-item listing to the republish state enum."""
+
+    def __init__(self, live: Any):
+        self.live = live
+
+    async def check(self, cookie_id: str, item_id: str) -> ItemAvailability:
+        del cookie_id
+        try:
+            safe_listing_method = getattr(self.live, 'get_active_item_ids_for_republish', None)
+            if callable(safe_listing_method):
+                result = safe_listing_method()
+                if inspect.isawaitable(result):
+                    result = await result
+                active_ids = self._extract_active_ids(result)
+                if active_ids is None:
+                    return ItemAvailability.UNKNOWN
+                return (
+                    ItemAvailability.AVAILABLE
+                    if str(item_id) in active_ids
+                    else ItemAvailability.UNAVAILABLE
+                )
+
+            listing_method = getattr(self.live, 'get_all_items', None)
+            if not callable(listing_method):
+                listing_method = getattr(self.live, 'get_item_list_info', None)
+            if not callable(listing_method):
+                return ItemAvailability.UNKNOWN
+
+            result = listing_method()
+            if inspect.isawaitable(result):
+                result = await result
+            items = self._extract_items(result)
+            if items is None:
+                return ItemAvailability.UNKNOWN
+            target = str(item_id)
+            for item in items:
+                if self._item_id(item) == target:
+                    return ItemAvailability.AVAILABLE
+            return ItemAvailability.UNAVAILABLE
+        except Exception:
+            return ItemAvailability.UNKNOWN
+
+    @classmethod
+    def _extract_items(cls, result: Any) -> list[Any] | None:
+        if not isinstance(result, Mapping):
+            return None
+        if result.get('success') is not True or result.get('error'):
+            return None
+        return cls._find_items(result)
+
+    @classmethod
+    def _find_items(cls, result: Any) -> list[Any] | None:
+        if isinstance(result, list):
+            return result
+        if not isinstance(result, Mapping):
+            return None
+        for key in ('items', 'itemList', 'item_list', 'list'):
+            value = result.get(key)
+            if isinstance(value, list):
+                return value
+        for key in ('data', 'result'):
+            nested = result.get(key)
+            extracted = cls._find_items(nested)
+            if extracted is not None:
+                return extracted
+        return None
+
+    @staticmethod
+    def _extract_active_ids(result: Any) -> set[str] | None:
+        if isinstance(result, (str, bytes, Mapping)):
+            return None
+        if not isinstance(result, (list, tuple, set, frozenset)):
+            return None
+        active_ids = set()
+        for value in result:
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                active_ids.add(str(value))
+            else:
+                return None
+        return active_ids
+
+    @staticmethod
+    def _item_id(item: Any) -> str | None:
+        if isinstance(item, (str, int)):
+            return str(item)
+        if not isinstance(item, Mapping):
+            return None
+        for key in ('item_id', 'itemId', 'idleItemId', 'idleId', 'id'):
+            value = item.get(key)
+            if value not in (None, ''):
+                return str(value)
+        return None
+
+
+class _RepublishRuntime:
+    def __init__(self, scheduler: Any, coordinator: Any, publisher: Any, store: Any, live: Any):
+        self.scheduler = scheduler
+        self.coordinator = coordinator
+        self.publisher = publisher
+        self.store = store
+        self.live = live
+        self._start_called = False
+        self._stop_called = False
+
+    async def start(self) -> None:
+        if self._start_called or self._stop_called:
+            return
+        self._start_called = True
+        await self.scheduler.start()
+
+    async def stop(self) -> None:
+        if self._stop_called:
+            return
+        self._stop_called = True
+        error = None
+        try:
+            await self.scheduler.stop()
+        except Exception as exc:
+            error = exc
+        try:
+            close_session = getattr(self.publisher, 'close_session', None)
+            if callable(close_session):
+                result = close_session()
+                if inspect.isawaitable(result):
+                    await result
+        except Exception as exc:
+            error = error or exc
+        finally:
+            try:
+                close_store = getattr(self.store, 'close', None)
+                if callable(close_store):
+                    close_store()
+            except Exception as exc:
+                error = error or exc
+            finally:
+                try:
+                    self.live.set_republish_coordinator(None)
+                except Exception as exc:
+                    error = error or exc
+        if error is not None:
+            raise error
+
+
+def _enabled_cookies_for_republish(manager: Any) -> Mapping[str, Any]:
+    getter = getattr(manager, 'get_enabled_cookies', None)
+    if callable(getter):
+        enabled = getter()
+    else:
+        enabled = getattr(manager, 'cookies', {})
+    return enabled if isinstance(enabled, Mapping) else {}
+
+
+def _live_for_republish(manager: Any, cookie_id: str) -> Any:
+    for method_name in ('get_xianyu_instance', 'get_live_instance'):
+        getter = getattr(manager, method_name, None)
+        if callable(getter):
+            live = getter(cookie_id)
+            if live is not None:
+                return live
+    instances = getattr(manager, 'live_instances', {})
+    if isinstance(instances, Mapping):
+        return instances.get(cookie_id)
+    return None
+
+
+def build_republish_runtime(
+    manager: Any,
+    settings: Mapping[str, Any],
+    scheduler_cls=RepublishScheduler,
+    store_path=None,
+):
+    if not isinstance(settings, Mapping) or not settings.get('enabled', False):
+        return None
+    enabled_cookies = _enabled_cookies_for_republish(manager)
+    if len(enabled_cookies) != 1:
+        return None
+    cookie_id, cookie = next(iter(enabled_cookies.items()))
+    account_id = str(settings.get('account_id') or '').strip()
+    if account_id and account_id != str(cookie_id):
+        return None
+    live = _live_for_republish(manager, str(cookie_id))
+    if live is None or not callable(getattr(live, 'set_republish_coordinator', None)):
+        return None
+
+    store = None
+    publisher = None
+    try:
+        store = RepublishStore(store_path or os.path.join('data', 'xianyu_data.db'))
+        publisher = ItemPublisher(cookie, str(cookie_id))
+        coordinator = RepublishCoordinator(
+            store,
+            ItemPublisherAdapter(publisher),
+            XianyuItemAvailabilityAdapter(live),
+            retry_backoff_seconds=settings.get('retry_backoff_seconds', (300.0, 900.0, 1800.0)),
+            dry_run=bool(settings.get('dry_run', True)),
+        )
+        coordinator.delay_seconds = float(settings.get('delay_seconds', 300.0))
+        coordinator.max_retries = int(settings.get('max_retries', 3))
+        live.set_republish_coordinator(coordinator)
+        interval = float(settings.get('check_interval_seconds', 30.0))
+        try:
+            scheduler = scheduler_cls(coordinator, interval=interval)
+        except TypeError:
+            scheduler = scheduler_cls(coordinator, interval)
+        return _RepublishRuntime(scheduler, coordinator, publisher, store, live)
+    except Exception:
+        try:
+            live.set_republish_coordinator(None)
+        except Exception:
+            pass
+        if publisher is not None:
+            close_session = getattr(publisher, 'close_session', None)
+            if callable(close_session):
+                try:
+                    result = close_session()
+                    if inspect.isawaitable(result):
+                        try:
+                            loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            asyncio.run(result)
+                        else:
+                            loop.create_task(result)
+                except Exception:
+                    pass
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+        raise
 
 
 def _start_api_server():
@@ -523,6 +873,7 @@ async def main():
     print("创建 CookieManager...")
     cm.manager = cm.CookieManager(loop)
     manager = cm.manager
+    republish_runtime = None
     print("CookieManager 创建完成")
 
     # 1) 从数据库加载的 Cookie 已经在 CookieManager 初始化时完成
@@ -569,6 +920,18 @@ async def main():
         manager.add_cookie('default', env_cookie)
         logger.info("从环境变量加载 default Cookie")
 
+    await asyncio.sleep(0)
+    republish_settings = load_republish_config(global_config.get('REPUBLISH', {}))
+    if republish_settings['enabled']:
+        try:
+            republish_runtime = build_republish_runtime(manager, republish_settings)
+            if republish_runtime is None:
+                logger.warning("republish_runtime_not_started")
+            else:
+                await republish_runtime.start()
+        except Exception:
+            logger.warning("republish_runtime_start_failed")
+
     # 启动 API 服务线程
     print("启动 API 服务线程...")
     threading.Thread(target=_start_api_server, daemon=True).start()
@@ -576,7 +939,14 @@ async def main():
 
     # 阻塞保持运行
     print("主程序启动完成，保持运行...")
-    await asyncio.Event().wait()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        if republish_runtime is not None:
+            try:
+                await republish_runtime.stop()
+            except Exception:
+                logger.warning("republish_runtime_stop_failed")
 
 
 if __name__ == '__main__':
