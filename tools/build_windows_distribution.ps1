@@ -8,7 +8,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($CompiledRoot)) {
     $CompiledRoot = Join-Path $repoRoot "dist\compiled-windows\XianyuAutoDelivery"
@@ -19,9 +18,10 @@ if ([string]::IsNullOrWhiteSpace($ModificationDate)) {
 if (-not (Test-Path -LiteralPath $CompiledRoot -PathType Container)) {
     throw "Compiled payload was not found: $CompiledRoot. Run tools\build_windows_executable.ps1 first."
 }
-foreach ($requiredMetadata in @("SourceRepositoryUrl", "SourceTag", "SourceCommit")) {
-    if ([string]::IsNullOrWhiteSpace((Get-Variable -Name $requiredMetadata -ValueOnly))) {
-        throw "$requiredMetadata is required so the package can identify its corresponding source."
+foreach ($metadataName in @("SourceRepositoryUrl", "SourceTag", "SourceCommit")) {
+    $metadataValue = Get-Variable -Name $metadataName -ValueOnly
+    if ([string]::IsNullOrWhiteSpace($metadataValue)) {
+        throw "$metadataName is required so the package can identify its corresponding source."
     }
 }
 
@@ -42,7 +42,7 @@ $excludedFilePatterns = @(
     "*.log", "*.key", "realtime.log"
 )
 $sensitiveFilePatterns = @(
-    ".env", "*.env", "*.key", "*.pem", "*.p12", "*.pfx", "*.crt", "*.cert",
+    ".env", "*.env", "*.key", "*.p12", "*.pfx",
     "config.local.*", "global_config.local.*", "credentials.*", "secrets.*",
     "*cookie*.json", "*token*.json", "*session*.json", "storage_state*.json",
     "auth*.json"
@@ -58,7 +58,6 @@ function Get-RelativePath {
 
 function Test-ExcludedStagingPath {
     param([Parameter(Mandatory = $true)][string]$FullPath)
-
     $relativePath = Get-RelativePath -BasePath $stagingRoot -FullPath $FullPath
     $parts = $relativePath -split '[\\/]'
     foreach ($part in $parts) {
@@ -66,7 +65,6 @@ function Test-ExcludedStagingPath {
             return $true
         }
     }
-
     $leaf = Split-Path -Leaf $FullPath
     foreach ($pattern in ($excludedFilePatterns + $sensitiveFilePatterns)) {
         if ($leaf -like $pattern) {
@@ -80,7 +78,6 @@ $ownershipMarker = Join-Path $stagingRoot ".distribution-owner-$stagingGuid.mark
 
 function Test-SafeOwnedStagingPath {
     param([Parameter(Mandatory = $true)][string]$CandidatePath)
-
     try {
         $resolvedDist = (Resolve-Path -LiteralPath $distRoot -ErrorAction Stop).Path
         $resolvedStaging = (Resolve-Path -LiteralPath $CandidatePath -ErrorAction Stop).Path
@@ -102,22 +99,29 @@ try {
     $createdStaging = $true
     New-Item -ItemType File -Path $ownershipMarker -Force | Out-Null
 
-    # The compiled payload is the only executable content copied into the package.
     Get-ChildItem -LiteralPath $CompiledRoot -Force | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stagingRoot $_.Name) -Recurse -Force
     }
 
-    foreach ($requiredFile in @(
-        "LICENSE",
-        "README.md",
-        "首次安装闲鱼自动发货.bat",
-        "启动闲鱼自动发货.bat"
-    )) {
+    foreach ($requiredFile in @("LICENSE", "README.md")) {
         $sourcePath = Join-Path $repoRoot $requiredFile
         if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
             throw "Required distribution file was not found: $sourcePath"
         }
         Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $stagingRoot $requiredFile) -Force
+    }
+
+    $launcherFiles = @(
+        Get-ChildItem -LiteralPath $repoRoot -Filter "*.bat" -File |
+            Where-Object {
+                [System.IO.File]::ReadAllText($_.FullName) -match "(?im)^.*XianyuAutoDelivery\.exe"
+            }
+    )
+    if ($launcherFiles.Count -ne 2) {
+        throw "Expected exactly two compiled-package launcher batch files, found $($launcherFiles.Count)."
+    }
+    foreach ($launcherFile in $launcherFiles) {
+        Copy-Item -LiteralPath $launcherFile.FullName -Destination (Join-Path $stagingRoot $launcherFile.Name) -Force
     }
 
     $docsRoot = Join-Path $stagingRoot "docs"
@@ -129,23 +133,24 @@ try {
         }
     }
 
-    $sourcePointer = @"
-# 对应源码 / Corresponding Source
-
-本安装包是 `xianyu-auto-reply-fix` 的编译 Windows 分发版本，遵循 GNU AGPL-3.0。
-
-- 源码仓库：$SourceRepositoryUrl
-- 源码标签：$SourceTag
-- 源码提交：$SourceCommit
-- 构建日期：$ModificationDate
-
-你可以免费获取、阅读、修改和再次分发对应源码及本安装包，但必须遵守 AGPL-3.0，并保留原作者与本项目的版权、许可证和修改声明。
-
-本安装包不包含 Python 源文件；上述仓库和提交号是本安装包的对应源码定位信息。
-"@
+    $sourcePointerLines = @(
+        "# Corresponding Source",
+        "",
+        "This is the compiled Windows distribution of xianyu-auto-reply-fix under GNU AGPL-3.0.",
+        "",
+        "- Source repository: $SourceRepositoryUrl",
+        "- Source tag: $SourceTag",
+        "- Source commit: $SourceCommit",
+        "- Build date: $ModificationDate",
+        "",
+        "You may obtain, modify, and redistribute the corresponding source and this package under AGPL-3.0.",
+        "Keep the original copyright, license, and modification notices.",
+        "",
+        "This package does not contain Python source files. The repository and commit above identify the exact corresponding source."
+    )
     [System.IO.File]::WriteAllText(
         (Join-Path $stagingRoot "SOURCE-CODE.md"),
-        $sourcePointer,
+        ($sourcePointerLines -join [Environment]::NewLine),
         [System.Text.UTF8Encoding]::new($false)
     )
 
@@ -167,7 +172,6 @@ try {
     if ($sourceFilesInPayload.Count -gt 0) {
         throw "Python source files were found in the compiled distribution: $($sourceFilesInPayload.FullName -join ', ')"
     }
-
     if (Test-Path -LiteralPath $zipPath) {
         throw "Refusing to overwrite an existing archive: $zipPath"
     }
@@ -206,7 +210,6 @@ try {
 }
 catch {
     if ($createdStaging -and (Test-Path -LiteralPath $stagingRoot) -and (Test-Path -LiteralPath $ownershipMarker) -and (Test-SafeOwnedStagingPath -CandidatePath $stagingRoot)) {
-        # Clean only a staging directory with this run's ownership marker and safe path.
         Remove-Item -LiteralPath $stagingRoot -Recurse -Force
     }
     throw
