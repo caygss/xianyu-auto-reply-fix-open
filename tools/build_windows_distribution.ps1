@@ -209,6 +209,7 @@ try {
     Write-Host "Executable SHA256: $($hash.Hash)"
 }
 catch {
+    # Cleanup is restricted to this run's uniquely owned staging directory.
     if ($createdStaging -and (Test-Path -LiteralPath $stagingRoot) -and (Test-Path -LiteralPath $ownershipMarker) -and (Test-SafeOwnedStagingPath -CandidatePath $stagingRoot)) {
         Remove-Item -LiteralPath $stagingRoot -Recurse -Force
     }
