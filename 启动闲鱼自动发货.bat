@@ -30,6 +30,7 @@ if not errorlevel 1 (
 
 echo Starting the bundled local service...
 if not exist "%PROJECT_ROOT%logs" mkdir "%PROJECT_ROOT%logs" >nul 2>&1
+set "XIANYU_AUTO_OPEN_BROWSER=0"
 start "" /min "%APP_EXE%"
 
 echo Waiting for the service health check...

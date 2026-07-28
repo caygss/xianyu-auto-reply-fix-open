@@ -12,7 +12,9 @@ $launcherCandidates = @(
     Get-ChildItem -LiteralPath $projectRoot -Filter "*.bat" -File |
         Where-Object {
             $content = [System.IO.File]::ReadAllText($_.FullName)
-            $content -match "(?im)^.*XianyuAutoDelivery\.exe"
+            # The startup launcher is the only batch file that starts the compiled EXE.
+            # Matching this behavior avoids confusing it with the first-run directory setup.
+            $content -match '(?im)^\s*start\s+""\s+/min\s+.*APP_EXE'
         }
 )
 

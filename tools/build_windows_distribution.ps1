@@ -124,6 +124,14 @@ try {
         Copy-Item -LiteralPath $launcherFile.FullName -Destination (Join-Path $stagingRoot $launcherFile.Name) -Force
     }
 
+    $toolsRoot = Join-Path $stagingRoot "tools"
+    New-Item -ItemType Directory -Path $toolsRoot -Force | Out-Null
+    $shortcutTool = Join-Path $repoRoot "tools\create_desktop_shortcut.ps1"
+    if (-not (Test-Path -LiteralPath $shortcutTool -PathType Leaf)) {
+        throw "Desktop shortcut helper was not found: $shortcutTool"
+    }
+    Copy-Item -LiteralPath $shortcutTool -Destination (Join-Path $toolsRoot "create_desktop_shortcut.ps1") -Force
+
     $docsRoot = Join-Path $stagingRoot "docs"
     New-Item -ItemType Directory -Path $docsRoot -Force | Out-Null
     foreach ($docName in @("windows-distribution.md", "open-source-distribution.md", "windows-republish-runbook.md")) {

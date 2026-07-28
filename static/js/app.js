@@ -22362,7 +22362,7 @@ async function showVersionInfo(version) {
     const versionInfo = await getUpdateInfo();
     
     // 构建项目介绍
-    const intro = versionInfo?.intro || '此版本为本人利用业余时间开发，功能可能不完善，欢迎大家提出建议和bug，我会尽快修复。此版本纯粹免费，没有任何收费项目，请大家放心使用。如果大家觉得这个项目对你有帮助，可以请我喝杯咖啡，支持我继续开发。';
+    const intro = versionInfo?.intro || '此版本为开源修改版，功能可能不完善，欢迎通过项目仓库提交建议和问题。';
     
     // 构建版本历史
     let versionHistoryHtml = '';

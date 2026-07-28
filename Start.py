@@ -18,6 +18,11 @@ if getattr(sys, 'frozen', False):
 else:
     os.environ.setdefault('XIANYU_APP_ROOT', str(Path(__file__).resolve().parent))
 
+# Compiled users may double-click the EXE directly instead of using the launcher.
+# Keep all runtime data beside the installed package in that case.
+if getattr(sys, 'frozen', False):
+    os.chdir(Path(os.environ['XIANYU_APP_ROOT']).resolve())
+
 _bundled_node_dir = Path(os.environ['XIANYU_APP_ROOT']) / 'node'
 if _bundled_node_dir.is_dir():
     os.environ['PATH'] = str(_bundled_node_dir) + os.pathsep + os.environ.get('PATH', '')
@@ -70,6 +75,37 @@ _OK = '[OK]'
 _WARN = '[WARN]'
 _ERROR = '[ERROR]'
 _INFO = '[INFO]'
+
+def _ensure_runtime_directories():
+    """Create the writable directories needed by a fresh compiled install."""
+    runtime_directories = (
+        Path('data'),
+        Path('logs'),
+        Path('browser_data'),
+        Path('trajectory_history'),
+        Path('static') / 'uploads' / 'images',
+    )
+    for directory in runtime_directories:
+        directory.mkdir(parents=True, exist_ok=True)
+        if not directory.is_dir():
+            raise RuntimeError(f'Runtime path is not a directory: {directory}')
+
+        probe = directory / '.write-test'
+        try:
+            probe.write_text('ok', encoding='ascii')
+        finally:
+            try:
+                probe.unlink()
+            except FileNotFoundError:
+                pass
+
+
+# A compiled EXE must be usable without the optional first-run batch file.
+try:
+    _ensure_runtime_directories()
+except Exception as exc:
+    print(f"{_ERROR} Cannot prepare writable runtime directories: {exc}")
+    raise
 
 # ==================== 在导入任何模块之前先迁移数据库 ====================
 def _migrate_database_files_early():
@@ -792,27 +828,60 @@ def build_republish_runtime(
         raise
 
 
+def _configured_api_port() -> int:
+    api_conf = AUTO_REPLY.get('api', {})
+    port = int(os.getenv('API_PORT', '8090'))
+    if 'port' in api_conf:
+        port = int(api_conf['port'])
+    elif 'url' in api_conf and 'host' not in api_conf and 'port' not in api_conf:
+        parsed = urlparse(api_conf.get('url', 'http://0.0.0.0:8090/xianyu/reply'))
+        port = parsed.port or 8090
+    return port
+
+
+def _open_compiled_dashboard_when_ready():
+    """Open the local panel for direct EXE launches after the API is healthy."""
+    if not getattr(sys, 'frozen', False):
+        return
+    if str(os.getenv('XIANYU_AUTO_OPEN_BROWSER', '1')).strip().lower() in {'0', 'false', 'no', 'off'}:
+        return
+
+    import time
+    import urllib.request
+    import webbrowser
+
+    port = _configured_api_port()
+    dashboard_url = f'http://127.0.0.1:{port}'
+    health_url = f'{dashboard_url}/health'
+    for _ in range(60):
+        try:
+            with urllib.request.urlopen(health_url, timeout=2) as response:
+                if 200 <= response.status < 300:
+                    webbrowser.open(dashboard_url, new=2)
+                    return
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    logger.warning('compiled_dashboard_auto_open_timeout')
+
+
 def _start_api_server():
     """后台线程启动 FastAPI 服务"""
     api_conf = AUTO_REPLY.get('api', {})
 
     # 优先使用环境变量配置
     host = os.getenv('API_HOST', '0.0.0.0')  # 默认绑定所有接口
-    port = int(os.getenv('API_PORT', '8090'))  # 默认端口8090
+    port = _configured_api_port()
 
     # 如果配置文件中有特定配置，则使用配置文件
     if 'host' in api_conf:
         host = api_conf['host']
-    if 'port' in api_conf:
-        port = api_conf['port']
-
-    # 兼容旧的URL配置方式
     if 'url' in api_conf and 'host' not in api_conf and 'port' not in api_conf:
         url = api_conf.get('url', 'http://0.0.0.0:8090/xianyu/reply')
         parsed = urlparse(url)
         if parsed.hostname and parsed.hostname != 'localhost':
             host = parsed.hostname
-        port = parsed.port or 8090
 
     logger.info(f"启动Web服务器: http://{host}:{port}")
     # 在后台线程中创建独立事件循环并直接运行 server.serve()
@@ -935,6 +1004,7 @@ async def main():
     # 启动 API 服务线程
     print("启动 API 服务线程...")
     threading.Thread(target=_start_api_server, daemon=True).start()
+    threading.Thread(target=_open_compiled_dashboard_when_ready, daemon=True).start()
     print("API 服务线程已启动")
 
     # 阻塞保持运行

@@ -28,6 +28,6 @@ for %%D in (data logs browser_data trajectory_history static\uploads\images) do 
 )
 
 echo Installation completed. Python, Node.js, and Chromium are already bundled.
-echo Next, double-click 启动闲鱼自动发货.bat.
+echo Next, double-click the startup batch file in this folder.
 pause
 exit /b 0

@@ -24,7 +24,7 @@ def test_distribution_builder_uses_repo_relative_timestamped_staging_and_zip():
 
     for phrase in (
         "$PSScriptRoot", "dist", "xianyu-auto-reply-fix-windows-", "timestamp",
-        "Compress-Archive", "fileCount", "zipPath",
+        "Compress-Archive", "fileCount", "zipPath", "create_desktop_shortcut.ps1",
     ):
         assert phrase in text
 
