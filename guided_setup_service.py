@@ -84,10 +84,50 @@ def _normalized_runtime_status(runtime_status: Optional[Mapping[str, Any]]) -> t
     return token_status, connection_state
 
 
+def _future_deadline(runtime_status: Mapping[str, Any], keys: tuple[str, ...]) -> Optional[float]:
+    now = time.time()
+    for key in keys:
+        timestamp = _timestamp(runtime_status.get(key))
+        if timestamp is not None and timestamp > now:
+            return timestamp
+    return None
+
+
 def get_user_action_for_runtime(runtime_status: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     """Map an internal runtime state to one user-facing action."""
     token_status, connection_state = _normalized_runtime_status(runtime_status)
     runtime_status = runtime_status if isinstance(runtime_status, Mapping) else {}
+
+    manual_action = str(runtime_status.get("manual_verification_action") or "").strip().lower()
+    if manual_action == "complete_pending":
+        return {
+            "action": "refresh_status",
+            "title": "\u6b63\u5728\u68c0\u67e5\u9a8c\u8bc1\u7ed3\u679c",
+            "message": "\u5df2\u8bb0\u5f55\u5b8c\u6210\u63d0\u793a\uff0c\u7cfb\u7edf\u6b63\u5728\u91cd\u65b0\u68c0\u67e5\u8d26\u53f7\uff0c\u8bf7\u7a0d\u5019\u3002",
+            "needs_user_action": False,
+        }
+    if manual_action in {"open_pending", "opened"} or runtime_status.get("manual_verification_open"):
+        return {
+            "action": "complete_manual_verification",
+            "title": "\u9700\u8981\u786e\u8ba4\u9a8c\u8bc1\u5df2\u5b8c\u6210",
+            "message": "\u5b8c\u6210\u9875\u9762\u4e2d\u7684\u9a8c\u8bc1\u540e\uff0c\u8bf7\u786e\u8ba4\u5df2\u5b8c\u6210\uff0c\u7cfb\u7edf\u4f1a\u91cd\u65b0\u68c0\u67e5\u8d26\u53f7\u3002",
+            "needs_user_action": True,
+        }
+    if token_status not in _VERIFICATION_STATUSES:
+        if _future_deadline(runtime_status, ("qr_login_grace_until", "grace_until")) is not None:
+            return {
+                "action": "refresh_status",
+                "title": "\u8d26\u53f7\u6b63\u5728\u7a33\u5b9a",
+                "message": "\u626b\u7801\u767b\u5f55\u5df2\u5b8c\u6210\uff0c\u7cfb\u7edf\u6b63\u5728\u7a33\u5b9a\u8d26\u53f7\uff0c\u8bf7\u7a0d\u5019\u3002",
+                "needs_user_action": False,
+            }
+        if _future_deadline(runtime_status, ("token_refresh_backoff_until", "backoff_until")) is not None:
+            return {
+                "action": "refresh_status",
+                "title": "\u8bf7\u7a0d\u5019\u6062\u590d\u8d26\u53f7",
+                "message": "\u7cfb\u7edf\u6b63\u5728\u7b49\u5f85\u4e0b\u4e00\u6b21\u6062\u590d\u673a\u4f1a\uff0c\u8bf7\u7a0d\u5019\u3002",
+                "needs_user_action": False,
+            }
 
     if token_status in _VERIFICATION_STATUSES:
         manual_action = str(runtime_status.get("manual_verification_action") or "").strip().lower()
@@ -158,11 +198,22 @@ def _retry_deadline(runtime_status: Mapping[str, Any], technical_status: str) ->
         candidates = ["token_refresh_backoff_until", "backoff_until"]
     else:
         candidates = []
-    candidates.extend(["retry_at", "token_refresh_retry_at", "manual_verification_until"])
-    for key in candidates:
+    candidates.extend([
+        "qr_login_grace_until",
+        "token_refresh_backoff_until",
+        "retry_at",
+        "token_refresh_retry_at",
+        "manual_verification_until",
+    ])
+    timestamps = []
+    for key in dict.fromkeys(candidates):
         timestamp = _timestamp(runtime_status.get(key))
-        if timestamp is not None:
-            return int(timestamp) if timestamp.is_integer() else timestamp
+        if timestamp is not None and timestamp > 0:
+            timestamps.append(timestamp)
+    if timestamps:
+        active_timestamps = [timestamp for timestamp in timestamps if timestamp > time.time()]
+        timestamp = active_timestamps[0] if active_timestamps else timestamps[0]
+        return int(timestamp) if timestamp.is_integer() else timestamp
     return None
 
 
@@ -193,6 +244,11 @@ def _safe_status_value(value: Any) -> str:
 
 def _technical_status(runtime_status: Mapping[str, Any]) -> str:
     token_status, connection_state = _normalized_runtime_status(runtime_status)
+    if token_status not in _VERIFICATION_STATUSES:
+        if _future_deadline(runtime_status, ("qr_login_grace_until", "grace_until")) is not None:
+            return "qr_login_grace_wait"
+        if _future_deadline(runtime_status, ("token_refresh_backoff_until", "backoff_until")) is not None:
+            return "password_login_backoff_wait"
     return _safe_status_value(token_status or connection_state)
 
 
@@ -229,7 +285,14 @@ def build_guided_status(
     }
 
     _, connection_state = _normalized_runtime_status(runtime_status)
-    if connection_state == "connected":
+    active_deadline = retry_at is not None and format_remaining_seconds(retry_at) > 0
+    blocking_runtime_state = (
+        technical_status in _VERIFICATION_STATUSES
+        or technical_status in _WAIT_STATUSES
+        or action["action"] in {"open_manual_verification", "complete_manual_verification"}
+        or active_deadline
+    )
+    if connection_state == "connected" and not blocking_runtime_state:
         configured = _delivery_configured(delivery_summary)
         if configured:
             status.update(
@@ -255,6 +318,15 @@ def build_guided_status(
             )
         else:
             status["step_id"] = "account_connected"
+    elif connection_state == "connected" and active_deadline and status["primary_action"] == "finish":
+        status.update(
+            {
+                "title": "\u8bf7\u7a0d\u5019\u7cfb\u7edf\u5b8c\u6210\u6062\u590d",
+                "message": "\u7cfb\u7edf\u6b63\u5728\u7b49\u5f85\u4e0b\u4e00\u6b21\u6062\u590d\u673a\u4f1a\uff0c\u8bf7\u5728\u7a33\u5b9a\u540e\u518d\u68c0\u67e5\u8d26\u53f7\u3002",
+                "needs_user_action": False,
+                "primary_action": "refresh_status",
+            }
+        )
 
     return status
 

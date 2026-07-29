@@ -4604,6 +4604,7 @@ def _build_guided_setup_account_status(cookie_id: str, account_details: Optional
         'guided_status': build_guided_status(
             runtime_status,
             account_details={'id': cookie_id},
+            delivery_summary={'configured': False},
         ),
     }
 
@@ -4653,7 +4654,11 @@ def _build_manual_verification_action_response(
             if action == 'open_manual_verification'
             else '已记录验证完成请求，正在重新检查账号。'
         ),
-        'guided_status': build_guided_status(runtime_status, account_details={'id': cleaned_cookie_id}),
+        'guided_status': build_guided_status(
+            runtime_status,
+            account_details={'id': cleaned_cookie_id},
+            delivery_summary={'configured': False},
+        ),
     }
 
 
@@ -4704,6 +4709,8 @@ def _perform_guided_setup_action_impl(
         raise HTTPException(status_code=400, detail='不支持的向导操作')
 
     cookie_id = str(request.cookie_id or request.cid or '').strip()
+    if action == 'finish' and not cookie_id:
+        raise HTTPException(status_code=400, detail='完成操作需要指定账号')
     if action in {'open_manual_verification', 'complete_manual_verification'}:
         if not cookie_id:
             raise HTTPException(status_code=400, detail='该操作需要指定账号')
@@ -4719,7 +4726,41 @@ def _perform_guided_setup_action_impl(
                 'guided_status': build_guided_status(
                     _build_live_runtime_status(cleaned_cookie_id),
                     account_details={'id': cleaned_cookie_id},
+                    delivery_summary={'configured': False},
                 ),
+            }
+        if action == 'finish':
+            runtime_status = _build_live_runtime_status(cleaned_cookie_id)
+            guided_status = build_guided_status(
+                runtime_status,
+                account_details={'id': cleaned_cookie_id},
+                delivery_summary={'configured': False},
+            )
+            connection_state = str(runtime_status.get('connection_state') or '').strip().lower()
+            account_running = (
+                runtime_status.get('running') is not False
+                and connection_state == 'connected'
+                and runtime_status.get('message_stream_ready') is not False
+            )
+            if account_running and guided_status.get('primary_action') == 'finish':
+                return {
+                    'success': True,
+                    'action': action,
+                    'cookie_id': cleaned_cookie_id,
+                    'message': '向导已完成。',
+                    'guided_status': guided_status,
+                }
+            return {
+                'success': False,
+                'action': action,
+                'cookie_id': cleaned_cookie_id,
+                'next_action': (
+                    guided_status.get('primary_action') or 'refresh_status'
+                    if account_running
+                    else 'refresh_status'
+                ),
+                'message': '向导尚未满足完成条件，请按提示继续。',
+                'guided_status': guided_status,
             }
 
     if action == 'refresh_status':

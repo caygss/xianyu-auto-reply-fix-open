@@ -86,6 +86,62 @@ def test_connected_account_without_delivery_summary_must_go_to_delivery_config()
 
 
 @pytest.mark.parametrize(
+    ("runtime_status", "expected_action"),
+    [
+        (
+            {
+                "connection_state": "connected",
+                "token_refresh_status": "qr_login_grace_wait",
+                "qr_login_grace_until": 130,
+            },
+            "refresh_status",
+        ),
+        (
+            {
+                "connection_state": "connected",
+                "token_refresh_status": "verification_pending_manual",
+                "manual_verification_open": True,
+            },
+            "complete_manual_verification",
+        ),
+        (
+            {
+                "connection_state": "connected",
+                "token_refresh_status": "password_login_backoff_wait",
+                "token_refresh_backoff_until": 130,
+            },
+            "refresh_status",
+        ),
+    ],
+)
+def test_explicit_wait_or_manual_action_has_priority_over_connected(runtime_status, expected_action, monkeypatch):
+    monkeypatch.setattr("guided_setup_service.time.time", lambda: 100)
+
+    status = build_guided_status(runtime_status, delivery_summary={"configured": True})
+
+    assert status["primary_action"] == expected_action
+    assert status["step_id"] != "ready_to_wait_for_order"
+
+
+def test_active_runtime_deadline_has_priority_even_when_token_status_says_connected(monkeypatch):
+    monkeypatch.setattr("guided_setup_service.time.time", lambda: 100)
+
+    status = build_guided_status(
+        {
+            "connection_state": "connected",
+            "token_refresh_status": "success",
+            "qr_login_grace_until": 130,
+        },
+        delivery_summary={"configured": True},
+    )
+
+    assert status["primary_action"] == "refresh_status"
+    assert status["technical_status"] == "qr_login_grace_wait"
+    assert status["retry_at"] == 130
+    assert status["remaining_seconds"] == 30
+
+
+@pytest.mark.parametrize(
     "delivery_summary",
     [None, {}, {"configured": "false"}, {"configured": "0"}, {"configured": "off"}],
 )

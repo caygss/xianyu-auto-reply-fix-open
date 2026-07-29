@@ -93,16 +93,96 @@ def test_setup_status_returns_safe_guided_json_and_reuses_cookie_details(authent
     assert "password-secret" not in response.text
 
 
+def test_setup_status_passes_explicit_unconfigured_delivery_summary(authenticated_client, monkeypatch):
+    captured = []
+    original_build_guided_status = reply_server.build_guided_status
+
+    def spy_build_guided_status(runtime_status, account_details=None, delivery_summary=None):
+        captured.append(delivery_summary)
+        return original_build_guided_status(runtime_status, account_details, delivery_summary)
+
+    monkeypatch.setattr(reply_server, "build_guided_status", spy_build_guided_status)
+    monkeypatch.setattr(
+        reply_server,
+        "get_cookies_details",
+        lambda current_user: [{"id": "account-1", "runtime_status": {"connection_state": "connected"}}],
+    )
+
+    response = authenticated_client.get("/setup/status")
+
+    assert response.status_code == 200
+    assert captured == [{"configured": False}]
+    assert response.json()["accounts"][0]["guided_status"]["primary_action"] == "go_to_delivery_config"
+
+
 def test_setup_action_rejects_unknown_action_and_keeps_allowed_actions(authenticated_client, monkeypatch):
     monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"account-1": "masked"})
 
     unknown = authenticated_client.post("/setup/action", json={"action": "delete_everything"})
     assert unknown.status_code == 400
 
-    for action in ("refresh_status", "go_to_delivery_config", "finish"):
+    for action in ("refresh_status", "go_to_delivery_config"):
         response = authenticated_client.post("/setup/action", json={"action": action})
         assert response.status_code == 200
         assert response.json()["action"] == action
+
+    finish_without_cookie = authenticated_client.post("/setup/action", json={"action": "finish"})
+    assert finish_without_cookie.status_code == 400
+
+
+def test_setup_finish_is_blocked_until_account_is_running_and_delivery_is_configured(
+    authenticated_client, monkeypatch
+):
+    monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"account-1": "masked"})
+    monkeypatch.setattr(
+        reply_server,
+        "_build_live_runtime_status",
+        lambda cid: {"connection_state": "connected", "message_stream_ready": True},
+    )
+
+    response = authenticated_client.post("/setup/action", json={"action": "finish", "cookie_id": "account-1"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["next_action"] == "go_to_delivery_config"
+    assert payload["guided_status"]["primary_action"] == "go_to_delivery_config"
+
+
+def test_setup_finish_is_blocked_when_account_is_not_running(authenticated_client, monkeypatch):
+    monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"account-1": "masked"})
+    monkeypatch.setattr(
+        reply_server,
+        "_build_live_runtime_status",
+        lambda cid: {"connection_state": "reconnecting"},
+    )
+
+    response = authenticated_client.post("/setup/action", json={"action": "finish", "cookie_id": "account-1"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["next_action"] == "refresh_status"
+
+
+def test_setup_finish_is_blocked_when_runtime_marks_account_not_running(authenticated_client, monkeypatch):
+    monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"account-1": "masked"})
+    monkeypatch.setattr(
+        reply_server,
+        "_build_live_runtime_status",
+        lambda cid: {
+            "running": False,
+            "connection_state": "connected",
+            "message_stream_ready": True,
+        },
+    )
+
+    response = authenticated_client.post("/setup/action", json={"action": "finish", "cookie_id": "account-1"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["next_action"] == "refresh_status"
 
 
 @pytest.mark.parametrize("path", [
