@@ -4146,6 +4146,43 @@ def _build_token_refresh_action_contract(
     }
 
 
+def _build_password_login_backoff_response(cookie_id: str, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """在平台冷却期内阻止新的密码登录任务，并返回动态可执行提示。"""
+    cleaned_cid = str(cookie_id or '').strip()
+    if not cleaned_cid:
+        return None
+
+    try:
+        from XianyuAutoAsync import XianyuLive
+        backoff_state = XianyuLive.get_password_login_failure_backoff(cleaned_cid) or {}
+    except Exception as exc:
+        logger.warning(f"读取密码登录退避状态失败 {cleaned_cid}: {mask_sensitive_text(exc)}")
+        return None
+
+    deadline = _safe_runtime_deadline(backoff_state.get('until'))
+    current_time = time.time() if now is None else float(now)
+    remaining_seconds = max(0, int(deadline - current_time)) if deadline > current_time else 0
+    if remaining_seconds <= 0:
+        return None
+
+    reason = str(backoff_state.get('reason') or '').strip() or None
+    remaining_minutes = max(1, math.ceil(remaining_seconds / 60))
+    return {
+        'success': False,
+        'status': 'password_login_backoff_wait',
+        'account_id': cleaned_cid,
+        'token_refresh_backoff_reason': reason,
+        'token_refresh_backoff_until': deadline,
+        'token_refresh_remaining_seconds': remaining_seconds,
+        'token_refresh_can_retry': False,
+        'user_action': 'wait_backoff',
+        'message': (
+            f'自动验证失败，当前需要等待约 {remaining_minutes} 分钟（剩余 {remaining_seconds} 秒）。'
+            '平台冷却期间不会启动新的浏览器验证，请等待冷却结束后再重新验证。'
+        ),
+    }
+
+
 def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     cleaned_cid = str(cookie_id or '').strip()
     runtime_status = {
@@ -6725,6 +6762,15 @@ async def password_login(
 
         if not account_id or not account or not password:
             return {'success': False, 'message': '账号ID、登录账号和密码不能为空'}
+
+        backoff_response = _build_password_login_backoff_response(account_id)
+        if backoff_response:
+            log_with_user(
+                'warning',
+                f"账号 {account_id} 处于密码登录失败冷却期，拒绝启动新的浏览器验证",
+                current_user,
+            )
+            return backoff_response
 
         log_with_user('info', f"开始账号密码登录: {account_id}, 账号: {account}", current_user)
         

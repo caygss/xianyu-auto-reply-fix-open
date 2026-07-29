@@ -8551,6 +8551,12 @@ class XianyuLive:
                 XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
                 failure_backoff = None
             else:
+                remaining_seconds = max(1, int(remaining_time))
+                self.last_token_refresh_status = "password_login_backoff_wait"
+                self.last_token_refresh_error_message = (
+                    f"自动验证失败，密码登录冷却中，剩余{remaining_seconds}秒；"
+                    "平台冷却期间不会启动新的浏览器验证，请等待冷却结束后再重新验证"
+                )
                 logger.warning(
                     f"【{self.cookie_id}】密码登录失败退避中（原因: {backoff_reason}），还需等待 {remaining_time:.1f} 秒"
                 )

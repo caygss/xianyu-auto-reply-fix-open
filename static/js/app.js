@@ -970,9 +970,21 @@ function isVncManualActionAvailable(runtimeStatus) {
         && Boolean(String(runtimeStatus.manual_browser_session_status || '').trim());
 }
 
+function getRuntimeDeadline(runtimeStatus) {
+    const tokenDeadline = Number(runtimeStatus?.token_refresh_backoff_until || 0);
+    const qrDeadline = Number(runtimeStatus?.qr_login_grace_until || 0);
+    const normalizedTokenDeadline = Number.isFinite(tokenDeadline) && tokenDeadline > 0 ? tokenDeadline : 0;
+    const normalizedQrDeadline = Number.isFinite(qrDeadline) && qrDeadline > 0 ? qrDeadline : 0;
+
+    if (String(runtimeStatus?.token_refresh_status || '').trim() === 'qr_login_grace_wait' && normalizedQrDeadline > 0) {
+        return normalizedQrDeadline;
+    }
+    return normalizedTokenDeadline || normalizedQrDeadline;
+}
+
 function getTokenRefreshBackoffRemainingSeconds(runtimeStatus, now = Date.now()) {
-    const deadline = Number(runtimeStatus?.token_refresh_backoff_until || 0);
-    if (!Number.isFinite(deadline) || deadline <= 0) {
+    const deadline = getRuntimeDeadline(runtimeStatus);
+    if (deadline <= 0) {
         return 0;
     }
     return Math.max(0, Math.ceil(deadline - (now / 1000)));
@@ -984,6 +996,7 @@ function getManualInterventionAlert(statusNote, runtimeStatus) {
     const tokenError = String(runtimeStatus?.token_refresh_error_message || '').trim();
     const backoffRemainingSeconds = getTokenRefreshBackoffRemainingSeconds(runtimeStatus);
     const backoffRemainingMinutes = Math.ceil(backoffRemainingSeconds / 60);
+    const qrGraceWaiting = tokenStatus === 'qr_login_grace_wait' && backoffRemainingSeconds > 0;
     const combinedText = `${noteText} ${tokenStatus} ${tokenError}`;
     const vncAvailable = isVncManualActionAvailable(runtimeStatus);
     const manualStatuses = new Set([
@@ -993,6 +1006,7 @@ function getManualInterventionAlert(statusNote, runtimeStatus) {
         'consecutive_failure_protected',
         'captcha_max_retries_exceeded',
         'password_login_backoff_wait',
+        'qr_login_grace_wait',
         'token_refresh_failed',
         'token_refresh_exception',
     ]);
@@ -1006,7 +1020,9 @@ function getManualInterventionAlert(statusNote, runtimeStatus) {
     }
 
     let title = noteText || '检测到滑块/风控，需要人工处理';
-    if (tokenStatus === 'password_login_backoff_wait' && backoffRemainingSeconds > 0) {
+    if (qrGraceWaiting) {
+        title = `账号正在稳定，当前需要等待 ${backoffRemainingMinutes} 分钟…`;
+    } else if (tokenStatus === 'password_login_backoff_wait' && backoffRemainingSeconds > 0) {
         title = `自动验证失败，当前需要等待 ${backoffRemainingMinutes} 分钟…`;
     } else if (!noteText && tokenStatus === 'captcha_max_retries_exceeded') {
         title = vncAvailable ? '滑块自动处理失败，需要人工接管' : '滑块自动处理失败，需重新发起恢复';
@@ -1015,6 +1031,8 @@ function getManualInterventionAlert(statusNote, runtimeStatus) {
     let detail = tokenError || '系统检测到认证链路异常。';
     if (vncAvailable) {
         detail = tokenError || '当前存在可接管的浏览器流程，请通过远程桌面完成滑块、扫码、人脸或其他风控验证。';
+    } else if (qrGraceWaiting) {
+        detail = `扫码登录已完成，系统正在稳定账号，当前无需操作，请等待约 ${backoffRemainingMinutes} 分钟。`;
     } else if (tokenStatus === 'password_login_backoff_wait' && backoffRemainingSeconds > 0) {
         detail = `平台冷却期间不会启动新的浏览器验证，请等待约 ${backoffRemainingMinutes} 分钟后再重新验证。`;
     } else if (tokenStatus === 'captcha_max_retries_exceeded' || tokenStatus === 'token_refresh_failed' || tokenStatus === 'token_refresh_exception') {

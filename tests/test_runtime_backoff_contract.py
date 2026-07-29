@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import asyncio
 
 import reply_server
 from XianyuAutoAsync import XianyuLive
@@ -86,6 +87,94 @@ def test_frontend_contract_uses_deadline_for_chinese_backoff_countdown():
     source = (REPO_ROOT / "static/js/app.js").read_text(encoding="utf-8")
 
     assert "token_refresh_backoff_until" in source
+    assert "qr_login_grace_until" in source
+    assert "getRuntimeDeadline" in source
     assert "自动验证失败，当前需要等待" in source
+    assert "账号正在稳定，当前需要等待" in source
     assert "Math.ceil" in source
     assert "manual_browser_session_status" in source
+
+
+def test_password_login_rejects_backoff_before_creating_browser_task(monkeypatch):
+    reply_server.password_login_sessions.clear()
+    monkeypatch.setattr(
+        reply_server.db_manager,
+        "get_cookie_details",
+        lambda cid: {
+            "user_id": 7,
+            "username": "demo-user",
+            "password": "demo-password",
+            "show_browser": True,
+        },
+    )
+    monkeypatch.setattr(reply_server.time, "time", lambda: 1000)
+    monkeypatch.setattr(
+        XianyuLive,
+        "get_password_login_failure_backoff",
+        classmethod(lambda cls, cid: {"reason": "slider_failed", "until": 1600}),
+    )
+    monkeypatch.setattr(
+        XianyuLive,
+        "is_manual_refresh_active",
+        classmethod(lambda cls, cid, allow_handoff_recovery=False: False),
+    )
+    created_tasks = []
+    monkeypatch.setattr(reply_server, "_execute_password_login", lambda *args: created_tasks.append(args))
+    monkeypatch.setattr(
+        reply_server.asyncio,
+        "create_task",
+        lambda coroutine: created_tasks.append(coroutine) or object(),
+    )
+
+    response = asyncio.run(
+        reply_server.password_login(
+            {
+                "account_id": "account-1",
+                "refresh_mode": True,
+                "show_browser": True,
+            },
+            {"user_id": 7, "username": "test-user"},
+        )
+    )
+
+    assert response["success"] is False
+    assert response["token_refresh_backoff_reason"] == "slider_failed"
+    assert response["token_refresh_backoff_until"] == 1600
+    assert response["token_refresh_remaining_seconds"] == 600
+    assert response["token_refresh_can_retry"] is False
+    assert response["user_action"] == "wait_backoff"
+    assert "600" in response["message"]
+    assert "分钟" in response["message"]
+    assert created_tasks == []
+    assert reply_server.password_login_sessions == {}
+
+
+def test_automatic_password_recovery_backoff_sets_explicit_status_without_browser(monkeypatch):
+    live = XianyuLive.__new__(XianyuLive)
+    live.cookie_id = "account-1"
+    live.last_token_refresh_status = None
+    live.last_token_refresh_error_message = None
+    live.last_password_login_backoff_log_time = 0
+    live.is_manual_refresh_active = lambda *args, **kwargs: False
+    live._is_account_pause_status = lambda status: False
+    live._should_defer_auth_recovery_for_qr_grace = lambda *args, **kwargs: False
+    live._has_recent_slider_success = lambda *args, **kwargs: False
+    live._create_risk_log = lambda **kwargs: 1
+    live._update_risk_log = lambda *args, **kwargs: None
+    monkeypatch.setattr(reply_server.time, "time", lambda: 1000)
+    monkeypatch.setattr(
+        XianyuLive,
+        "get_password_login_failure_backoff",
+        classmethod(lambda cls, cid: {"reason": "slider_failed", "until": 1600}),
+    )
+    monkeypatch.setattr(
+        XianyuLive,
+        "consume_manual_refresh_slider_failed_bypass",
+        classmethod(lambda cls, cid: False),
+    )
+
+    result = asyncio.run(live._try_password_login_refresh("Token 过期"))
+
+    assert result is False
+    assert live.last_token_refresh_status == "password_login_backoff_wait"
+    assert "600" in live.last_token_refresh_error_message
