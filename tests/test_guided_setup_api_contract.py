@@ -1,5 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
 import reply_server
 
@@ -136,6 +137,11 @@ def test_setup_finish_is_blocked_until_account_is_running_and_delivery_is_config
     monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"account-1": "masked"})
     monkeypatch.setattr(
         reply_server,
+        "_get_republish_store",
+        lambda: SimpleNamespace(list_templates=lambda cookie_id: []),
+    )
+    monkeypatch.setattr(
+        reply_server,
         "_build_live_runtime_status",
         lambda cid: {"connection_state": "connected", "message_stream_ready": True},
     )
@@ -147,6 +153,37 @@ def test_setup_finish_is_blocked_until_account_is_running_and_delivery_is_config
     assert payload["success"] is False
     assert payload["next_action"] == "go_to_delivery_config"
     assert payload["guided_status"]["primary_action"] == "go_to_delivery_config"
+
+
+def test_setup_finish_uses_configured_delivery_summary_and_can_complete(authenticated_client, monkeypatch):
+    monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"account-1": "masked"})
+    monkeypatch.setattr(
+        reply_server,
+        "_get_republish_store",
+        lambda: SimpleNamespace(
+            list_templates=lambda cookie_id: [
+                SimpleNamespace(
+                    auto_delivery=True,
+                    delivery_content="delivery-secret",
+                    sku_delivery={},
+                    delivery_choice="digital",
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        reply_server,
+        "_build_live_runtime_status",
+        lambda cid: {"connection_state": "connected", "message_stream_ready": True},
+    )
+
+    response = authenticated_client.post("/setup/action", json={"action": "finish", "cookie_id": "account-1"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["guided_status"]["primary_action"] == "finish"
+    assert "delivery-secret" not in response.text
 
 
 def test_setup_finish_is_blocked_when_account_is_not_running(authenticated_client, monkeypatch):

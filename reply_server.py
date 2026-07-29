@@ -4588,6 +4588,39 @@ class GuidedSetupActionRequest(BaseModel):
     cid: Optional[str] = None
 
 
+def _get_guided_delivery_summary(cookie_id: str) -> Dict[str, Any]:
+    """Read only a safe completion flag from the existing delivery template store."""
+    try:
+        templates = _get_republish_store().list_templates(cookie_id=cookie_id)
+    except Exception as exc:
+        logger.warning(
+            f"璇诲彇鍚戝浜や粯閰嶇疆澶辫触: {type(exc).__name__}"
+        )
+        return {'configured': False, 'template_count': 0}
+
+    configured = False
+    for template in templates if isinstance(templates, list) else []:
+        if not bool(getattr(template, 'auto_delivery', False)):
+            continue
+        delivery_choice = getattr(template, 'delivery_choice', None)
+        if not isinstance(delivery_choice, str) or not delivery_choice.strip():
+            continue
+        delivery_content = getattr(template, 'delivery_content', None)
+        has_default_content = isinstance(delivery_content, str) and bool(delivery_content.strip())
+        sku_delivery = getattr(template, 'sku_delivery', None)
+        has_sku_content = isinstance(sku_delivery, dict) and any(
+            isinstance(value, str) and bool(value.strip())
+            for value in sku_delivery.values()
+        )
+        if has_default_content or has_sku_content:
+            configured = True
+            break
+    return {
+        'configured': configured,
+        'template_count': len(templates) if isinstance(templates, list) else 0,
+    }
+
+
 def _build_guided_setup_account_status(cookie_id: str, account_details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build the safe guided status for one account without copying secrets."""
     account_details = account_details or {}
@@ -4731,10 +4764,11 @@ def _perform_guided_setup_action_impl(
             }
         if action == 'finish':
             runtime_status = _build_live_runtime_status(cleaned_cookie_id)
+            delivery_summary = _get_guided_delivery_summary(cleaned_cookie_id)
             guided_status = build_guided_status(
                 runtime_status,
                 account_details={'id': cleaned_cookie_id},
-                delivery_summary={'configured': False},
+                delivery_summary=delivery_summary,
             )
             connection_state = str(runtime_status.get('connection_state') or '').strip().lower()
             account_running = (
