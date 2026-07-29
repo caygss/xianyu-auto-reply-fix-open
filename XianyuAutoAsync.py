@@ -11829,6 +11829,9 @@ class XianyuLive:
         reservation_id: str,
         item_id: str = None,
         provider_transport=None,
+        quantity: int = 1,
+        order_line_id: str = None,
+        idempotency_key: str = None,
     ):
         """Prepare a Task 6 delivery payload for the order flow.
 
@@ -11840,19 +11843,30 @@ class XianyuLive:
         from delivery_adapter_service import DeliveryDispatcher, DeliveryRequest
         from delivery_config_service import DeliveryConfigService
 
+        request_context = {
+            "order_id": order_id,
+            "buyer_id": buyer_id,
+            "item_id": item_id,
+            "account_id": self.cookie_id,
+            "card_id": card_id,
+            "quantity": quantity,
+        }
+        if order_line_id:
+            request_context["order_line_id"] = order_line_id
+        if idempotency_key:
+            request_context["idempotency_key"] = idempotency_key
+
         request = DeliveryRequest(
             user_id=getattr(self, "user_id", None),
             card_id=card_id,
             account_id=self.cookie_id,
             order_id=order_id,
             reservation_id=reservation_id,
-            context={
-                "order_id": order_id,
-                "buyer_id": buyer_id,
-                "item_id": item_id,
-                "account_id": self.cookie_id,
-                "card_id": card_id,
-            },
+            context=request_context,
+            quantity=quantity,
+            idempotency_key=idempotency_key,
+            order_line_id=order_line_id,
+            item_id=item_id,
         )
         dispatcher = DeliveryDispatcher(
             DeliveryConfigService(db_manager),
@@ -11860,6 +11874,61 @@ class XianyuLive:
             transport=provider_transport,
         )
         return dispatcher.prepare(request)
+
+    def _orchestrate_configured_delivery(
+        self,
+        *,
+        card_id: int,
+        order_id: str,
+        buyer_id: str,
+        quantity=1,
+        order_line_id: str = None,
+        item_id: str = None,
+        delivery_config,
+        sender,
+        provider_transport=None,
+        idempotency_key: str = None,
+    ):
+        """Run the quantity-aware Task 7 order delivery entry point.
+
+        The legacy ``_auto_delivery`` path remains unchanged; new order callbacks
+        can use this explicit seam and supply their existing message sender.
+        """
+        from card_inventory_service import CardInventoryService
+        from delivery_adapter_service import DeliveryDispatcher
+        from delivery_config_service import DeliveryConfigService
+        from delivery_orchestration_service import (
+            DeliveryOrchestrationRequest,
+            DeliveryOrchestrationService,
+        )
+
+        inventory = CardInventoryService(db_manager)
+        dispatcher = DeliveryDispatcher(
+            DeliveryConfigService(db_manager),
+            inventory,
+            transport=provider_transport,
+        )
+        request = DeliveryOrchestrationRequest(
+            user_id=getattr(self, "user_id", None),
+            card_id=card_id,
+            account_id=self.cookie_id,
+            order_id=order_id,
+            order_line_id=order_line_id,
+            quantity=quantity,
+            delivery_config=delivery_config,
+            item_id=item_id,
+            idempotency_key=idempotency_key,
+            context={
+                "buyer_id": buyer_id,
+                "order_id": order_id,
+                "item_id": item_id,
+                "account_id": self.cookie_id,
+                "card_id": card_id,
+            },
+        )
+        return DeliveryOrchestrationService(db_manager, inventory, dispatcher).orchestrate(
+            request, sender
+        )
 
     async def _auto_delivery(self, item_id: str, item_title: str = None, order_id: str = None, send_user_id: str = None,
                              chat_id: str = None, send_user_name: str = None, include_meta: bool = False,

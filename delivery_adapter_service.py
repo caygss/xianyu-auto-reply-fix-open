@@ -26,6 +26,11 @@ class DeliveryRequest:
     reservation_id: str | None = None
     context: Mapping[str, Any] = field(default_factory=dict)
     mode: str | None = None
+    quantity: int = 1
+    idempotency_key: str | None = None
+    order_line_id: str | None = None
+    item_id: str | None = None
+    delivery_config: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -131,6 +136,10 @@ class ProviderApiAdapter:
     def _payload(config, request):
         payload = copy.deepcopy(config.get("request_body", {}))
         context = dict(request.context or {})
+        if request.quantity != 1 or request.idempotency_key:
+            context.setdefault("quantity", request.quantity)
+        if request.idempotency_key:
+            context.setdefault("idempotency_key", request.idempotency_key)
         mapping = config.get("field_mapping", {})
         if not mapping:
             payload.update(context)
@@ -146,6 +155,10 @@ class ProviderApiAdapter:
                     f"Provider 请求字段缺少：{source}",
                     "provider_request",
                 )
+        if request.quantity != 1 or request.idempotency_key:
+            payload.setdefault("quantity", request.quantity)
+        if request.idempotency_key:
+            payload.setdefault("idempotency_key", request.idempotency_key)
         return payload
 
     @staticmethod
@@ -287,13 +300,22 @@ class DeliveryDispatcher:
             raise DeliveryDispatchError("invalid_request", "交付请求格式无效", "validation")
         if request.mode is not None and request.mode not in DELIVERY_MODES:
             raise DeliveryDispatchError("invalid_mode", "交付方式无效", "validation")
-        try:
-            config_record = self.config_service.get_for_delivery(
-                request.user_id, request.card_id, request.account_id
-            )
-        except DeliveryConfigError as exc:
-            raise self._config_error(exc) from exc
-        mode = config_record["mode"]
+        if request.delivery_config:
+            raw_config = dict(request.delivery_config)
+            mode = str(raw_config.pop("mode", request.mode or "")).strip()
+            try:
+                mode, config = DeliveryConfigService._validate_config(mode, raw_config)
+            except DeliveryConfigError as exc:
+                raise self._config_error(exc) from exc
+            config_record = {"mode": mode, "config": config}
+        else:
+            try:
+                config_record = self.config_service.get_for_delivery(
+                    request.user_id, request.card_id, request.account_id
+                )
+            except DeliveryConfigError as exc:
+                raise self._config_error(exc) from exc
+            mode = config_record["mode"]
         if request.mode is not None and request.mode != mode:
             raise DeliveryDispatchError("mode_mismatch", "请求交付方式与配置不一致", "configuration")
         config = config_record["config"]

@@ -448,6 +448,95 @@ def test_xianyu_delivery_seam_reuses_existing_text_steps(monkeypatch):
     assert captured["request"].reservation_id == "reservation-1"
 
 
+def test_xianyu_delivery_seam_forwards_quantity_and_idempotency_context(monkeypatch):
+    from XianyuAutoAsync import XianyuLive
+
+    captured = {}
+
+    class FakeDispatcher:
+        def __init__(self, config_service, inventory_service, *, transport=None):
+            pass
+
+        def prepare(self, delivery_request):
+            captured["request"] = delivery_request
+            return {"mode": "fixed_link", "content": "https://example.test/item", "content_type": "text"}
+
+    monkeypatch.setattr("delivery_adapter_service.DeliveryDispatcher", FakeDispatcher)
+    live = XianyuLive.__new__(XianyuLive)
+    live.user_id = 1
+    live.cookie_id = "account-a"
+
+    live._prepare_configured_delivery(
+        card_id=7,
+        order_id="order-1",
+        buyer_id="buyer-1",
+        reservation_id="reservation-1",
+        item_id="item-7",
+        quantity=3,
+        order_line_id="line-1",
+        idempotency_key="scope-key",
+    )
+
+    request = captured["request"]
+    assert request.quantity == 3
+    assert request.order_line_id == "line-1"
+    assert request.idempotency_key == "scope-key"
+    assert request.context["quantity"] == 3
+    assert request.context["order_line_id"] == "line-1"
+    assert request.context["idempotency_key"] == "scope-key"
+
+
+def test_xianyu_configured_order_entry_uses_orchestration_service(monkeypatch):
+    from XianyuAutoAsync import XianyuLive
+
+    captured = {}
+
+    class FakeInventory:
+        def __init__(self, db):
+            captured["inventory_db"] = db
+
+    class FakeDispatcher:
+        def __init__(self, config_service, inventory_service, *, transport=None):
+            captured["dispatcher_dependencies"] = (config_service, inventory_service, transport)
+
+    class FakeService:
+        def __init__(self, db, inventory, dispatcher):
+            captured["service_dependencies"] = (db, inventory, dispatcher)
+
+        def orchestrate(self, request, sender):
+            captured["request"] = request
+            captured["sender"] = sender
+            return {"status": "sent"}
+
+    monkeypatch.setattr("card_inventory_service.CardInventoryService", FakeInventory)
+    monkeypatch.setattr("delivery_adapter_service.DeliveryDispatcher", FakeDispatcher)
+    monkeypatch.setattr("delivery_orchestration_service.DeliveryOrchestrationService", FakeService)
+    live = XianyuLive.__new__(XianyuLive)
+    live.user_id = 1
+    live.cookie_id = "account-a"
+    sender = lambda contents, request: True
+
+    result = live._orchestrate_configured_delivery(
+        card_id=7,
+        order_id="order-1",
+        buyer_id="buyer-1",
+        item_id="item-7",
+        quantity="3",
+        order_line_id=None,
+        delivery_config={"mode": "fixed_link", "url": "https://example.test/item"},
+        sender=sender,
+    )
+
+    assert result == {"status": "sent"}
+    request = captured["request"]
+    assert request.user_id == 1
+    assert request.account_id == "account-a"
+    assert request.quantity == "3"
+    assert request.order_line_id is None
+    assert request.context["buyer_id"] == "buyer-1"
+    assert captured["sender"] is sender
+
+
 def test_xianyu_auto_delivery_routes_reserved_content_through_delivery_seam(monkeypatch):
     from XianyuAutoAsync import XianyuLive
 
@@ -507,3 +596,29 @@ def test_xianyu_auto_delivery_routes_reserved_content_through_delivery_seam(monk
         "reservation_id": "reservation-1",
         "item_id": "item-7",
     }
+
+
+def test_provider_adapter_forwards_quantity_and_idempotency_key(services):
+    _, configs, inventory = services
+    configs.save(
+        1,
+        7,
+        "account-a",
+        "provider_api",
+        {"endpoint": "https://provider.test/issue", "token": "t"},
+    )
+    transport = FakeTransport(
+        [ProviderResponse(200, {}, b'{"content":"provider-content"}')]
+    )
+
+    result = DeliveryDispatcher(configs, inventory, transport=transport).prepare(
+        request(
+            quantity=3,
+            idempotency_key="scope-key",
+            context={"order_id": "order-1"},
+        )
+    )
+
+    assert result["content"] == "provider-content"
+    assert transport.calls[0]["json_body"]["quantity"] == 3
+    assert transport.calls[0]["json_body"]["idempotency_key"] == "scope-key"

@@ -706,6 +706,41 @@ class DBManager:
             self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_delivery_finalization_states_status ON delivery_finalization_states(status, updated_at)")
 
             cursor.execute('''
+            CREATE TABLE IF NOT EXISTS delivery_orchestration_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                card_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                order_line_id TEXT NOT NULL,
+                quantity INTEGER NOT NULL CHECK (quantity > 0),
+                mode TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                reservation_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'paused', 'reserved', 'sending', 'sent', 'failed')),
+                result_meta TEXT NOT NULL DEFAULT '{}',
+                last_error_code TEXT,
+                last_error TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                sent_at TIMESTAMP,
+                UNIQUE (user_id, card_id, account_id, order_id, order_line_id),
+                UNIQUE (idempotency_key)
+            )
+            ''')
+            self._execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_delivery_orchestration_states_order_line "
+                "ON delivery_orchestration_states(user_id, account_id, order_id, order_line_id)",
+            )
+            self._execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_delivery_orchestration_states_status "
+                "ON delivery_orchestration_states(status, updated_at)",
+            )
+
+            cursor.execute('''
             CREATE TABLE IF NOT EXISTS data_card_reservations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 card_id INTEGER NOT NULL,
