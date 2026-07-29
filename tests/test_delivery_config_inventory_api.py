@@ -115,6 +115,11 @@ def test_delivery_config_rejects_empty_unknown_mode_and_non_http_link(api_state)
         assert error.value.status_code == 400
         assert error.value.detail["code"] in {"invalid_mode", "invalid_config"}
 
+    with pytest.raises(HTTPException) as malformed_ipv6:
+        _put_config({"mode": "fixed_link", "config": {"url": "http://[::1"}})
+    assert malformed_ipv6.value.status_code == 400
+    assert malformed_ipv6.value.detail["code"] == "invalid_config"
+
 
 def test_delivery_config_rejects_cross_user_and_cross_account_scope(api_state):
     with pytest.raises(HTTPException) as other_user:
@@ -161,11 +166,15 @@ def test_inventory_api_delegates_settings_import_generate_summary_and_masked_pre
     assert imported["inserted"] == 2
     assert imported["duplicates"] == 1
     assert imported["blank"] == 1
+    assert imported["shortage"] == 1
+    assert imported["deficit"] == 1
     assert "manual-secret-a" not in json.dumps(imported, ensure_ascii=False)
     assert "manual-secret-a" not in caplog.text
 
     generated = reply_server.generate_card_inventory(7, "cookie-a", USER)
     assert generated["generated"] == 1
+    assert generated["shortage"] == 0
+    assert generated["deficit"] == 0
     assert "manual-secret" not in json.dumps(generated, ensure_ascii=False)
 
     summary = reply_server.get_card_inventory(7, "cookie-a", USER)
@@ -179,6 +188,33 @@ def test_inventory_api_delegates_settings_import_generate_summary_and_masked_pre
     assert preview["items"]
     assert all("manual-secret" not in item for item in preview["items"])
     assert all("*" in item for item in preview["items"])
+
+
+def test_inventory_settings_round_trip_returns_complete_generator_configuration(api_state):
+    saved = reply_server.update_inventory_settings(
+        card_id=7,
+        account_id="cookie-a",
+        request=reply_server.InventorySettingsRequest(
+            stock_ceiling=8,
+            low_stock_threshold=2,
+            auto_replenish=True,
+            generator_prefix="AC-",
+            generator_length=20,
+            generator_charset="ABCDEFG234567",
+        ),
+        current_user=USER,
+    )
+    assert saved["settings"]["generator_prefix"] == "AC-"
+
+    fetched = reply_server.get_inventory_settings(7, "cookie-a", USER)
+    assert fetched["settings"] == {
+        "stock_ceiling": 8,
+        "low_stock_threshold": 2,
+        "auto_replenish": True,
+        "generator_prefix": "AC-",
+        "generator_length": 20,
+        "generator_charset": "ABCDEFG234567",
+    }
 
 
 def test_inventory_api_rejects_cross_user_scope(api_state):

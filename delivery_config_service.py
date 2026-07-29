@@ -63,7 +63,12 @@ class DeliveryConfigService:
 
         if mode == "fixed_link":
             url = str(normalized.get("url") or "").strip()
-            parsed = urlparse(url)
+            try:
+                parsed = urlparse(url)
+            except (TypeError, ValueError) as exc:
+                raise DeliveryConfigError(
+                    "invalid_config", "固定链接必须是有效的 HTTP 或 HTTPS 链接"
+                ) from exc
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise DeliveryConfigError("invalid_config", "固定链接必须是有效的 HTTP 或 HTTPS 链接")
             normalized["url"] = url
@@ -73,7 +78,12 @@ class DeliveryConfigService:
     def _summary(mode, config):
         summary = {"configured": True, "field_count": len(config)}
         if mode == "fixed_link":
-            summary["url_scheme"] = urlparse(config["url"]).scheme
+            try:
+                summary["url_scheme"] = urlparse(config["url"]).scheme
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DeliveryConfigError(
+                    "invalid_config", "固定链接必须是有效的 HTTP 或 HTTPS 链接"
+                ) from exc
         return summary
 
     @staticmethod

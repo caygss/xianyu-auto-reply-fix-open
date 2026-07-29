@@ -1395,15 +1395,9 @@ def get_inventory_settings(
 ):
     user_id, card_id, account_id = _task5_scope(card_id, account_id, current_user)
     try:
-        summary = _task5_inventory_summary(
-            CardInventoryService(db_manager), card_id, user_id, account_id
-        )
+        settings = CardInventoryService(db_manager).get_settings(card_id, user_id, account_id)
         return {
-            "settings": {
-                "stock_ceiling": summary["stock_ceiling"],
-                "low_stock_threshold": summary["low_stock_threshold"],
-                "auto_replenish": summary["auto_replenish"],
-            },
+            "settings": settings,
             "card_id": card_id,
             "account_id": account_id,
         }
@@ -1470,6 +1464,9 @@ def import_card_inventory(
             request.secrets,
             idempotency_key=request.idempotency_key,
         )
+        summary = _task5_inventory_summary(service, card_id, user_id, account_id)
+        result["shortage"] = summary["shortage"]
+        result["deficit"] = summary["deficit"]
         result["masked_preview"] = service.preview_items(card_id, user_id, account_id)
         return result
     except CardInventoryError as exc:
@@ -1486,6 +1483,9 @@ def generate_card_inventory(
     service = CardInventoryService(db_manager)
     try:
         result = service.generate_items(card_id, user_id, account_id)
+        summary = _task5_inventory_summary(service, card_id, user_id, account_id)
+        result["shortage"] = summary["shortage"]
+        result["deficit"] = summary["deficit"]
         result["masked_preview"] = service.preview_items(card_id, user_id, account_id)
         return result
     except CardInventoryError as exc:

@@ -178,6 +178,13 @@ class CardInventoryService:
         )
         return self._settings_dict(result)
 
+    def get_settings(self, card_id, user_id, account_id):
+        user_id, card_id, account_id = self._scope(user_id, card_id, account_id)
+        with self._transaction() as cursor:
+            settings = self._settings_dict(self._settings_row(cursor, user_id, card_id, account_id))
+        settings.pop("updated_at", None)
+        return settings
+
     def get_inventory_summary(self, card_id, user_id, account_id):
         user_id, card_id, account_id = self._scope(user_id, card_id, account_id)
         with self._transaction() as cursor:
