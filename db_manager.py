@@ -991,7 +991,7 @@ Cookie数量: {cookie_count}
             cursor.execute('''
             INSERT OR IGNORE INTO system_settings (key, value, description) VALUES
             ('theme_color', 'blue', '主题颜色'),
-            ('registration_enabled', 'true', '是否开启用户注册'),
+            ('registration_enabled', 'false', '是否开启用户注册'),
             ('show_default_login_info', 'true', '是否显示默认登录信息'),
             ('login_captcha_enabled', 'true', '是否开启登录验证码'),
             ('risk_control_night_mode_enabled', 'false', '是否启用夜间风控降频'),
@@ -1026,6 +1026,15 @@ Cookie数量: {cookie_count}
 
     def _migrate_database(self, cursor):
         """执行数据库迁移"""
+        # Registration is permanently disabled for the single-user distribution.
+        # Keep this enforcement outside the legacy migration try/except: a
+        # failure must abort init_db and roll back instead of failing open.
+        cursor.execute('''
+        UPDATE system_settings
+        SET value = 'false', updated_at = CURRENT_TIMESTAMP
+        WHERE key = 'registration_enabled'
+        ''')
+
         try:
             # 检查cards表是否存在image_url列
             cursor.execute("PRAGMA table_info(cards)")

@@ -8208,10 +8208,10 @@ def get_registration_status():
         enabled_str = db_manager.get_system_setting('registration_enabled')
         logger.info(f"从数据库获取的注册设置值: '{enabled_str}'")  # 调试信息
 
-        # 如果设置不存在，默认为开启
+        # 单用户模式下设置不存在时默认为关闭
         if enabled_str is None:
-            enabled_bool = True
-            message = '注册功能已开启'
+            enabled_bool = False
+            message = '注册功能已关闭'
         else:
             enabled_bool = enabled_str == 'true'
             message = '注册功能已开启' if enabled_bool else '注册功能已关闭'
@@ -8224,7 +8224,7 @@ def get_registration_status():
         }
     except Exception as e:
         logger.error(f"获取注册状态失败: {e}")
-        return {'enabled': True, 'message': '注册功能已开启'}  # 出错时默认开启
+        return {'enabled': False, 'message': '注册功能已关闭'}
 
 
 @app.get('/login-info-status')
@@ -8261,10 +8261,13 @@ def update_registration_settings(setting_data: RegistrationSettingUpdate, admin_
     """更新注册开关设置（仅管理员）"""
     from db_manager import db_manager
     try:
-        enabled = setting_data.enabled
+        requested_enabled = bool(setting_data.enabled)
+        enabled = False
+        if requested_enabled:
+            logger.warning("拒绝通过注册设置接口开启注册，强制保持关闭")
         success = db_manager.set_system_setting(
             'registration_enabled',
-            'true' if enabled else 'false',
+            'false',
             '是否开启用户注册'
         )
         if success:

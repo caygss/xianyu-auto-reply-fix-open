@@ -16466,18 +16466,30 @@ async function saveOutgoingConfigs(event) {
 
 // 加载注册设置
 async function loadRegistrationSettings() {
+    const checkbox = document.getElementById('registrationEnabled');
+    if (checkbox) {
+        checkbox.checked = false;
+        checkbox.disabled = true;
+    }
+
     try {
         const response = await fetch('/registration-status');
-        if (response.ok) {
-            const data = await response.json();
-            const checkbox = document.getElementById('registrationEnabled');
-            if (checkbox) {
-                checkbox.checked = data.enabled;
-            }
+        if (!response.ok) {
+            throw new Error('加载注册设置失败');
+        }
+
+        await response.json();
+        if (checkbox) {
+            checkbox.checked = false;
+            checkbox.disabled = true;
         }
     } catch (error) {
         console.error('加载注册设置失败:', error);
         showToast('加载注册设置失败', 'danger');
+        if (checkbox) {
+            checkbox.checked = false;
+            checkbox.disabled = true;
+        }
     }
 }
 
@@ -16514,7 +16526,6 @@ async function loadLoginInfoSettings() {
 
 // 更新登录与注册设置
 async function updateLoginInfoSettings() {
-    const registrationCheckbox = document.getElementById('registrationEnabled');
     const checkbox = document.getElementById('showDefaultLoginInfo');
     const captchaCheckbox = document.getElementById('loginCaptchaEnabled');
     const statusDiv = document.getElementById('loginInfoStatus');
@@ -16522,27 +16533,6 @@ async function updateLoginInfoSettings() {
 
     try {
         let messages = [];
-
-        // 更新用户注册设置
-        if (registrationCheckbox) {
-            const regEnabled = registrationCheckbox.checked;
-            const regResponse = await fetch('/registration-settings', {
-                method: 'PUT',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${authToken}`
-                },
-                body: JSON.stringify({ enabled: regEnabled })
-            });
-
-            if (regResponse.ok) {
-                messages.push(regEnabled ? '用户注册已开启' : '用户注册已关闭');
-            } else {
-                const errorData = await regResponse.json();
-                showToast(`更新注册设置失败: ${errorData.detail || '未知错误'}`, 'danger');
-                return;
-            }
-        }
 
         // 更新显示默认登录信息设置
         if (checkbox) {

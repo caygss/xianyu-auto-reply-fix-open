@@ -1,5 +1,13 @@
 # Windows 分发说明
 
+## Windows single-user first use and isolation
+
+One buyer uses one package on one computer and one installation directory. Unzip the package, double-click `XianyuAutoDelivery.exe`, and sign in with the local default administrator account (`admin` / `admin123`). Change the password at first login before configuring the Xianyu account, default fixed cloud-drive link, and SKU override links.
+
+No SMTP is required, and no ordinary user registration is needed: registration is permanently disabled. The package supports local automatic delivery, publish, and republish workflows without forced online registration or embedded credentials.
+
+Keep `data/`, `browser_data/`, `logs/`, and local configuration inside the installation directory. Separate computers and separate installation directories have separate SQLite databases and Cookies. Do not copy an already-running directory to another buyer or run two instances from one installation directory.
+
 ## 编译版安装包
 
 本项目的 Windows 分发形式是单目录编译包。安装包包含可执行文件、网页资源、Node.js、Playwright Chromium、启动脚本、许可证和 `SOURCE-CODE.md`，不包含 Python 源文件，也不要求使用 Docker。
@@ -38,8 +46,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\build_windows_ex
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\build_windows_distribution.ps1 `
-  -SourceTag windows-installer-v1.0.0 `
-  -SourceCommit <发布标签对应的完整提交号>
+  -SourceTag "working-tree-uncommitted" `
+  -SourceCommit (git rev-parse HEAD)
 ```
 
 输出位于源码仓库的 `dist` 目录。构建脚本只复制已经编译的 payload、启动脚本、许可证和必要文档，并在压缩前检查 Python 源文件、数据库、日志、Cookie、Token 和密钥模式。

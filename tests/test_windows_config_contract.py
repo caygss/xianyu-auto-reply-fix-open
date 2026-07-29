@@ -9,12 +9,46 @@ from Start import load_republish_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
+README = ROOT / "README.md"
+WINDOWS_GUIDE = ROOT / "docs" / "windows-distribution.md"
 RUNBOOK = ROOT / "docs" / "windows-republish-runbook.md"
 
 
 def _runbook_text() -> str:
     assert RUNBOOK.exists(), "Windows runbook must exist"
     return RUNBOOK.read_text(encoding="utf-8")
+
+
+def _windows_documentation() -> str:
+    return "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (README, WINDOWS_GUIDE, RUNBOOK)
+    )
+
+
+def test_windows_docs_explain_single_user_first_use_and_isolation() -> None:
+    text = _windows_documentation()
+    required_phrases = (
+        "XianyuAutoDelivery.exe",
+        "default administrator account",
+        "admin123",
+        "first login",
+        "SMTP",
+        "ordinary user",
+        "registration is permanently disabled",
+        "one computer",
+        "one installation directory",
+        "data/",
+        "browser_data/",
+        "logs/",
+        "Do not copy",
+        "two instances",
+        "automatic delivery",
+        "publish",
+        "republish",
+    )
+    for phrase in required_phrases:
+        assert phrase in text, f"Windows docs missing required guidance: {phrase}"
 
 
 def test_runbook_covers_safe_windows_setup_and_operations() -> None:

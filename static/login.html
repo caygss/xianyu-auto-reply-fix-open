@@ -265,7 +265,7 @@
       </form>
 
       <!-- 注册链接 -->
-      <div id="registerSection" class="text-center mt-3">
+      <div id="registerSection" class="text-center mt-3" hidden>
         <span class="text-muted">还没有账号？</span>
         <a href="/register.html" class="text-decoration-none">
           <i class="bi bi-person-plus me-1"></i>立即注册
@@ -881,18 +881,21 @@
 
     // 检查注册状态
     async function checkRegistrationStatus() {
+      const registerSection = document.getElementById('registerSection');
       try {
         const response = await fetch('/registration-status');
-        if (response.ok) {
-          const data = await response.json();
-          const registerSection = document.getElementById('registerSection');
-          if (registerSection) {
-            registerSection.style.display = data.enabled ? 'block' : 'none';
-          }
+        if (!response.ok) {
+          if (registerSection) registerSection.style.display = 'none';
+          return;
+        }
+
+        const data = await response.json();
+        if (registerSection) {
+          registerSection.style.display = data.enabled ? 'block' : 'none';
         }
       } catch (error) {
         console.error('检查注册状态失败:', error);
-        // 出错时默认显示注册链接
+        if (registerSection) registerSection.style.display = 'none';
       }
     }
 

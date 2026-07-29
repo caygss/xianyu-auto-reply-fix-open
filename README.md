@@ -186,6 +186,14 @@ This repository contains the complete corresponding source for the compiled Wind
 
 The compiled package contains no Python source files. Each release package includes `SOURCE-CODE.md` with the exact public source repository, release tag, and commit used to build it. Do not distribute runtime databases, cookies, browser sessions, logs, API keys, email credentials, or seller-specific links.
 
+## Windows single-user first use and data isolation
+
+Each buyer should use one package on one computer and one installation directory. Unzip the package into its own folder, then double-click `XianyuAutoDelivery.exe`. Sign in with the local default administrator account (`admin` / `admin123`), change the password at first login, and then configure the Xianyu account, the default fixed cloud-drive link, and any SKU override links.
+
+This workflow does not require SMTP and does not require registering an ordinary user account; registration is permanently disabled. Configure automatic delivery, publish, and republish features from the local administration page as needed.
+
+The installation directory is the isolation boundary: `data/`, `browser_data/`, `logs/`, and local configuration stay inside that directory. Independent computers and independent installation directories do not share SQLite data or Cookies. Do not copy an already-running directory to another buyer, and do not run two instances from the same installation directory.
+
 ## Star History
 
 <a href="https://www.star-history.com/#GuDong2003/xianyu-auto-reply-fix&Date">
