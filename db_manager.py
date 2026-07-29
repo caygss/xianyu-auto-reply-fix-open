@@ -734,7 +734,7 @@ class DBManager:
                 user_id INTEGER NOT NULL,
                 card_id INTEGER NOT NULL,
                 account_id TEXT NOT NULL,
-                stock_ceiling INTEGER NOT NULL DEFAULT 100 CHECK (stock_ceiling >= 0),
+                stock_ceiling INTEGER NOT NULL DEFAULT 100 CHECK (stock_ceiling > 0),
                 low_stock_threshold INTEGER NOT NULL DEFAULT 20 CHECK (low_stock_threshold >= 0),
                 auto_replenish INTEGER NOT NULL DEFAULT 0 CHECK (auto_replenish IN (0, 1)),
                 generator_prefix TEXT NOT NULL DEFAULT '',
