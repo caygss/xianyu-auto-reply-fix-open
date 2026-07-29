@@ -803,6 +803,26 @@ class DBManager:
                 "ON card_inventory_reservations(user_id, card_id, account_id, order_id)",
             )
 
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS item_delivery_configs (
+                user_id INTEGER NOT NULL,
+                card_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK (
+                    mode IN ('fixed_link', 'imported_card', 'generated_card', 'provider_api')
+                ),
+                config_text TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, card_id, account_id)
+            )
+            ''')
+            self._execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_item_delivery_configs_account "
+                "ON item_delivery_configs(user_id, account_id)",
+            )
+
             # 创建默认回复表
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS default_replies (

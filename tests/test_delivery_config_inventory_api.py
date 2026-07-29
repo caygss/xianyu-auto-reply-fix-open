@@ -65,7 +65,8 @@ def test_task5_routes_are_present_and_authenticated():
     }
     assert expected <= actual
     for route in reply_server.app.routes:
-        if route.path in {item[0] for item in expected}:
+        route_path = getattr(route, "path", "")
+        if route_path in {item[0] for item in expected}:
             assert any(
                 dependency.call is reply_server.get_current_user
                 for dependency in route.dependant.dependencies

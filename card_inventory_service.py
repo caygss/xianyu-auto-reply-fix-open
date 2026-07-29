@@ -346,6 +346,29 @@ class CardInventoryService:
     def replenish_generated_inventory(self, card_id, user_id, account_id):
         return self.generate_items(card_id, user_id, account_id)
 
+    @staticmethod
+    def _mask_secret(secret_text):
+        text = str(secret_text or "")
+        if len(text) <= 4:
+            return "*" * len(text)
+        return f"{text[:2]}{'*' * (len(text) - 4)}{text[-2:]}"
+
+    def preview_items(self, card_id, user_id, account_id, limit=20):
+        user_id, card_id, account_id = self._scope(user_id, card_id, account_id)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 or limit > 100:
+            raise CardInventoryError("invalid_quantity", "预览数量必须在 1 到 100 之间")
+        with self._transaction() as cursor:
+            rows = cursor.execute(
+                """
+                SELECT secret_text FROM card_inventory_items
+                WHERE user_id = ? AND card_id = ? AND account_id = ?
+                  AND status = 'available'
+                ORDER BY id ASC LIMIT ?
+                """,
+                (user_id, card_id, account_id, limit),
+            ).fetchall()
+        return [self._mask_secret(self.db._decrypt_secret(row[0])) for row in rows]
+
     def _reservation_row(self, cursor, reservation_id):
         return cursor.execute(
             """

@@ -67,6 +67,8 @@ from republish_template_service import (
     safe_delivery_summary,
 )
 from guided_setup_service import build_guided_status, is_guided_runtime_ready
+from card_inventory_service import CardInventoryError, CardInventoryService
+from delivery_config_service import DeliveryConfigError, DeliveryConfigService
 from runtime_paths import app_root
 
 from loguru import logger
@@ -1194,6 +1196,25 @@ class PersonalBlacklistToggleRequest(BaseModel):
     is_enabled: bool
 
 
+class DeliveryConfigRequest(BaseModel):
+    mode: str
+    config: Dict[str, Any]
+
+
+class InventorySettingsRequest(BaseModel):
+    stock_ceiling: Optional[int] = None
+    low_stock_threshold: Optional[int] = None
+    auto_replenish: Optional[bool] = None
+    generator_prefix: Optional[str] = None
+    generator_length: Optional[int] = None
+    generator_charset: Optional[str] = None
+
+
+class InventoryImportRequest(BaseModel):
+    secrets: List[str]
+    idempotency_key: Optional[str] = None
+
+
 app = FastAPI(
     title="Xianyu Management API",
     version="1.0.0",
@@ -1279,6 +1300,218 @@ uploads_dir = os.path.join(static_dir, 'uploads', 'images')
 if not os.path.exists(uploads_dir):
     os.makedirs(uploads_dir, exist_ok=True)
     logger.info(f"创建图片上传目录: {uploads_dir}")
+
+
+def _task5_scope(card_id: int, account_id: str, current_user: Dict[str, Any]):
+    cleaned_account_id = _ensure_cookie_access(account_id, current_user)
+    try:
+        cleaned_card_id = int(card_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="商品 ID 无效") from exc
+    if cleaned_card_id <= 0:
+        raise HTTPException(status_code=400, detail="商品 ID 无效")
+    card = db_manager.get_card_by_id(cleaned_card_id, current_user["user_id"])
+    if not card:
+        raise HTTPException(status_code=403, detail="无权限操作该商品")
+    return current_user["user_id"], cleaned_card_id, cleaned_account_id
+
+
+def _task5_http_error(exc):
+    if isinstance(exc, DeliveryConfigError):
+        status_code = 404 if exc.code == "config_not_found" else 400
+    else:
+        status_code = {
+            "reservation_not_found": 404,
+            "scope_mismatch": 403,
+            "insufficient_inventory": 409,
+            "inventory_ceiling_exceeded": 409,
+            "invalid_state_transition": 409,
+        }.get(getattr(exc, "code", ""), 400)
+    raise HTTPException(
+        status_code=status_code,
+        detail={"code": getattr(exc, "code", "task5_error"), "message": str(exc)},
+    ) from exc
+
+
+def _task5_inventory_summary(service, card_id, user_id, account_id):
+    summary = service.get_inventory_summary(card_id, user_id, account_id)
+    summary["shortage"] = max(
+        summary["stock_ceiling"] - summary["available"] - summary["reserved"],
+        0,
+    )
+    summary["deficit"] = summary["shortage"]
+    return summary
+
+
+@app.get("/api/cards/{card_id}/delivery-config")
+def get_delivery_config(
+    card_id: int,
+    account_id: str = Query(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id, card_id, account_id = _task5_scope(card_id, account_id, current_user)
+    try:
+        return DeliveryConfigService(db_manager).get(user_id, card_id, account_id)
+    except DeliveryConfigError as exc:
+        _task5_http_error(exc)
+
+
+@app.put("/api/cards/{card_id}/delivery-config")
+def put_delivery_config(
+    card_id: int,
+    account_id: str = Query(...),
+    request: DeliveryConfigRequest = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id, card_id, account_id = _task5_scope(card_id, account_id, current_user)
+    if request is None:
+        raise HTTPException(status_code=400, detail="交付配置不能为空")
+    try:
+        return DeliveryConfigService(db_manager).save(
+            user_id, card_id, account_id, request.mode, request.config
+        )
+    except DeliveryConfigError as exc:
+        _task5_http_error(exc)
+
+
+@app.delete("/api/cards/{card_id}/delivery-config")
+def delete_delivery_config(
+    card_id: int,
+    account_id: str = Query(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id, card_id, account_id = _task5_scope(card_id, account_id, current_user)
+    try:
+        return DeliveryConfigService(db_manager).delete(user_id, card_id, account_id)
+    except DeliveryConfigError as exc:
+        _task5_http_error(exc)
+
+
+@app.get("/api/cards/{card_id}/inventory/settings")
+def get_inventory_settings(
+    card_id: int,
+    account_id: str = Query(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id, card_id, account_id = _task5_scope(card_id, account_id, current_user)
+    try:
+        summary = _task5_inventory_summary(
+            CardInventoryService(db_manager), card_id, user_id, account_id
+        )
+        return {
+            "settings": {
+                "stock_ceiling": summary["stock_ceiling"],
+                "low_stock_threshold": summary["low_stock_threshold"],
+                "auto_replenish": summary["auto_replenish"],
+            },
+            "card_id": card_id,
+            "account_id": account_id,
+        }
+    except CardInventoryError as exc:
+        _task5_http_error(exc)
+
+
+@app.put("/api/cards/{card_id}/inventory/settings")
+def update_inventory_settings(
+    card_id: int,
+    account_id: str = Query(...),
+    request: InventorySettingsRequest = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id, card_id, account_id = _task5_scope(card_id, account_id, current_user)
+    if request is None:
+        raise HTTPException(status_code=400, detail="库存设置不能为空")
+    service = CardInventoryService(db_manager)
+    try:
+        settings = service.save_settings(
+            card_id,
+            user_id,
+            account_id,
+            **request.model_dump(exclude_unset=True),
+        )
+        return {"settings": settings, "card_id": card_id, "account_id": account_id}
+    except CardInventoryError as exc:
+        _task5_http_error(exc)
+
+
+@app.get("/api/cards/{card_id}/inventory")
+def get_card_inventory(
+    card_id: int,
+    account_id: str = Query(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id, card_id, account_id = _task5_scope(card_id, account_id, current_user)
+    try:
+        return {
+            "inventory": _task5_inventory_summary(
+                CardInventoryService(db_manager), card_id, user_id, account_id
+            )
+        }
+    except CardInventoryError as exc:
+        _task5_http_error(exc)
+
+
+@app.post("/api/cards/{card_id}/inventory/import")
+def import_card_inventory(
+    card_id: int,
+    account_id: str = Query(...),
+    request: InventoryImportRequest = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id, card_id, account_id = _task5_scope(card_id, account_id, current_user)
+    if request is None:
+        raise HTTPException(status_code=400, detail="导入卡密不能为空")
+    service = CardInventoryService(db_manager)
+    try:
+        result = service.import_items(
+            card_id,
+            user_id,
+            account_id,
+            request.secrets,
+            idempotency_key=request.idempotency_key,
+        )
+        result["masked_preview"] = service.preview_items(card_id, user_id, account_id)
+        return result
+    except CardInventoryError as exc:
+        _task5_http_error(exc)
+
+
+@app.post("/api/cards/{card_id}/inventory/generate")
+def generate_card_inventory(
+    card_id: int,
+    account_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id, card_id, account_id = _task5_scope(card_id, account_id, current_user)
+    service = CardInventoryService(db_manager)
+    try:
+        result = service.generate_items(card_id, user_id, account_id)
+        result["masked_preview"] = service.preview_items(card_id, user_id, account_id)
+        return result
+    except CardInventoryError as exc:
+        _task5_http_error(exc)
+
+
+@app.get("/api/cards/{card_id}/inventory/preview")
+def preview_card_inventory(
+    card_id: int,
+    account_id: str = Query(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    limit: int = Query(20, ge=1, le=100),
+):
+    user_id, card_id, account_id = _task5_scope(card_id, account_id, current_user)
+    try:
+        service = CardInventoryService(db_manager)
+        if not isinstance(limit, int):
+            limit = 20
+        return {
+            "items": service.preview_items(card_id, user_id, account_id, limit=limit),
+            "card_id": card_id,
+            "account_id": account_id,
+        }
+    except CardInventoryError as exc:
+        _task5_http_error(exc)
+
 
 # 健康检查端点
 @app.get('/health')
@@ -4721,7 +4954,7 @@ def _get_guided_delivery_summary(cookie_id: str) -> Dict[str, Any]:
         logger.warning(
             f"璇诲彇鍚戝浜や粯閰嶇疆澶辫触: {type(exc).__name__}"
         )
-        return {'configured': False, 'template_count': 0}
+        templates = []
 
     configured = False
     for template in templates if isinstance(templates, list) else []:
@@ -4740,9 +4973,18 @@ def _get_guided_delivery_summary(cookie_id: str) -> Dict[str, Any]:
         if has_default_content or has_sku_content:
             configured = True
             break
+    config_count = 0
+    try:
+        account_details = db_manager.get_cookie_details(cookie_id) or {}
+        config_count = DeliveryConfigService(db_manager).count_for_account(
+            account_details.get('user_id'), cookie_id
+        )
+    except Exception as exc:
+        logger.warning(f"读取向导交付配置摘要失败: {type(exc).__name__}")
     return {
-        'configured': configured,
+        'configured': configured or config_count > 0,
         'template_count': len(templates) if isinstance(templates, list) else 0,
+        'config_count': config_count,
     }
 
 
