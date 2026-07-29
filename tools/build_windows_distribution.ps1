@@ -100,7 +100,18 @@ try {
     New-Item -ItemType File -Path $ownershipMarker -Force | Out-Null
 
     Get-ChildItem -LiteralPath $CompiledRoot -Force | ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stagingRoot $_.Name) -Recurse -Force
+        $entryName = $_.Name
+        if ($_.PSIsContainer -and ($excludedDirectoryNames -contains $entryName)) {
+            return
+        }
+        if (-not $_.PSIsContainer) {
+            foreach ($pattern in ($excludedFilePatterns + $sensitiveFilePatterns)) {
+                if ($entryName -like $pattern) {
+                    return
+                }
+            }
+        }
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stagingRoot $entryName) -Recurse -Force
     }
 
     foreach ($requiredFile in @("LICENSE", "README.md")) {

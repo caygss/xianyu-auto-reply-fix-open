@@ -39,7 +39,7 @@ def test_distribution_builder_contains_complete_runtime_and_sensitive_exclusions
         assert entry in text, f"missing exclusion: {entry}"
     for phrase in (
         "staging", "Copy-Item", "sensitive", "clean", "Stop", "[guid]::NewGuid",
-        "Resolve-Path", "GetFullPath", "StartsWith", "createdStaging",
+        "Resolve-Path", "GetFullPath", "StartsWith", "createdStaging", "PSIsContainer",
     ):
         assert phrase.lower() in text.lower()
 
