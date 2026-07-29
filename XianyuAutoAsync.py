@@ -1994,6 +1994,8 @@ class XianyuLive:
         self.token_refresh_task = None
         self.last_token_refresh_status = None  # Token刷新状态追踪
         self.last_token_refresh_error_message = None  # Token刷新失败详情，供通知文案分流
+        self.manual_browser_session_status = None
+        self.manual_browser_reason = None
         self.last_session_keepalive_status = None
         self.last_session_keepalive_error_message = None
         self.pending_slider_success_notice = None  # 滑块成功后的延迟成功通知，避免会话未恢复时误报
@@ -7731,6 +7733,7 @@ class XianyuLive:
                             else:
                                 logger.error(f"【{self.cookie_id}】滑块验证失败")
                                 XianyuLive.set_password_login_failure_backoff(self.cookie_id, 'slider_failed', 600)
+                                self.last_token_refresh_status = "password_login_backoff_wait"
                                 self.last_token_refresh_error_message = "滑块验证失败，未获取到新Cookie"
                                 logger.warning(f"【{self.cookie_id}】已进入滑块失败退避期: slider_failed, 600秒")
 
@@ -7763,6 +7766,7 @@ class XianyuLive:
                             logger.error(f"【{self.cookie_id}】滑块验证处理异常: {self._safe_str(captcha_e)}")
                             self._clear_pending_slider_success_notice("滑块验证处理异常")
                             XianyuLive.set_password_login_failure_backoff(self.cookie_id, 'slider_failed', 600)
+                            self.last_token_refresh_status = "password_login_backoff_wait"
                             self.last_token_refresh_error_message = self._safe_str(captcha_e)
                             logger.warning(f"【{self.cookie_id}】滑块验证异常后进入退避期: slider_failed, 600秒")
 
@@ -8112,7 +8116,13 @@ class XianyuLive:
                 slider_stealth.risk_trigger_scene = 'token_refresh'
 
                 # 直接使用异步方法执行滑块验证（避免 ThreadPoolExecutor 导致的 Playwright 初始化问题）
-                strict_result = await run_slider_async_with_fallback(slider_stealth, verification_url, engine="playwright")
+                self.manual_browser_session_status = "processing" if show_browser else None
+                self.manual_browser_reason = "active_token_refresh" if show_browser else None
+                try:
+                    strict_result = await run_slider_async_with_fallback(slider_stealth, verification_url, engine="playwright")
+                finally:
+                    self.manual_browser_session_status = None
+                    self.manual_browser_reason = None
                 self.last_slider_captcha_engine = strict_result.engine
                 self.last_slider_result_message = strict_result.message
 
@@ -8745,14 +8755,20 @@ class XianyuLive:
             slider = XianyuSliderStealth(user_id=self.cookie_id, enable_learning=True, headless=not show_browser)
             slider.risk_session_id = risk_session_id
             slider.risk_trigger_scene = trigger_scene
-            result = await slider._run_sync_method_on_fresh_thread(
-                slider.login_with_password_playwright,
-                account=username,
-                password=password,
-                show_browser=show_browser,
-                notification_callback=notification_callback_wrapper,
-                force_clean_context=True,
-            )
+            self.manual_browser_session_status = "processing" if show_browser else None
+            self.manual_browser_reason = "active_password_refresh" if show_browser else None
+            try:
+                result = await slider._run_sync_method_on_fresh_thread(
+                    slider.login_with_password_playwright,
+                    account=username,
+                    password=password,
+                    show_browser=show_browser,
+                    notification_callback=notification_callback_wrapper,
+                    force_clean_context=True,
+                )
+            finally:
+                self.manual_browser_session_status = None
+                self.manual_browser_reason = None
             
             if result:
                 logger.info(f"【{self.cookie_id}】密码登录成功，获取到Cookie")

@@ -4096,6 +4096,56 @@ def _safe_runtime_deadline(value: Any) -> int:
         return 0
 
 
+def _build_token_refresh_action_contract(
+    *,
+    token_refresh_status: Any,
+    backoff_reason: Any = None,
+    backoff_until: Any = 0,
+    manual_browser_active: bool = False,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """将认证恢复的后端截止时间转换成前端可执行的状态契约。"""
+    now = time.time() if now is None else float(now)
+    status = str(token_refresh_status or '').strip()
+    reason = str(backoff_reason or '').strip() or None
+    deadline = _safe_runtime_deadline(backoff_until)
+    remaining_seconds = max(0, int(deadline - now)) if deadline > now else 0
+    manual_statuses = {
+        'verification_pending_manual',
+        'manual_verification_required',
+        'manual_refresh_active',
+        'manual_refresh_browser_stabilizing',
+    }
+    failure_statuses = {
+        'captcha_max_retries_exceeded',
+        'token_expired_recovery_failed',
+        'token_refresh_failed',
+        'token_refresh_exception',
+        'password_login_backoff_wait',
+    }
+
+    if remaining_seconds > 0:
+        can_retry = False
+        user_action = 'wait_backoff'
+    elif status in manual_statuses:
+        can_retry = False
+        user_action = 'complete_manual_verification' if manual_browser_active else 'open_manual_verification'
+    elif status in failure_statuses or reason == 'slider_failed':
+        can_retry = True
+        user_action = 'open_manual_verification'
+    else:
+        can_retry = True
+        user_action = 'refresh_status'
+
+    return {
+        'token_refresh_backoff_reason': reason,
+        'token_refresh_backoff_until': deadline,
+        'token_refresh_remaining_seconds': remaining_seconds,
+        'token_refresh_can_retry': can_retry,
+        'user_action': user_action,
+    }
+
+
 def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     cleaned_cid = str(cookie_id or '').strip()
     runtime_status = {
@@ -4111,8 +4161,11 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'token_refresh_status': None,
         'token_refresh_error_message': None,
         'qr_login_grace_until': 0,
+        'token_refresh_backoff_reason': None,
         'token_refresh_backoff_until': 0,
         'token_refresh_remaining_seconds': 0,
+        'token_refresh_can_retry': True,
+        'user_action': 'refresh_status',
         'token_last_refreshed_at': None,
         'token_last_refreshed_at_display': None,
         'token_age_seconds': None,
@@ -4189,6 +4242,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     except Exception:
         live_instance = None
 
+    backoff_state = None
     try:
         from XianyuAutoAsync import XianyuLive
     except Exception as e:
@@ -4203,12 +4257,26 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         try:
             backoff_state = XianyuLive.get_password_login_failure_backoff(cleaned_cid) or {}
             backoff_until = _safe_runtime_deadline(backoff_state.get('until'))
+            backoff_reason = backoff_state.get('reason')
             runtime_status['token_refresh_backoff_until'] = backoff_until
+            runtime_status['token_refresh_backoff_reason'] = backoff_reason
             if backoff_until > time.time():
                 runtime_status['token_refresh_remaining_seconds'] = max(0, int(backoff_until - time.time()))
                 current_status = str(runtime_status.get('token_refresh_status') or '').strip()
                 if current_status not in {'verification_pending_manual', 'manual_verification_required', 'qr_login_grace_wait'}:
                     runtime_status['token_refresh_status'] = 'password_login_backoff_wait'
+            runtime_status.update(_build_token_refresh_action_contract(
+                token_refresh_status=runtime_status.get('token_refresh_status'),
+                backoff_reason=backoff_reason,
+                backoff_until=backoff_until,
+            ))
+            qr_deadline = _safe_runtime_deadline(runtime_status.get('qr_login_grace_until'))
+            if qr_deadline > time.time() and backoff_until <= time.time():
+                runtime_status.update({
+                    'token_refresh_remaining_seconds': max(0, int(qr_deadline - time.time())),
+                    'token_refresh_can_retry': False,
+                    'user_action': 'wait_backoff',
+                })
         except Exception as exc:
             logger.warning(f"读取账号恢复等待状态失败: {cleaned_cid}, {mask_sensitive_text(exc)}")
 
@@ -4253,6 +4321,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
 
     qr_login_grace_until = _safe_runtime_deadline(runtime_status.get('qr_login_grace_until'))
     token_refresh_backoff_until = _safe_runtime_deadline(runtime_status.get('token_refresh_backoff_until'))
+    token_refresh_backoff_reason = runtime_status.get('token_refresh_backoff_reason')
     if qr_login_grace_until > now:
         token_refresh_status = 'qr_login_grace_wait'
         runtime_status['token_refresh_remaining_seconds'] = max(0, int(qr_login_grace_until - now))
@@ -4416,16 +4485,26 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         manual_browser_status = None
         manual_browser_reason = None
 
-    vnc_relevant_token_statuses = {
-        'manual_refresh_active',
-        'manual_refresh_browser_stabilizing',
-        'verification_pending_manual',
-        'manual_verification_required',
-    }
-    vnc_manual_action_available = bool(
-        manual_browser_status
-        or token_refresh_status in vnc_relevant_token_statuses
+    if not manual_browser_status:
+        instance_browser_status = str(getattr(live_instance, 'manual_browser_session_status', '') or '').strip()
+        if instance_browser_status:
+            manual_browser_status = instance_browser_status
+            manual_browser_reason = getattr(live_instance, 'manual_browser_reason', None)
+
+    vnc_manual_action_available = bool(manual_browser_status)
+    recovery_contract = _build_token_refresh_action_contract(
+        token_refresh_status=token_refresh_status,
+        backoff_reason=token_refresh_backoff_reason,
+        backoff_until=token_refresh_backoff_until,
+        manual_browser_active=bool(manual_browser_status),
+        now=now,
     )
+    if qr_login_grace_until > now:
+        recovery_contract.update({
+            'token_refresh_remaining_seconds': max(0, int(qr_login_grace_until - now)),
+            'token_refresh_can_retry': False,
+            'user_action': 'wait_backoff',
+        })
 
     runtime_status.update({
         'instance_exists': True,
@@ -4440,9 +4519,8 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'token_cached': token_cached,
         'token_refresh_status': token_refresh_status,
         'token_refresh_error_message': getattr(live_instance, 'last_token_refresh_error_message', None),
+        **recovery_contract,
         'qr_login_grace_until': qr_login_grace_until,
-        'token_refresh_backoff_until': token_refresh_backoff_until,
-        'token_refresh_remaining_seconds': runtime_status.get('token_refresh_remaining_seconds', 0),
         'token_last_refreshed_at': token_refreshed_at,
         'token_last_refreshed_at_display': _format_runtime_timestamp(token_refreshed_at),
         'token_age_seconds': _get_runtime_age_seconds(token_refreshed_at),
@@ -4658,6 +4736,38 @@ def _build_guided_setup_status_payload(current_user: Dict[str, Any]) -> Dict[str
     }
 
 
+def _schedule_manual_verification_token_recheck(cookie_id: str) -> bool:
+    """完成验证后在账号实例所属事件循环中发起一次无浏览器 Token 检查。"""
+    cleaned_cookie_id = str(cookie_id or '').strip()
+    manager = getattr(cookie_manager, 'manager', None)
+    live_instance = getattr(manager, 'live_instances', {}).get(cleaned_cookie_id) if manager else None
+    target_loop = getattr(manager, 'loop', None) if manager else None
+    if not live_instance or not target_loop or not target_loop.is_running():
+        return False
+
+    async def _recheck():
+        try:
+            await live_instance.refresh_token(
+                captcha_retry_count=0,
+                allow_password_login_recovery=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"人工验证完成后的Token复查失败: {cleaned_cookie_id}, {mask_sensitive_text(exc)}")
+
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if current_loop is target_loop:
+        asyncio.create_task(_recheck())
+    else:
+        asyncio.run_coroutine_threadsafe(_recheck(), target_loop)
+    return True
+
+
 def _build_manual_verification_action_response(
     cookie_id: str,
     action: str,
@@ -4665,6 +4775,14 @@ def _build_manual_verification_action_response(
 ) -> Dict[str, Any]:
     cleaned_cookie_id = _ensure_cookie_access(cookie_id, current_user)
     state = 'open_pending' if action == 'open_manual_verification' else 'complete_pending'
+    token_recheck_scheduled = False
+    if action == 'complete_manual_verification':
+        try:
+            from XianyuAutoAsync import XianyuLive
+            XianyuLive.clear_password_login_failure_backoff(cleaned_cookie_id)
+            token_recheck_scheduled = _schedule_manual_verification_token_recheck(cleaned_cookie_id)
+        except Exception as exc:
+            logger.warning(f"清理人工验证后的登录退避失败: {mask_sensitive_text(exc)}")
     pending_state = {
         'status': state,
         'action': action,
@@ -4687,6 +4805,7 @@ def _build_manual_verification_action_response(
             if action == 'open_manual_verification'
             else '已记录验证完成请求，正在重新检查账号。'
         ),
+        'token_recheck_scheduled': token_recheck_scheduled,
         'guided_status': build_guided_status(
             runtime_status,
             account_details={'id': cleaned_cookie_id},

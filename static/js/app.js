@@ -17,6 +17,7 @@ let aboutDiagnosticsAccounts = [];
 let aboutDiagnosticsInitialized = false;
 let dashboardRuntimeRetryTimer = null;
 let aboutRuntimeRetryTimer = null;
+let aboutRuntimeCountdownTimer = null;
 let lastDashboardRuntimeRetryAt = 0;
 let lastAboutRuntimeRetryAt = 0;
 const DASHBOARD_ANNOUNCEMENT_DISMISS_PREFIX = 'dashboard_announcement_dismissed_';
@@ -856,6 +857,28 @@ function scheduleAboutRuntimeAutoRetry(accountId, runtimeStatus) {
     }, delay);
 }
 
+function scheduleAboutRuntimeCountdown(runtimeStatus) {
+    if (aboutRuntimeCountdownTimer) {
+        clearInterval(aboutRuntimeCountdownTimer);
+        aboutRuntimeCountdownTimer = null;
+    }
+
+    if (getTokenRefreshBackoffRemainingSeconds(runtimeStatus) <= 0) {
+        return;
+    }
+
+    aboutRuntimeCountdownTimer = setInterval(() => {
+        const selectedAccountId = getAboutSelectedAccountId();
+        const selectedAccount = aboutDiagnosticsAccounts.find(account => account.id === selectedAccountId);
+        const latestRuntimeStatus = selectedAccount?.runtime_status || runtimeStatus;
+        if (getTokenRefreshBackoffRemainingSeconds(latestRuntimeStatus) <= 0) {
+            clearInterval(aboutRuntimeCountdownTimer);
+            aboutRuntimeCountdownTimer = null;
+        }
+        renderAboutRuntimeStatus(latestRuntimeStatus);
+    }, 1000);
+}
+
 function renderDashboardAccountRuntimeSnapshot(runtimeStatus) {
     const normalizedRuntimeStatus = runtimeStatus || {};
     const connectionState = normalizedRuntimeStatus.connection_state || 'not_running';
@@ -943,24 +966,24 @@ function isVncManualActionAvailable(runtimeStatus) {
         return false;
     }
 
-    if (runtimeStatus.vnc_manual_action_available === true) {
-        return true;
-    }
+    return runtimeStatus.vnc_manual_action_available === true
+        && Boolean(String(runtimeStatus.manual_browser_session_status || '').trim());
+}
 
-    const tokenStatus = String(runtimeStatus.token_refresh_status || '').trim();
-    const vncRelevantStatuses = new Set([
-        'manual_refresh_active',
-        'manual_refresh_browser_stabilizing',
-        'verification_pending_manual',
-        'manual_verification_required',
-    ]);
-    return vncRelevantStatuses.has(tokenStatus);
+function getTokenRefreshBackoffRemainingSeconds(runtimeStatus, now = Date.now()) {
+    const deadline = Number(runtimeStatus?.token_refresh_backoff_until || 0);
+    if (!Number.isFinite(deadline) || deadline <= 0) {
+        return 0;
+    }
+    return Math.max(0, Math.ceil(deadline - (now / 1000)));
 }
 
 function getManualInterventionAlert(statusNote, runtimeStatus) {
     const noteText = String(statusNote || '').trim();
     const tokenStatus = String(runtimeStatus?.token_refresh_status || '').trim();
     const tokenError = String(runtimeStatus?.token_refresh_error_message || '').trim();
+    const backoffRemainingSeconds = getTokenRefreshBackoffRemainingSeconds(runtimeStatus);
+    const backoffRemainingMinutes = Math.ceil(backoffRemainingSeconds / 60);
     const combinedText = `${noteText} ${tokenStatus} ${tokenError}`;
     const vncAvailable = isVncManualActionAvailable(runtimeStatus);
     const manualStatuses = new Set([
@@ -983,8 +1006,8 @@ function getManualInterventionAlert(statusNote, runtimeStatus) {
     }
 
     let title = noteText || '检测到滑块/风控，需要人工处理';
-    if (!noteText && tokenStatus === 'password_login_backoff_wait') {
-        title = '登录恢复退避中，暂不可接管';
+    if (tokenStatus === 'password_login_backoff_wait' && backoffRemainingSeconds > 0) {
+        title = `自动验证失败，当前需要等待 ${backoffRemainingMinutes} 分钟…`;
     } else if (!noteText && tokenStatus === 'captcha_max_retries_exceeded') {
         title = vncAvailable ? '滑块自动处理失败，需要人工接管' : '滑块自动处理失败，需重新发起恢复';
     }
@@ -992,8 +1015,8 @@ function getManualInterventionAlert(statusNote, runtimeStatus) {
     let detail = tokenError || '系统检测到认证链路异常。';
     if (vncAvailable) {
         detail = tokenError || '当前存在可接管的浏览器流程，请通过远程桌面完成滑块、扫码、人脸或其他风控验证。';
-    } else if (tokenStatus === 'password_login_backoff_wait') {
-        detail = tokenError || '当前只是失败退避等待，浏览器流程通常已结束。请重新发起“刷新 Cookie”并勾选“显示浏览器”，或等待退避结束。';
+    } else if (tokenStatus === 'password_login_backoff_wait' && backoffRemainingSeconds > 0) {
+        detail = `平台冷却期间不会启动新的浏览器验证，请等待约 ${backoffRemainingMinutes} 分钟后再重新验证。`;
     } else if (tokenStatus === 'captcha_max_retries_exceeded' || tokenStatus === 'token_refresh_failed' || tokenStatus === 'token_refresh_exception') {
         detail = tokenError || '当前没有可接管的浏览器流程。请重新发起“刷新 Cookie”并勾选“显示浏览器”，让系统打开新的可接管页面。';
     }
@@ -4817,6 +4840,7 @@ async function loadAboutRuntimeStatus(accountId = '') {
     const selectedAccount = aboutDiagnosticsAccounts.find(account => account.id === normalizedAccountId) || null;
     renderAboutAccountMeta(selectedAccount);
     renderAboutRuntimeStatus(selectedAccount?.runtime_status || null);
+    scheduleAboutRuntimeCountdown(selectedAccount?.runtime_status || null);
 
     try {
         const result = await fetchJSON(`${apiBase}/cookies/${encodeURIComponent(normalizedAccountId)}/runtime-status`);
@@ -4827,6 +4851,7 @@ async function loadAboutRuntimeStatus(accountId = '') {
             renderAboutAccountMeta(targetAccount);
         }
         renderAboutRuntimeStatus(runtimeStatus);
+        scheduleAboutRuntimeCountdown(runtimeStatus);
         scheduleAboutRuntimeAutoRetry(normalizedAccountId, runtimeStatus);
     } catch (error) {
         console.error('加载账号运行态失败:', error);
