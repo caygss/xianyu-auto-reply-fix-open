@@ -65,6 +65,7 @@ from republish_template_service import (
     normalize_delivery_content,
     safe_delivery_summary,
 )
+from guided_setup_service import build_guided_status
 from runtime_paths import app_root
 
 from loguru import logger
@@ -4514,6 +4515,133 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'runtime_status': _build_live_runtime_status(cookie_id),
         })
     return result
+
+
+class GuidedSetupActionRequest(BaseModel):
+    action: str
+    cookie_id: Optional[str] = None
+    cid: Optional[str] = None
+
+
+def _build_guided_setup_account_status(cookie_id: str, account_details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build the safe guided status for one account without copying secrets."""
+    account_details = account_details or {}
+    runtime_status = account_details.get('runtime_status')
+    if not isinstance(runtime_status, dict):
+        runtime_status = _build_live_runtime_status(cookie_id)
+    return {
+        'cookie_id': cookie_id,
+        'guided_status': build_guided_status(
+            runtime_status,
+            account_details={'id': cookie_id},
+        ),
+    }
+
+
+def _build_guided_setup_status_payload(current_user: Dict[str, Any]) -> Dict[str, Any]:
+    """Reuse the existing safe account-details route as the status source."""
+    account_details = get_cookies_details(current_user)
+    accounts = []
+    for account in account_details if isinstance(account_details, list) else []:
+        cookie_id = str(account.get('id') or '').strip()
+        if not cookie_id:
+            continue
+        accounts.append(_build_guided_setup_account_status(cookie_id, account))
+    return {
+        'success': True,
+        'accounts': accounts,
+        'status': accounts[0]['guided_status'] if len(accounts) == 1 else None,
+    }
+
+
+def _build_manual_verification_action_response(
+    cookie_id: str,
+    action: str,
+    current_user: Dict[str, Any],
+) -> Dict[str, Any]:
+    cleaned_cookie_id = _ensure_cookie_access(cookie_id, current_user)
+    runtime_status = _build_live_runtime_status(cleaned_cookie_id)
+    return {
+        'success': True,
+        'action': action,
+        'cookie_id': cleaned_cookie_id,
+        'message': (
+            '已准备打开验证页面，请完成页面中的验证。'
+            if action == 'open_manual_verification'
+            else '已记录验证完成请求，系统正在重新检查账号。'
+        ),
+        'guided_status': build_guided_status(runtime_status, account_details={'id': cleaned_cookie_id}),
+    }
+
+
+@app.get('/setup/status')
+def get_guided_setup_status(current_user: Dict[str, Any] = Depends(get_current_user)):
+    return _build_guided_setup_status_payload(current_user)
+
+
+@app.post('/setup/action')
+def perform_guided_setup_action(
+    request: GuidedSetupActionRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    allowed_actions = {
+        'refresh_status',
+        'open_manual_verification',
+        'complete_manual_verification',
+        'go_to_delivery_config',
+        'finish',
+    }
+    action = str(request.action or '').strip()
+    if action not in allowed_actions:
+        raise HTTPException(status_code=400, detail='不支持的向导操作')
+
+    cookie_id = str(request.cookie_id or request.cid or '').strip()
+    if action in {'open_manual_verification', 'complete_manual_verification'}:
+        if not cookie_id:
+            raise HTTPException(status_code=400, detail='该操作需要指定账号')
+        return _build_manual_verification_action_response(cookie_id, action, current_user)
+
+    if cookie_id:
+        cleaned_cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        if action == 'refresh_status':
+            return {
+                'success': True,
+                'action': action,
+                'cookie_id': cleaned_cookie_id,
+                'guided_status': build_guided_status(
+                    _build_live_runtime_status(cleaned_cookie_id),
+                    account_details={'id': cleaned_cookie_id},
+                ),
+            }
+
+    if action == 'refresh_status':
+        return {
+            'success': True,
+            'action': action,
+            **_build_guided_setup_status_payload(current_user),
+        }
+    if action == 'go_to_delivery_config':
+        return {
+            'success': True,
+            'action': action,
+            'message': '请进入交付配置页面，设置买家收到的内容。',
+            'next_step': 'delivery_config',
+        }
+    return {
+        'success': True,
+        'action': action,
+        'message': '向导已完成。',
+    }
+
+
+@app.post('/cookies/{cid}/manual-verification/open')
+def open_manual_verification(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    return _build_manual_verification_action_response(cid, 'open_manual_verification', current_user)
+
+
+@app.post('/cookies/{cid}/manual-verification/complete')
+def complete_manual_verification(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    return _build_manual_verification_action_response(cid, 'complete_manual_verification', current_user)
 
 
 @app.get("/api/announcement")
