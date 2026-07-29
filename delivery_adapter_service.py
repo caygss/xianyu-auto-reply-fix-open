@@ -47,12 +47,16 @@ class JsonTransport(Protocol):
         ...
 
 
-class DeliveryDispatchError(ValueError):
+class AdapterError(ValueError):
     def __init__(self, code: str, message: str, technical_category: str, **details):
         super().__init__(message)
         self.code = code
         self.technical_category = technical_category
         self.details = details
+
+
+class DeliveryDispatchError(AdapterError):
+    pass
 
 
 class UrllibJsonTransport:
@@ -183,6 +187,12 @@ class ProviderApiAdapter:
                     "POST", config["endpoint"], headers, payload, timeout
                 )
             except Exception as exc:
+                if not isinstance(exc, (URLError, TimeoutError, ConnectionError)):
+                    raise DeliveryDispatchError(
+                        "provider_transport_error",
+                        "外部交付服务调用失败，请检查适配器或配置",
+                        "provider_transport",
+                    ) from exc
                 if attempt < retries:
                     continue
                 raise DeliveryDispatchError(
@@ -190,14 +200,22 @@ class ProviderApiAdapter:
                     "外部交付服务调用失败，请稍后重试",
                     "provider_transport",
                 ) from exc
+            if not isinstance(response, ProviderResponse):
+                raise DeliveryDispatchError(
+                    "provider_response_invalid",
+                    "外部交付服务返回格式异常",
+                    "provider_response",
+                )
+            if isinstance(response.status_code, bool) or not isinstance(response.status_code, int):
+                raise DeliveryDispatchError(
+                    "provider_response_invalid",
+                    "外部交付服务返回状态码格式异常",
+                    "provider_response",
+                )
             if response.status_code in {429, *range(500, 600)} and attempt < retries:
                 continue
             break
 
-        if not isinstance(response, ProviderResponse):
-            raise DeliveryDispatchError(
-                "provider_transport_error", "外部交付服务返回格式异常", "provider_transport"
-            )
         if isinstance(response.body, bytes):
             if len(response.body) > MAX_PROVIDER_RESPONSE_BYTES:
                 raise DeliveryDispatchError(

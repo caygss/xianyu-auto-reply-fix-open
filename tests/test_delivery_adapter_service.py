@@ -1,4 +1,5 @@
 import json
+from urllib.error import URLError
 
 import pytest
 from loguru import logger
@@ -273,6 +274,89 @@ def test_provider_invalid_utf8_is_a_readable_domain_error(services):
 
     assert error.value.code == "provider_response_invalid"
     assert "JSON" in str(error.value)
+
+
+def test_provider_non_response_transport_value_is_adapter_error_without_status_attribute_access(services):
+    _, configs, inventory = services
+    configs.save(
+        1,
+        7,
+        "account-a",
+        "provider_api",
+        {"endpoint": "https://provider.test/issue", "token": "t", "max_retries": 3},
+    )
+    transport = FakeTransport([object(), ProviderResponse(200, {}, b'{"content":"unused"}')])
+
+    with pytest.raises(DeliveryDispatchError) as error:
+        DeliveryDispatcher(configs, inventory, transport=transport).prepare(request())
+
+    assert error.value.code == "provider_response_invalid"
+    assert error.value.technical_category == "provider_response"
+    assert len(transport.calls) == 1
+
+
+def test_provider_does_not_retry_programming_exception(services):
+    _, configs, inventory = services
+    configs.save(
+        1,
+        7,
+        "account-a",
+        "provider_api",
+        {"endpoint": "https://provider.test/issue", "token": "t", "max_retries": 3},
+    )
+    transport = FakeTransport(
+        [ValueError("programming failure"), ProviderResponse(200, {}, b'{"content":"unused"}')]
+    )
+
+    with pytest.raises(DeliveryDispatchError) as error:
+        DeliveryDispatcher(configs, inventory, transport=transport).prepare(request())
+
+    assert error.value.code == "provider_transport_error"
+    assert len(transport.calls) == 1
+
+
+def test_provider_retries_network_exception_up_to_max_retries(services):
+    _, configs, inventory = services
+    configs.save(
+        1,
+        7,
+        "account-a",
+        "provider_api",
+        {"endpoint": "https://provider.test/issue", "token": "t", "max_retries": 3},
+    )
+    transport = FakeTransport(
+        [
+            URLError("offline"),
+            URLError("offline"),
+            URLError("offline"),
+            ProviderResponse(200, {}, b'{"content":"recovered"}'),
+        ]
+    )
+
+    result = DeliveryDispatcher(configs, inventory, transport=transport).prepare(request())
+
+    assert result["content"] == "recovered"
+    assert len(transport.calls) == 4
+
+
+def test_provider_max_retries_three_caps_retryable_http_to_four_calls(services):
+    _, configs, inventory = services
+    configs.save(
+        1,
+        7,
+        "account-a",
+        "provider_api",
+        {"endpoint": "https://provider.test/issue", "token": "t", "max_retries": 3},
+    )
+    transport = FakeTransport(
+        [ProviderResponse(503, {}, b'{"error":"busy"}') for _ in range(4)]
+    )
+
+    with pytest.raises(DeliveryDispatchError) as error:
+        DeliveryDispatcher(configs, inventory, transport=transport).prepare(request())
+
+    assert error.value.code == "provider_http_error"
+    assert len(transport.calls) == 4
 
 
 def test_xianyu_delivery_seam_reuses_existing_text_steps(monkeypatch):
