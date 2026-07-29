@@ -239,3 +239,24 @@ def test_verification_status_can_switch_to_completion_action_after_opening():
 
     assert action["action"] == "complete_manual_verification"
     assert action["needs_user_action"] is True
+
+
+def test_guided_status_exposes_only_a_safe_active_browser_signal():
+    active = build_guided_status(
+        {
+            "token_refresh_status": "verification_pending_manual",
+            "vnc_manual_action_available": True,
+            "manual_browser_session_status": "processing",
+        }
+    )
+    inactive = build_guided_status(
+        {
+            "token_refresh_status": "verification_pending_manual",
+            "vnc_manual_action_available": False,
+            "manual_browser_session_status": None,
+        }
+    )
+
+    assert active["manual_browser_available"] is True
+    assert inactive["manual_browser_available"] is False
+    assert "manual_browser_session_status" not in active

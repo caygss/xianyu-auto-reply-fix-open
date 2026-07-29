@@ -51,6 +51,7 @@
   <link rel="stylesheet" href="/static/lib/bootstrap-icons/bootstrap-icons.css">
 
   <link rel="stylesheet" href="/static/css/app.css">
+  <link rel="stylesheet" href="/static/css/guided-setup.css">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
@@ -457,6 +458,60 @@
 
     <!-- 账号管理内容 -->
     <div id="accounts-section" class="content-section">
+      <div class="guided-setup-reopen-wrap" id="guidedSetupReopenWrap" hidden>
+        <button type="button" class="btn btn-sm btn-outline-primary" id="guidedSetupReopen" onclick="toggleGuidedSetup(true)">
+          <i class="bi bi-signpost-2 me-1" aria-hidden="true"></i>打开首次登录向导
+        </button>
+      </div>
+      <section class="guided-setup card mb-4" id="guidedSetupPanel" aria-label="首次登录向导" aria-describedby="guidedSetupMessage">
+        <div class="card-body">
+          <div class="guided-setup__header">
+            <div>
+              <div class="guided-setup__eyebrow">首次登录</div>
+              <h3 class="guided-setup__heading mb-1">连接闲鱼账号</h3>
+              <p class="guided-setup__account mb-0">当前账号：<span id="guidedSetupAccount">准备添加账号</span></p>
+            </div>
+            <button type="button" class="btn btn-sm btn-link guided-setup__close" id="guidedSetupDismiss" onclick="toggleGuidedSetup(false)">
+              稍后处理
+            </button>
+          </div>
+
+          <div class="guided-setup__layout">
+            <ol class="guided-setup__steps" id="guidedSetupSteps" aria-label="首次登录步骤">
+              <li class="guided-setup__step" data-guided-step="1"><span class="guided-setup__step-index">1</span><span>准备登录</span></li>
+              <li class="guided-setup__step" data-guided-step="2"><span class="guided-setup__step-index">2</span><span>扫码</span></li>
+              <li class="guided-setup__step" data-guided-step="3"><span class="guided-setup__step-index">3</span><span>等待稳定</span></li>
+              <li class="guided-setup__step" data-guided-step="4"><span class="guided-setup__step-index">4</span><span>人工验证或等待退避</span></li>
+              <li class="guided-setup__step" data-guided-step="5"><span class="guided-setup__step-index">5</span><span>连接成功</span></li>
+              <li class="guided-setup__step" data-guided-step="6"><span class="guided-setup__step-index">6</span><span>验证可用</span></li>
+            </ol>
+
+            <div class="guided-setup__current" aria-live="polite" aria-atomic="true">
+              <div class="guided-setup__step-label" id="guidedSetupStep">第 1 步，共 6 步</div>
+              <h4 class="guided-setup__title" id="guidedSetupTitle">准备登录</h4>
+              <p class="guided-setup__message" id="guidedSetupMessage">请打开闲鱼 App，准备使用扫码登录。</p>
+              <div class="guided-setup__notice" id="guidedSetupNotice" role="note">
+                <i class="bi bi-info-circle" aria-hidden="true"></i>
+                <span id="guidedSetupNoticeText">首次登录只需按当前步骤操作，不要重复扫码。</span>
+              </div>
+              <div class="guided-setup__actions" id="guidedSetupActions">
+                <button type="button" class="btn btn-primary" id="guidedSetupPrimaryAction" onclick="handleGuidedSetupAction()">
+                  开始扫码登录
+                </button>
+                <button type="button" class="btn btn-outline-secondary" id="guidedSetupSecondaryAction" onclick="handleGuidedSetupAction('refresh_status')" hidden>
+                  重新检查
+                </button>
+              </div>
+              <div class="guided-setup__countdown" id="guidedSetupCountdown" aria-live="polite" hidden></div>
+              <div class="guided-setup__error" id="guidedSetupError" role="alert" aria-live="assertive" hidden></div>
+              <details class="guided-setup__technical" id="guidedSetupTechnicalDetails">
+                <summary>查看连接详情</summary>
+                <p class="mb-0" id="guidedSetupTechnicalText">连接状态会在这里显示。</p>
+              </details>
+            </div>
+          </div>
+        </div>
+      </section>
       <div class="content-header">
         <h2 class="mb-0">
           <i class="bi bi-person-circle me-2"></i>

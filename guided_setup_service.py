@@ -287,6 +287,11 @@ def build_guided_status(
         "remaining_seconds": format_remaining_seconds(retry_at),
         "technical_status": technical_status,
         "technical_detail": _technical_detail(runtime_status, technical_status),
+        "manual_browser_available": bool(
+            runtime_status.get("vnc_manual_action_available") is True
+            or str(runtime_status.get("manual_browser_session_status") or "").strip().lower()
+            in {"processing", "active", "ready", "opened"}
+        ),
     }
 
     _, connection_state = _normalized_runtime_status(runtime_status)

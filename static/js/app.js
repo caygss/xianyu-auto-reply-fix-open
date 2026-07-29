@@ -20,11 +20,389 @@ let aboutRuntimeRetryTimer = null;
 let aboutRuntimeCountdownTimer = null;
 let lastDashboardRuntimeRetryAt = 0;
 let lastAboutRuntimeRetryAt = 0;
+const GUIDED_SETUP_POLL_INTERVAL = 3000;
+const GUIDED_SETUP_STATUS_ENDPOINT = '/setup/status';
+const GUIDED_SETUP_ACTION_ENDPOINT = '/setup/action';
+const GUIDED_SETUP_ACTIVE_BROWSER_STATES = new Set(['processing', 'active', 'ready', 'opened']);
+let guidedSetupPollTimer = null;
+let guidedSetupCountdownTimer = null;
+let guidedSetupState = {
+    accounts: [],
+    selectedAccountId: '',
+    guidedStatus: null,
+    runtimeStatus: null,
+    scanStarted: false,
+    hiddenByUser: false,
+    requestInFlight: false,
+    expiredDeadline: '',
+};
 const DASHBOARD_ANNOUNCEMENT_DISMISS_PREFIX = 'dashboard_announcement_dismissed_';
 let dashboardAnnouncementState = {
     current: null,
     history: []
 };
+
+function getGuidedSetupElements() {
+    return {
+        panel: document.getElementById('guidedSetupPanel'),
+        reopen: document.getElementById('guidedSetupReopenWrap'),
+        account: document.getElementById('guidedSetupAccount'),
+        steps: document.getElementById('guidedSetupSteps'),
+        step: document.getElementById('guidedSetupStep'),
+        title: document.getElementById('guidedSetupTitle'),
+        message: document.getElementById('guidedSetupMessage'),
+        notice: document.getElementById('guidedSetupNoticeText'),
+        primary: document.getElementById('guidedSetupPrimaryAction'),
+        secondary: document.getElementById('guidedSetupSecondaryAction'),
+        countdown: document.getElementById('guidedSetupCountdown'),
+        error: document.getElementById('guidedSetupError'),
+        technical: document.getElementById('guidedSetupTechnicalText'),
+    };
+}
+
+function getGuidedSetupAccounts(payload, runtimeAccounts) {
+    const payloadAccounts = Array.isArray(payload?.accounts) ? payload.accounts : [];
+    const singleStatus = payload?.status && typeof payload.status === 'object'
+        ? [{ cookie_id: payload.cookie_id || '', guided_status: payload.status }]
+        : [];
+    const sourceAccounts = payloadAccounts.length ? payloadAccounts : singleStatus;
+    const runtimeById = new Map(
+        (Array.isArray(runtimeAccounts) ? runtimeAccounts : [])
+            .map(account => [String(account?.id || '').trim(), account])
+            .filter(([id]) => id)
+    );
+
+    return sourceAccounts.map(account => {
+        const guidedStatus = account?.guided_status || account?.status || null;
+        const accountId = String(
+            account?.cookie_id || account?.id || guidedStatus?.cookie_id || ''
+        ).trim();
+        const runtimeAccount = runtimeById.get(accountId);
+        return {
+            id: accountId,
+            guidedStatus,
+            runtimeStatus: runtimeAccount?.runtime_status || account?.runtime_status || null,
+            username: runtimeAccount?.username || '',
+        };
+    }).filter(account => account.guidedStatus || account.runtimeStatus);
+}
+
+function isGuidedRuntimeReady(runtimeStatus, guidedStatus) {
+    const runtime = runtimeStatus || {};
+    if (runtime.connection_state === 'connected') {
+        return runtime.running === true
+            && runtime.ws_ready === true
+            && runtime.session_ready === true
+            && runtime.has_current_token === true
+            && runtime.message_stream_ready === true;
+    }
+
+    return !runtimeStatus && ['connected', 'success'].includes(String(guidedStatus?.technical_status || '').trim())
+        && ['finish', 'go_to_delivery_config'].includes(String(guidedStatus?.primary_action || '').trim());
+}
+
+function hasGuidedActiveBrowser(runtimeStatus, guidedStatus) {
+    const runtimeState = String(runtimeStatus?.manual_browser_session_status || '').trim().toLowerCase();
+    return GUIDED_SETUP_ACTIVE_BROWSER_STATES.has(runtimeState)
+        && runtimeStatus?.vnc_manual_action_available === true
+        && guidedStatus?.manual_browser_available === true;
+}
+
+function getGuidedSetupAccount() {
+    return guidedSetupState.accounts.find(account => account.id === guidedSetupState.selectedAccountId)
+        || guidedSetupState.accounts.find(account => !isGuidedRuntimeReady(account.runtimeStatus, account.guidedStatus))
+        || guidedSetupState.accounts[0]
+        || null;
+}
+
+function getGuidedSetupStep(account) {
+    if (!account?.guidedStatus) {
+        return guidedSetupState.scanStarted ? 2 : 1;
+    }
+
+    const guidedStatus = account.guidedStatus;
+    const technicalStatus = String(guidedStatus.technical_status || '').trim();
+    if (technicalStatus === 'qr_login_grace_wait') return 3;
+    if (
+        technicalStatus === 'verification_pending_manual'
+        || technicalStatus === 'manual_verification_required'
+        || technicalStatus === 'password_login_backoff_wait'
+        || ['open_manual_verification', 'complete_manual_verification'].includes(guidedStatus.primary_action)
+    ) {
+        return 4;
+    }
+    if (isGuidedRuntimeReady(account.runtimeStatus, guidedStatus)) return 6;
+    if (
+        account.runtimeStatus?.connection_state === 'connected'
+        || technicalStatus === 'connected'
+        || ['finish', 'go_to_delivery_config'].includes(guidedStatus.primary_action)
+    ) {
+        return 5;
+    }
+    return 4;
+}
+
+function getGuidedSetupCopy(step, account) {
+    const guidedStatus = account?.guidedStatus || {};
+    const hasActiveBrowser = hasGuidedActiveBrowser(account?.runtimeStatus, guidedStatus);
+    const copies = {
+        1: {
+            title: '准备登录',
+            message: '请打开闲鱼 App，准备使用扫码登录。',
+            notice: '请按当前步骤操作，不要重复扫码。',
+        },
+        2: {
+            title: '扫码登录',
+            message: '请在闲鱼 App 中完成扫码并确认登录，完成后请保持浏览器窗口打开。',
+            notice: '二维码只需扫描一次，不要重复扫码；登录完成后请等待状态更新。',
+        },
+        3: {
+            title: '等待账号稳定',
+            message: '扫码登录已完成，系统正在稳定账号，当前无需操作。',
+            notice: '请保持浏览器窗口打开，不要重复扫码，等待账号稳定。',
+        },
+        4: {
+            title: hasActiveBrowser ? '请完成人工验证' : '自动验证未完成',
+            message: hasActiveBrowser
+                ? '请接管当前浏览器完成验证，完成后回到这里确认。'
+                : '自动验证没有完成，请按下一步重新打开验证页面，或等待冷却结束后再检查。',
+            notice: hasActiveBrowser
+                ? '请保持浏览器窗口打开，不要重复扫码；完成验证后再点击确认。'
+                : '当前没有可接管的浏览器；冷却期间请等待，不要重复扫码。',
+        },
+        5: {
+            title: '连接成功',
+            message: '账号连接已经建立，系统正在检查消息通道是否可用。',
+            notice: '请保持浏览器窗口打开，检查完成后即可继续使用。',
+        },
+        6: {
+            title: '验证可用',
+            message: '账号已连接并通过可用性检查，可以开始使用。',
+            notice: '首次登录已完成，后续请保持浏览器窗口打开。',
+        },
+    };
+    return copies[step] || copies[1];
+}
+
+function getGuidedDeadlineSeconds(deadline, now = Date.now()) {
+    if (deadline === null || deadline === undefined || deadline === '') return 0;
+    let timestamp = Number(deadline);
+    if (!Number.isFinite(timestamp)) {
+        const parsed = Date.parse(String(deadline));
+        timestamp = Number.isFinite(parsed) ? parsed / 1000 : 0;
+    } else if (timestamp > 1e12) {
+        timestamp /= 1000;
+    }
+    if (timestamp <= 0) return 0;
+    return Math.max(0, Math.ceil(timestamp - (now / 1000)));
+}
+
+function updateGuidedSetupCountdown(now = Date.now()) {
+    const { countdown } = getGuidedSetupElements();
+    if (!countdown) return;
+    const deadline = guidedSetupState.guidedStatus?.retry_at;
+    const remaining = getGuidedDeadlineSeconds(deadline, now);
+    if (remaining > 0) {
+        countdown.hidden = false;
+        countdown.textContent = `预计还需等待 ${remaining} 秒，倒计时结束后会自动重新检查。`;
+        return;
+    }
+
+    countdown.hidden = true;
+    countdown.textContent = '';
+    const deadlineKey = String(deadline || '');
+    if (deadlineKey && !guidedSetupState.requestInFlight && guidedSetupState.expiredDeadline !== deadlineKey) {
+        guidedSetupState.expiredDeadline = deadlineKey;
+        refreshGuidedSetupStatus({ force: true });
+    }
+}
+
+function startGuidedSetupCountdown() {
+    if (guidedSetupCountdownTimer) {
+        clearInterval(guidedSetupCountdownTimer);
+        guidedSetupCountdownTimer = null;
+    }
+    updateGuidedSetupCountdown();
+    if (getGuidedDeadlineSeconds(guidedSetupState.guidedStatus?.retry_at) > 0) {
+        guidedSetupCountdownTimer = setInterval(updateGuidedSetupCountdown, 1000);
+    }
+}
+
+function scheduleGuidedSetupPoll() {
+    if (guidedSetupPollTimer) clearTimeout(guidedSetupPollTimer);
+    if (!document.getElementById('accounts-section')?.classList.contains('active')) return;
+    guidedSetupPollTimer = setTimeout(() => {
+        guidedSetupPollTimer = null;
+        refreshGuidedSetupStatus();
+    }, GUIDED_SETUP_POLL_INTERVAL);
+}
+
+function renderGuidedSetup() {
+    const elements = getGuidedSetupElements();
+    if (!elements.panel) return;
+
+    const needsSetup = guidedSetupState.accounts.length === 0
+        || guidedSetupState.accounts.some(account => !isGuidedRuntimeReady(account.runtimeStatus, account.guidedStatus));
+    if (!needsSetup) {
+        elements.panel.hidden = true;
+        elements.reopen.hidden = true;
+        if (guidedSetupPollTimer) clearTimeout(guidedSetupPollTimer);
+        if (guidedSetupCountdownTimer) clearInterval(guidedSetupCountdownTimer);
+        return;
+    }
+
+    elements.reopen.hidden = !guidedSetupState.hiddenByUser;
+    elements.panel.hidden = guidedSetupState.hiddenByUser;
+    if (guidedSetupState.hiddenByUser) return;
+
+    const account = getGuidedSetupAccount();
+    const step = getGuidedSetupStep(account);
+    const copy = getGuidedSetupCopy(step, account);
+    const guidedStatus = account?.guidedStatus || {};
+    const runtimeStatus = account?.runtimeStatus || {};
+    const hasActiveBrowser = hasGuidedActiveBrowser(runtimeStatus, guidedStatus);
+
+    elements.account.textContent = account?.id || '准备添加账号';
+    elements.step.textContent = `第 ${step} 步，共 6 步`;
+    elements.title.textContent = copy.title;
+    elements.message.textContent = copy.message;
+    elements.notice.textContent = copy.notice;
+    elements.technical.textContent = guidedStatus.technical_detail || '连接状态会在这里显示。';
+    elements.error.hidden = true;
+    elements.error.textContent = '';
+
+    elements.steps?.querySelectorAll('[data-guided-step]').forEach(item => {
+        const itemStep = Number(item.dataset.guidedStep || 0);
+        item.classList.toggle('is-active', itemStep === step);
+        item.classList.toggle('is-complete', itemStep < step);
+        item.setAttribute('aria-current', itemStep === step ? 'step' : 'false');
+    });
+
+    const primary = elements.primary;
+    const secondary = elements.secondary;
+    primary.hidden = false;
+    secondary.hidden = true;
+    primary.disabled = guidedSetupState.requestInFlight;
+    secondary.disabled = guidedSetupState.requestInFlight;
+
+    if (step <= 2 && !account?.guidedStatus) {
+        primary.textContent = step === 1 ? '开始扫码登录' : '打开扫码登录';
+        primary.dataset.guidedAction = 'start_scan';
+    } else if (step === 3) {
+        primary.hidden = true;
+        secondary.hidden = false;
+        secondary.textContent = '重新检查状态';
+        secondary.dataset.guidedAction = 'refresh_status';
+    } else if (step === 4 && hasActiveBrowser) {
+        primary.textContent = '接管验证';
+        primary.dataset.guidedAction = 'takeover_browser';
+        secondary.hidden = false;
+        secondary.textContent = '我已完成验证';
+        secondary.dataset.guidedAction = 'complete_manual_verification';
+    } else if (step === 4) {
+        primary.textContent = '重新打开验证页面';
+        primary.dataset.guidedAction = 'open_manual_verification';
+        secondary.hidden = false;
+        secondary.textContent = '重新检查状态';
+        secondary.dataset.guidedAction = 'refresh_status';
+    } else if (step === 5) {
+        primary.textContent = '检查连接可用性';
+        primary.dataset.guidedAction = 'refresh_status';
+    } else {
+        primary.textContent = '完成首次登录';
+        primary.dataset.guidedAction = 'finish_local';
+    }
+
+    startGuidedSetupCountdown();
+    scheduleGuidedSetupPoll();
+}
+
+function toggleGuidedSetup(visible) {
+    guidedSetupState.hiddenByUser = !visible;
+    renderGuidedSetup();
+    if (visible && !guidedSetupState.accounts.length && !guidedSetupState.guidedStatus) {
+        refreshGuidedSetupStatus();
+    }
+}
+
+async function refreshGuidedSetupStatus(options = {}) {
+    if (guidedSetupState.requestInFlight && !options.force) return;
+    if (!document.getElementById('guidedSetupPanel')) return;
+    guidedSetupState.requestInFlight = true;
+    try {
+        const [payload, runtimeAccounts] = await Promise.all([
+            fetchJSON(`${apiBase}${GUIDED_SETUP_STATUS_ENDPOINT}`),
+            fetchJSON(`${apiBase}/cookies/details`),
+        ]);
+        guidedSetupState.accounts = getGuidedSetupAccounts(payload, runtimeAccounts);
+        const selected = getGuidedSetupAccount();
+        guidedSetupState.selectedAccountId = selected?.id || '';
+        guidedSetupState.guidedStatus = selected?.guidedStatus || null;
+        guidedSetupState.runtimeStatus = selected?.runtimeStatus || null;
+        const deadlineKey = String(guidedSetupState.guidedStatus?.retry_at || '');
+        if (deadlineKey !== guidedSetupState.expiredDeadline && getGuidedDeadlineSeconds(deadlineKey) > 0) {
+            guidedSetupState.expiredDeadline = '';
+        }
+        renderGuidedSetup();
+    } catch (error) {
+        const { error: errorElement, panel, reopen } = getGuidedSetupElements();
+        if (panel && !guidedSetupState.hiddenByUser) panel.hidden = false;
+        if (reopen) reopen.hidden = guidedSetupState.hiddenByUser;
+        if (errorElement) {
+            errorElement.hidden = false;
+            errorElement.textContent = '暂时无法读取登录状态，请稍后重新检查。';
+        }
+        scheduleGuidedSetupPoll();
+    } finally {
+        guidedSetupState.requestInFlight = false;
+    }
+}
+
+async function handleGuidedSetupAction(action) {
+    const elements = getGuidedSetupElements();
+    const selectedAction = action || elements.primary?.dataset.guidedAction || '';
+    const account = getGuidedSetupAccount();
+    const cookieId = account?.id || '';
+
+    if (selectedAction === 'start_scan') {
+        guidedSetupState.scanStarted = true;
+        renderGuidedSetup();
+        showQRCodeLogin();
+        return;
+    }
+    if (selectedAction === 'takeover_browser') {
+        if (!hasGuidedActiveBrowser(account?.runtimeStatus, account?.guidedStatus)) return;
+        window.open(getNoVncUrl(), '_blank', 'noopener');
+        return;
+    }
+    if (selectedAction === 'finish_local') {
+        toggleGuidedSetup(false);
+        return;
+    }
+
+    guidedSetupState.requestInFlight = true;
+    renderGuidedSetup();
+    try {
+        const response = await fetchJSON(`${apiBase}${GUIDED_SETUP_ACTION_ENDPOINT}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: selectedAction, cookie_id: cookieId || undefined }),
+        });
+        if (response?.guided_status && cookieId) {
+            guidedSetupState.guidedStatus = response.guided_status;
+        }
+        await refreshGuidedSetupStatus({ force: true });
+    } catch (error) {
+        const { error: errorElement } = getGuidedSetupElements();
+        if (errorElement) {
+            errorElement.hidden = false;
+            errorElement.textContent = '操作没有完成，请保持浏览器窗口打开后重新检查。';
+        }
+    } finally {
+        guidedSetupState.requestInFlight = false;
+        renderGuidedSetup();
+    }
+}
 
 // 账号关键词缓存
 let accountKeywordCache = {};
@@ -5293,6 +5671,7 @@ async function loadCookies() {
     toggleLoading(false);
     if (document.getElementById('accounts-section')?.classList.contains('active')) {
         loadAboutDiagnostics();
+        refreshGuidedSetupStatus();
     }
     }
 }

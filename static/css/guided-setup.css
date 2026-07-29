@@ -1,0 +1,239 @@
+/* 首次登录向导：只承载账户连接状态，不改变普通账号管理布局。 */
+.guided-setup {
+    --guided-border: color-mix(in srgb, var(--primary-color) 18%, var(--border-color));
+    border: 1px solid var(--guided-border);
+    background: var(--card-bg);
+    box-shadow: var(--shadow-sm);
+}
+
+.guided-setup[hidden],
+.guided-setup-reopen-wrap[hidden],
+.guided-setup__countdown[hidden],
+.guided-setup__error[hidden],
+.guided-setup__actions [hidden] {
+    display: none !important;
+}
+
+.guided-setup__header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 1.25rem;
+}
+
+.guided-setup__eyebrow,
+.guided-setup__step-label {
+    color: var(--primary-color);
+    font-size: .78rem;
+    font-weight: 700;
+    letter-spacing: .04em;
+}
+
+.guided-setup__heading,
+.guided-setup__title {
+    color: var(--text-color);
+    font-weight: 700;
+}
+
+.guided-setup__heading {
+    font-size: 1.25rem;
+}
+
+.guided-setup__account,
+.guided-setup__message,
+.guided-setup__technical,
+.guided-setup__countdown {
+    color: var(--text-secondary);
+}
+
+.guided-setup__layout {
+    display: grid;
+    grid-template-columns: minmax(210px, .72fr) minmax(360px, 1.28fr);
+    gap: 1.5rem;
+    align-items: start;
+}
+
+.guided-setup__steps {
+    list-style: none;
+    margin: 0;
+    padding: .25rem 0;
+}
+
+.guided-setup__step {
+    display: flex;
+    align-items: center;
+    gap: .7rem;
+    min-height: 2.65rem;
+    padding: .55rem .65rem;
+    border-radius: .6rem;
+    color: var(--text-secondary);
+    font-size: .92rem;
+}
+
+.guided-setup__step + .guided-setup__step {
+    margin-top: .25rem;
+}
+
+.guided-setup__step-index {
+    display: inline-grid;
+    place-items: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    flex: 0 0 1.75rem;
+    border: 1px solid var(--border-color);
+    border-radius: 50%;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: .78rem;
+    font-weight: 700;
+}
+
+.guided-setup__step.is-active {
+    background: color-mix(in srgb, var(--primary-color) 9%, var(--card-bg));
+    color: var(--text-color);
+    font-weight: 700;
+}
+
+.guided-setup__step.is-active .guided-setup__step-index {
+    border-color: var(--primary-color);
+    background: var(--primary-color);
+    color: #fff;
+}
+
+.guided-setup__step.is-complete .guided-setup__step-index {
+    border-color: color-mix(in srgb, var(--success-color) 45%, var(--border-color));
+    background: color-mix(in srgb, var(--success-color) 13%, var(--card-bg));
+    color: var(--success-color);
+}
+
+.guided-setup__current {
+    min-width: 0;
+    padding: 1.25rem 1.35rem;
+    border: 1px solid var(--border-color);
+    border-radius: .8rem;
+    background: color-mix(in srgb, var(--bg-secondary) 88%, var(--primary-color));
+}
+
+.guided-setup__title {
+    margin: .35rem 0 .65rem;
+    font-size: 1.35rem;
+}
+
+.guided-setup__message {
+    margin-bottom: 1rem;
+    line-height: 1.7;
+}
+
+.guided-setup__notice {
+    display: flex;
+    gap: .6rem;
+    align-items: flex-start;
+    margin-bottom: 1rem;
+    padding: .7rem .8rem;
+    border: 1px solid color-mix(in srgb, var(--warning-color) 28%, var(--border-color));
+    border-radius: .6rem;
+    background: color-mix(in srgb, var(--warning-color) 10%, var(--card-bg));
+    color: var(--text-color);
+    font-size: .9rem;
+    line-height: 1.55;
+}
+
+.guided-setup__notice i {
+    color: var(--warning-color);
+    flex: 0 0 auto;
+}
+
+.guided-setup__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .6rem;
+}
+
+.guided-setup__actions .btn,
+.guided-setup__close,
+.guided-setup-reopen-wrap .btn {
+    min-height: 2.75rem;
+}
+
+.guided-setup__countdown {
+    margin-top: .9rem;
+    font-weight: 600;
+}
+
+.guided-setup__error {
+    margin-top: .9rem;
+    color: var(--danger-color);
+    line-height: 1.55;
+}
+
+.guided-setup__technical {
+    margin-top: 1rem;
+    font-size: .8rem;
+}
+
+.guided-setup__technical summary {
+    cursor: pointer;
+    color: var(--text-secondary);
+}
+
+.guided-setup__technical p {
+    margin-top: .5rem;
+    overflow-wrap: anywhere;
+}
+
+.guided-setup__actions .btn:focus-visible,
+.guided-setup__close:focus-visible,
+.guided-setup-reopen-wrap .btn:focus-visible,
+.guided-setup__technical summary:focus-visible {
+    outline: 3px solid color-mix(in srgb, var(--primary-color) 35%, transparent);
+    outline-offset: 2px;
+}
+
+.guided-setup-reopen-wrap {
+    margin-bottom: .75rem;
+}
+
+@media (max-width: 768px) {
+    .guided-setup__layout {
+        grid-template-columns: 1fr;
+        gap: 1rem;
+    }
+
+    .guided-setup__steps {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: .35rem .55rem;
+    }
+
+    .guided-setup__step {
+        min-height: 2.4rem;
+        padding: .45rem .5rem;
+        font-size: .85rem;
+    }
+}
+
+@media (max-width: 420px) {
+    .guided-setup__header {
+        align-items: stretch;
+        flex-direction: column;
+        gap: .35rem;
+    }
+
+    .guided-setup__close {
+        align-self: flex-start;
+        padding-left: 0;
+    }
+
+    .guided-setup__steps {
+        grid-template-columns: 1fr;
+    }
+
+    .guided-setup__current {
+        padding: 1rem;
+    }
+
+    .guided-setup__actions .btn {
+        width: 100%;
+    }
+}
