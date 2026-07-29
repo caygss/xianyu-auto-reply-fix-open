@@ -1,6 +1,6 @@
 # 🐟 闲鱼管理系统
 
-[![GitHub](https://img.shields.io/badge/GitHub-GuDong2003%2Fxianyu--auto--reply--fix-blue?logo=github)](https://github.com/GuDong2003/xianyu-auto-reply-fix)
+[![GitHub](https://img.shields.io/badge/GitHub-caygss%2Fxianyu--auto--reply--fix--open-blue?logo=github)](https://github.com/caygss/xianyu-auto-reply-fix-open)
 [![Docker Compose](https://img.shields.io/badge/Docker%20Compose-源码构建-blue?logo=docker)](#-快速开始)
 [![Python](https://img.shields.io/badge/Python-3.11+-green?logo=python)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
@@ -28,7 +28,7 @@
 ### Docker Compose（推荐）
 
 ```bash
-git clone https://github.com/GuDong2003/xianyu-auto-reply-fix.git
+git clone https://github.com/caygss/xianyu-auto-reply-fix-open.git
 cd xianyu-auto-reply-fix
 docker compose up -d
 ```
@@ -42,7 +42,7 @@ docker compose up -d
 ### 本地运行
 
 ```bash
-git clone https://github.com/GuDong2003/xianyu-auto-reply-fix.git
+git clone https://github.com/caygss/xianyu-auto-reply-fix-open.git
 cd xianyu-auto-reply-fix
 
 python -m venv venv
@@ -132,7 +132,7 @@ AI 回复使用统一的 `model_name` / `api_key` / `base_url` / `api_type` 配�
 4. 推送分支：`git push origin feature/your-feature`。
 5. 提交 Pull Request。
 
-贡献前建议先查看 [Issues](https://github.com/GuDong2003/xianyu-auto-reply-fix/issues)，并确保变更不引入真实 Cookie、Token、数据库文件或其他敏感信息。
+贡献前建议先查看 [Issues](https://github.com/caygss/xianyu-auto-reply-fix-open/issues)，并确保变更不引入真实 Cookie、Token、数据库文件或其他敏感信息。
 
 ## ❓ 常见问题
 
@@ -196,10 +196,10 @@ The installation directory is the isolation boundary: `data/`, `browser_data/`, 
 
 ## Star History
 
-<a href="https://www.star-history.com/#GuDong2003/xianyu-auto-reply-fix&Date">
+<a href="https://www.star-history.com/#caygss/xianyu-auto-reply-fix-open&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=GuDong2003/xianyu-auto-reply-fix&type=Date&theme=dark&sealed_token=P3o8nIGCB4Y4KGlfZogILPfgp0REbjEcS8s8BScY9WUcxbgx9b9JK_2HPPn7pF39I703tgOcIWPx-4RI5Zfsd0VBVLRc6AIKpKgDOekOySsw7T5-BWZHBA" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=GuDong2003/xianyu-auto-reply-fix&type=Date&sealed_token=P3o8nIGCB4Y4KGlfZogILPfgp0REbjEcS8s8BScY9WUcxbgx9b9JK_2HPPn7pF39I703tgOcIWPx-4RI5Zfsd0VBVLRc6AIKpKgDOekOySsw7T5-BWZHBA" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=GuDong2003/xianyu-auto-reply-fix&type=Date&sealed_token=P3o8nIGCB4Y4KGlfZogILPfgp0REbjEcS8s8BScY9WUcxbgx9b9JK_2HPPn7pF39I703tgOcIWPx-4RI5Zfsd0VBVLRc6AIKpKgDOekOySsw7T5-BWZHBA" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=caygss/xianyu-auto-reply-fix-open&type=Date&theme=dark&sealed_token=P3o8nIGCB4Y4KGlfZogILPfgp0REbjEcS8s8BScY9WUcxbgx9b9JK_2HPPn7pF39I703tgOcIWPx-4RI5Zfsd0VBVLRc6AIKpKgDOekOySsw7T5-BWZHBA" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=caygss/xianyu-auto-reply-fix-open&type=Date&sealed_token=P3o8nIGCB4Y4KGlfZogILPfgp0REbjEcS8s8BScY9WUcxbgx9b9JK_2HPPn7pF39I703tgOcIWPx-4RI5Zfsd0VBVLRc6AIKpKgDOekOySsw7T5-BWZHBA" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=caygss/xianyu-auto-reply-fix-open&type=Date&sealed_token=P3o8nIGCB4Y4KGlfZogILPfgp0REbjEcS8s8BScY9WUcxbgx9b9JK_2HPPn7pF39I703tgOcIWPx-4RI5Zfsd0VBVLRc6AIKpKgDOekOySsw7T5-BWZHBA" />
   </picture>
 </a>
