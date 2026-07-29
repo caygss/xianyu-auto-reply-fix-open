@@ -11820,9 +11820,51 @@ class XianyuLive:
                 logger.error(f"【{self.cookie_id}】获取订单详情异常: {self._safe_str(e)}")
                 return None
 
+    def _prepare_configured_delivery(
+        self,
+        *,
+        card_id: int,
+        order_id: str,
+        buyer_id: str,
+        reservation_id: str,
+        item_id: str = None,
+        provider_transport=None,
+    ):
+        """Prepare a Task 6 delivery payload for the order flow.
+
+        Reservation creation, quantity, idempotency, and order-level pause decisions
+        remain with the caller (Task 7). This seam only forwards the complete scope
+        and reuses the existing delivery-step sender after preparation.
+        """
+        from card_inventory_service import CardInventoryService
+        from delivery_adapter_service import DeliveryDispatcher, DeliveryRequest
+        from delivery_config_service import DeliveryConfigService
+
+        request = DeliveryRequest(
+            user_id=getattr(self, "user_id", None),
+            card_id=card_id,
+            account_id=self.cookie_id,
+            order_id=order_id,
+            reservation_id=reservation_id,
+            context={
+                "order_id": order_id,
+                "buyer_id": buyer_id,
+                "item_id": item_id,
+                "account_id": self.cookie_id,
+                "card_id": card_id,
+            },
+        )
+        dispatcher = DeliveryDispatcher(
+            DeliveryConfigService(db_manager),
+            CardInventoryService(db_manager),
+            transport=provider_transport,
+        )
+        return dispatcher.prepare(request)
+
     async def _auto_delivery(self, item_id: str, item_title: str = None, order_id: str = None, send_user_id: str = None,
                              chat_id: str = None, send_user_name: str = None, include_meta: bool = False,
-                             data_preview_index: int = 0, delivery_unit_index: int = 1):
+                             data_preview_index: int = 0, delivery_unit_index: int = 1,
+                             delivery_reservation_id: str = None):
         """自动发货功能 - 匹配规则并准备发货内容，不直接提交副作用。"""
         try:
             matched_rule_context = None

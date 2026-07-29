@@ -16,6 +16,10 @@ DELIVERY_MODES = {
 }
 MAX_DELIVERY_CONFIG_BYTES = 64 * 1024
 MAX_FIXED_LINK_BYTES = 2048
+MAX_PROVIDER_ENDPOINT_BYTES = 2048
+MAX_PROVIDER_TIMEOUT_SECONDS = 30
+MAX_PROVIDER_RETRIES = 3
+MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024
 
 
 class DeliveryConfigError(ValueError):
@@ -130,6 +134,77 @@ class DeliveryConfigService:
         return url
 
     @staticmethod
+    def _validate_provider_endpoint(endpoint):
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            raise DeliveryConfigError(
+                "invalid_config", "Provider endpoint 必须是有效的 HTTP 或 HTTPS 链接"
+            )
+        if len(endpoint.encode("utf-8")) > MAX_PROVIDER_ENDPOINT_BYTES:
+            raise DeliveryConfigError("invalid_config", "Provider endpoint 长度超过限制")
+        try:
+            parsed = urlparse(endpoint)
+            if parsed.username or parsed.password:
+                raise DeliveryConfigError("invalid_config", "Provider endpoint 不能包含账号信息")
+        except (TypeError, ValueError) as exc:
+            raise DeliveryConfigError(
+                "invalid_config", "Provider endpoint 必须是有效的 HTTP 或 HTTPS 链接"
+            ) from exc
+        try:
+            DeliveryConfigService._validate_fixed_link(endpoint)
+        except DeliveryConfigError as exc:
+            raise DeliveryConfigError(
+                "invalid_config", "Provider endpoint 必须是有效的 HTTP 或 HTTPS 链接"
+            ) from exc
+        return endpoint
+
+    @staticmethod
+    def _validate_provider_config(config):
+        endpoint = DeliveryConfigService._validate_provider_endpoint(config.get("endpoint"))
+
+        token = config.get("token")
+        if token is not None and (not isinstance(token, str) or not token.strip()):
+            raise DeliveryConfigError("invalid_config", "Provider token 必须是非空文本")
+
+        headers = config.get("headers", {})
+        if not isinstance(headers, dict) or any(
+            not isinstance(key, str) or not key.strip()
+            or not isinstance(value, str)
+            or not value.strip()
+            for key, value in headers.items()
+        ):
+            raise DeliveryConfigError("invalid_config", "Provider 请求头格式无效")
+
+        field_mapping = config.get("field_mapping", {})
+        if not isinstance(field_mapping, dict) or any(
+            not isinstance(key, str) or not key.strip()
+            or not isinstance(value, str)
+            or not value.strip()
+            for key, value in field_mapping.items()
+        ):
+            raise DeliveryConfigError("invalid_config", "Provider 字段映射格式无效")
+
+        response_field = config.get("response_field", "content")
+        if not isinstance(response_field, str) or not response_field.strip():
+            raise DeliveryConfigError("invalid_config", "Provider 响应字段不能为空")
+
+        timeout = config.get("timeout_seconds", 10)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise DeliveryConfigError("invalid_config", "Provider 超时必须是 1 到 30 秒")
+        if not 1 <= timeout <= MAX_PROVIDER_TIMEOUT_SECONDS:
+            raise DeliveryConfigError("invalid_config", "Provider 超时必须是 1 到 30 秒")
+
+        retries = config.get("max_retries", 0)
+        if isinstance(retries, bool) or not isinstance(retries, int):
+            raise DeliveryConfigError("invalid_config", "Provider 重试次数必须是 0 到 3 次")
+        if not 0 <= retries <= MAX_PROVIDER_RETRIES:
+            raise DeliveryConfigError("invalid_config", "Provider 重试次数必须是 0 到 3 次")
+
+        request_body = config.get("request_body", {})
+        if not isinstance(request_body, dict):
+            raise DeliveryConfigError("invalid_config", "Provider 请求体模板必须是对象")
+        return endpoint
+
+    @staticmethod
     def _validate_config(mode, config):
         mode = str(mode or "").strip()
         if mode not in DELIVERY_MODES:
@@ -149,6 +224,8 @@ class DeliveryConfigService:
             normalized["url"] = DeliveryConfigService._validate_fixed_link(
                 normalized.get("url")
             )
+        elif mode == "provider_api":
+            DeliveryConfigService._validate_provider_config(normalized)
         return mode, normalized
 
     @staticmethod
@@ -160,6 +237,15 @@ class DeliveryConfigService:
             except (KeyError, TypeError, ValueError) as exc:
                 raise DeliveryConfigError(
                     "invalid_config", "固定链接必须是有效的 HTTP 或 HTTPS 链接"
+                ) from exc
+        elif mode == "provider_api":
+            try:
+                summary["endpoint_scheme"] = urlparse(config["endpoint"]).scheme
+                summary["timeout_seconds"] = config.get("timeout_seconds", 10)
+                summary["max_retries"] = config.get("max_retries", 0)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DeliveryConfigError(
+                    "invalid_config", "Provider endpoint 无法读取"
                 ) from exc
         return summary
 
@@ -210,6 +296,32 @@ class DeliveryConfigService:
         except (TypeError, ValueError) as exc:
             raise DeliveryConfigError("invalid_config", "交付配置无法读取") from exc
         return self._response(user_id, card_id, account_id, row[0], config)
+
+    def get_for_delivery(self, user_id, card_id, account_id):
+        """读取交付服务内部配置；调用方不得把 config 字段返回给 UI。"""
+        user_id, card_id, account_id = self._scope(user_id, card_id, account_id)
+        with self._transaction() as cursor:
+            row = cursor.execute(
+                """
+                SELECT mode, config_text FROM item_delivery_configs
+                WHERE user_id = ? AND card_id = ? AND account_id = ?
+                """,
+                (user_id, card_id, account_id),
+            ).fetchone()
+        if not row:
+            raise DeliveryConfigError("config_not_found", "交付配置不存在")
+        try:
+            config = json.loads(self.db._decrypt_secret(row[1]))
+        except (TypeError, ValueError) as exc:
+            raise DeliveryConfigError("invalid_config", "交付配置无法读取") from exc
+        mode, config = self._validate_config(row[0], config)
+        return {
+            "user_id": user_id,
+            "card_id": card_id,
+            "account_id": account_id,
+            "mode": mode,
+            "config": config,
+        }
 
     def delete(self, user_id, card_id, account_id):
         user_id, card_id, account_id = self._scope(user_id, card_id, account_id)
