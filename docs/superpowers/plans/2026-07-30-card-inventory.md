@@ -279,7 +279,7 @@ def test_reserve_commit_returns_n_distinct_values_and_decrements_available(inven
     reservation = service.reserve_items(7, 1, "cookie-a", "order-1", 2)
     assert reservation["quantity"] == 2
     assert service.get_inventory_summary(7, 1, "cookie-a")["reserved"] == 2
-    committed = service.commit_reservation(reservation["reservation_id"], 1, "cookie-a")
+    committed = service.commit_reservation(reservation["reservation_id"], 1, 7, "cookie-a")
 
     assert committed["status"] == "committed"
     assert len(committed["items"]) == 2
@@ -292,7 +292,7 @@ def test_generate_does_not_count_sent_items_toward_ceiling(inventory):
     service.save_settings(7, 1, "cookie-a", stock_ceiling=2)
     service.import_items(7, 1, "cookie-a", ["secret-a", "secret-b"])
     reservation = service.reserve_items(7, 1, "cookie-a", "order-1", 1)
-    service.commit_reservation(reservation["reservation_id"], 1, "cookie-a")
+    service.commit_reservation(reservation["reservation_id"], 1, 7, "cookie-a")
 
     assert service.generate_items(7, 1, "cookie-a")["generated"] == 1
     assert service.get_inventory_summary(7, 1, "cookie-a")["sent"] == 1
@@ -313,13 +313,13 @@ def test_release_is_idempotent_and_scope_mismatch_cannot_commit(inventory):
     service.import_items(7, 1, "cookie-a", ["a", "b"])
     reservation = service.reserve_items(7, 1, "cookie-a", "order-1", 2)
 
-    released = service.release_reservation(reservation["reservation_id"], 1, "cookie-a")
-    repeated = service.release_reservation(reservation["reservation_id"], 1, "cookie-a")
+    released = service.release_reservation(reservation["reservation_id"], 1, 7, "cookie-a")
+    repeated = service.release_reservation(reservation["reservation_id"], 1, 7, "cookie-a")
     assert released["status"] == repeated["status"] == "released"
     assert service.get_inventory_summary(7, 1, "cookie-a")["available"] == 2
 
     with pytest.raises(CardInventoryError) as error:
-        service.commit_reservation(reservation["reservation_id"], 1, "cookie-b")
+        service.commit_reservation(reservation["reservation_id"], 1, 7, "cookie-b")
     assert error.value.code == "scope_mismatch"
 
 
@@ -333,8 +333,8 @@ def test_duplicate_order_reuses_reservation_and_commit_result(inventory):
     assert second["reservation_id"] == first["reservation_id"]
     assert service.get_inventory_summary(7, 1, "cookie-a")["reserved"] == 1
 
-    committed = service.commit_reservation(first["reservation_id"], 1, "cookie-a")
-    repeated = service.commit_reservation(first["reservation_id"], 1, "cookie-a")
+    committed = service.commit_reservation(first["reservation_id"], 1, 7, "cookie-a")
+    repeated = service.commit_reservation(first["reservation_id"], 1, 7, "cookie-a")
     assert repeated == committed
 ```
 

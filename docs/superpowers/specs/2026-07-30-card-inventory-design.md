@@ -80,8 +80,8 @@
 - `generate_items(...)`：依据当前 `available + reserved` 补到 `stock_ceiling`，只生成缺口数量；每张使用系统安全随机源，生成前缀、长度和字符集来自设置；随机冲突时重试，数据库唯一约束是最终保护。
 - `get_inventory_summary(...)`：返回 `available`、`reserved`、`sent`、`invalidated`、`total`、`stock_ceiling` 等数量，不返回完整卡密。
 - `reserve_items(..., order_id, quantity, idempotency_key=None)`：数量必须为正整数。在同一 `BEGIN IMMEDIATE` 事务中先复用相同订单/幂等键的既有结果，再检查可用数量，一次性选出 N 张不同 `available` item 并改为 `reserved`。不足时返回 `insufficient_inventory`，不写任何部分预占。
-- `commit_reservation(reservation_id, user_id, account_id)`：只将该批次和全部 item 从 `reserved` 改为 `sent`，记录发出时间并返回按单元排序的卡密文本；已提交的重复调用复用相同结果，不重复扣减。
-- `release_reservation(reservation_id, user_id, account_id)`：只将 `reserved` item 恢复为 `available` 并清理预占关联；已释放或已提交的重复调用返回现有终态，不重复修改。
+- `commit_reservation(reservation_id, user_id, card_id, account_id)`：先校验预占记录属于完整的商品+账号作用域，再将该批次和全部 item 从 `reserved` 改为 `sent`，记录发出时间并返回按单元排序的卡密文本；已提交的重复调用复用相同结果，不重复扣减。
+- `release_reservation(reservation_id, user_id, card_id, account_id)`：先校验完整的商品+账号作用域，再将 `reserved` item 恢复为 `available` 并清理预占关联；已释放或已提交的重复调用返回现有终态，不重复修改。
 - `replenish_generated_inventory(...)`：调用生成逻辑补齐当前缺口；只补 `source_type=generated` 的缺口，不改变手工导入卡密的来源。
 
 库存和状态更新使用 `DBManager.lock` 与 SQLite 事务。并发 reserve 即使来自多个线程，也不能重复选择同一 item 或超过可用库存。订单重复回调、进程重启和 service 重建都从持久化 reservation 状态恢复幂等结果。

@@ -500,27 +500,28 @@ class CardInventoryService:
         )
         return result
 
-    def _check_reservation_scope(self, row, user_id, account_id):
+    def _check_reservation_scope(self, row, user_id, card_id, account_id):
         if row is None:
             raise CardInventoryError("reservation_not_found", "预占记录不存在")
-        if row[1] != user_id or row[3] != account_id:
+        if row[1] != user_id or row[2] != card_id or row[3] != account_id:
             raise CardInventoryError("scope_mismatch", "预占记录不属于当前商品或账号")
 
-    def _reservation_scope(self, user_id, account_id):
+    def _reservation_scope(self, user_id, card_id, account_id):
         try:
             user_id = int(user_id)
+            card_id = int(card_id)
         except (TypeError, ValueError):
-            raise CardInventoryError("invalid_scope", "用户标识无效")
+            raise CardInventoryError("invalid_scope", "商品或用户标识无效")
         account_id = str(account_id or "").strip()
-        if user_id <= 0 or not account_id:
-            raise CardInventoryError("invalid_scope", "用户和账号标识不能为空")
-        return user_id, account_id
+        if user_id <= 0 or card_id <= 0 or not account_id:
+            raise CardInventoryError("invalid_scope", "商品、用户和账号标识不能为空")
+        return user_id, card_id, account_id
 
-    def commit_reservation(self, reservation_id, user_id, account_id):
-        user_id, account_id = self._reservation_scope(user_id, account_id)
+    def commit_reservation(self, reservation_id, user_id, card_id, account_id):
+        user_id, card_id, account_id = self._reservation_scope(user_id, card_id, account_id)
         with self._transaction() as cursor:
             row = self._reservation_row(cursor, reservation_id)
-            self._check_reservation_scope(row, user_id, account_id)
+            self._check_reservation_scope(row, user_id, card_id, account_id)
             if row[6] != "reserved":
                 result = self._reservation_result(
                     cursor, row, include_items=row[6] == "committed"
@@ -560,16 +561,16 @@ class CardInventoryService:
                     cursor, self._reservation_row(cursor, reservation_id), include_items=True
                 )
         logger.info(
-            "卡密库存预占已提交: user_id={} account_id={} reservation_id={} quantity={}",
-            user_id, account_id, reservation_id, result["quantity"],
+            "卡密库存预占已提交: user_id={} card_id={} account_id={} reservation_id={} quantity={}",
+            user_id, card_id, account_id, reservation_id, result["quantity"],
         )
         return result
 
-    def release_reservation(self, reservation_id, user_id, account_id):
-        user_id, account_id = self._reservation_scope(user_id, account_id)
+    def release_reservation(self, reservation_id, user_id, card_id, account_id):
+        user_id, card_id, account_id = self._reservation_scope(user_id, card_id, account_id)
         with self._transaction() as cursor:
             row = self._reservation_row(cursor, reservation_id)
-            self._check_reservation_scope(row, user_id, account_id)
+            self._check_reservation_scope(row, user_id, card_id, account_id)
             if row[6] != "reserved":
                 result = self._reservation_result(cursor, row)
             else:
@@ -595,7 +596,7 @@ class CardInventoryService:
                     cursor, self._reservation_row(cursor, reservation_id)
                 )
         logger.info(
-            "卡密库存预占已释放: user_id={} account_id={} reservation_id={} quantity={}",
-            user_id, account_id, reservation_id, result["quantity"],
+            "卡密库存预占已释放: user_id={} card_id={} account_id={} reservation_id={} quantity={}",
+            user_id, card_id, account_id, reservation_id, result["quantity"],
         )
         return result
