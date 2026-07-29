@@ -729,6 +729,80 @@ class DBManager:
             self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_data_card_reservations_order_status ON data_card_reservations(order_id, status)")
             self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_data_card_reservations_card_order_unit ON data_card_reservations(card_id, order_id, unit_index)")
 
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS card_inventory_settings (
+                user_id INTEGER NOT NULL,
+                card_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                stock_ceiling INTEGER NOT NULL DEFAULT 100 CHECK (stock_ceiling >= 0),
+                low_stock_threshold INTEGER NOT NULL DEFAULT 20 CHECK (low_stock_threshold >= 0),
+                auto_replenish INTEGER NOT NULL DEFAULT 0 CHECK (auto_replenish IN (0, 1)),
+                generator_prefix TEXT NOT NULL DEFAULT '',
+                generator_length INTEGER NOT NULL DEFAULT 16 CHECK (generator_length >= 4),
+                generator_charset TEXT NOT NULL DEFAULT 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789',
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, card_id, account_id)
+            )
+            ''')
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS card_inventory_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                card_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                quantity INTEGER NOT NULL CHECK (quantity > 0),
+                status TEXT NOT NULL DEFAULT 'reserved'
+                    CHECK (status IN ('reserved', 'committed', 'released')),
+                idempotency_key TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                committed_at TIMESTAMP,
+                released_at TIMESTAMP,
+                UNIQUE (user_id, card_id, account_id, order_id),
+                UNIQUE (user_id, card_id, account_id, idempotency_key)
+            )
+            ''')
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS card_inventory_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                card_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                secret_text TEXT NOT NULL,
+                secret_digest TEXT NOT NULL,
+                source_type TEXT NOT NULL CHECK (source_type IN ('manual', 'generated')),
+                status TEXT NOT NULL DEFAULT 'available'
+                    CHECK (status IN ('available', 'reserved', 'sent', 'invalidated')),
+                order_id TEXT,
+                reservation_id TEXT,
+                unit_index INTEGER,
+                idempotency_key TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                reserved_at TIMESTAMP,
+                delivered_at TIMESTAMP,
+                UNIQUE (user_id, card_id, account_id, secret_digest)
+            )
+            ''')
+            self._execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_card_inventory_items_scope_status "
+                "ON card_inventory_items(user_id, card_id, account_id, status)",
+            )
+            self._execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_card_inventory_items_reservation "
+                "ON card_inventory_items(reservation_id, status, unit_index)",
+            )
+            self._execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_card_inventory_reservations_scope_order "
+                "ON card_inventory_reservations(user_id, card_id, account_id, order_id)",
+            )
+
             # 创建默认回复表
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS default_replies (
