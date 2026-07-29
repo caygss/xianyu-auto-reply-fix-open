@@ -161,6 +161,22 @@ assert.equal(ready.step, 6);
 assert.equal(ready.action, 'finish');
 assert.equal(ready.ready, true);
 
+const setupSnapshotReady = guided.getGuidedSetupStatusViewModel(
+  { primary_action: 'finish', step_index: 6, runtime_ready: true, technical_status: 'connected' },
+  null,
+);
+assert.equal(setupSnapshotReady.step, 6);
+assert.equal(setupSnapshotReady.showPrimaryAction, true);
+assert.equal(setupSnapshotReady.ready, true);
+
+const setupSnapshotUnavailable = guided.getGuidedSetupStatusViewModel(
+  { primary_action: 'finish', step_index: 6, runtime_ready: false, technical_status: 'connected' },
+  null,
+);
+assert.equal(setupSnapshotUnavailable.step, 5);
+assert.equal(setupSnapshotUnavailable.showPrimaryAction, false);
+assert.equal(setupSnapshotUnavailable.ready, false);
+
 for (const missingRuntime of [null, {}, { connection_state: 'connected' }]) {
   const unavailable = guided.getGuidedSetupStatusViewModel(
     { primary_action: 'finish', step_index: 6, technical_status: 'connected', needs_user_action: false },
@@ -203,7 +219,7 @@ assert.equal(guided.isGuidedManualBrowserAvailable(
 assert.equal(guided.isGuidedManualBrowserAvailable(
   { vnc_manual_action_available: false, manual_browser_session_status: 'false' },
   { manual_browser_available: true },
-), false);
+), true);
 assert.equal(guided.isGuidedManualBrowserAvailable(
   { vnc_manual_action_available: true, manual_browser_session_status: 'active' },
 ), true);

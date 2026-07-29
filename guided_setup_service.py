@@ -173,6 +173,8 @@ def is_guided_runtime_ready(runtime_status: Optional[Mapping[str, Any]]) -> bool
     return bool(
         normalized["runtime_available"]
         and normalized["connection_state"] == "connected"
+        and isinstance(runtime_status, Mapping)
+        and runtime_status.get("running") is True
         and normalized["message_stream_ready_present"]
         and normalized["message_stream_ready"] is True
         and normalized["message_stream_status"] not in _MESSAGE_STREAM_UNREADY_STATUSES
@@ -274,6 +276,14 @@ def get_user_action_for_runtime(runtime_status: Optional[Mapping[str, Any]]) -> 
             "action": "refresh_status",
             "title": "正在恢复账号连接",
             "message": "账号正在恢复连接，请稍候，系统会自动继续。",
+            "needs_user_action": False,
+        }
+
+    if connection_state == "connected" and not is_guided_runtime_ready(runtime_status):
+        return {
+            "action": "refresh_status",
+            "title": "\u6b63\u5728\u6062\u590d\u8fde\u63a5",
+            "message": "\u8fde\u63a5\u5c1a\u672a\u5b8c\u5168\u5c31\u7eea\uff0c\u8bf7\u4fdd\u6301\u6d4f\u89c8\u5668\u7a97\u53e3\u6253\u5f00\u5e76\u7b49\u5f85\u81ea\u52a8\u6062\u590d\u3002",
             "needs_user_action": False,
         }
 
@@ -419,6 +429,7 @@ def build_guided_status(
         "message": action["message"],
         "needs_user_action": action["needs_user_action"],
         "primary_action": action["action"],
+        "runtime_ready": is_guided_runtime_ready(runtime_status),
         "retry_at": retry_at,
         "remaining_seconds": format_remaining_seconds(retry_at),
         "technical_status": technical_status,
@@ -437,6 +448,7 @@ def build_guided_status(
         or technical_status in _WAIT_STATUSES
         or action["action"] in {"open_manual_verification", "complete_manual_verification"}
         or _message_stream_unready(runtime_status)
+        or not is_guided_runtime_ready(runtime_status)
         or active_deadline
     )
     if connection_state == "connected" and not blocking_runtime_state:

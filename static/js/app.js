@@ -60,31 +60,28 @@ function getGuidedSetupElements() {
     };
 }
 
-function getGuidedSetupAccounts(payload, runtimeAccounts) {
+function getGuidedSetupAccounts(payload) {
     const payloadAccounts = Array.isArray(payload?.accounts) ? payload.accounts : [];
     const singleStatus = payload?.status && typeof payload.status === 'object'
         ? [{ cookie_id: payload.cookie_id || '', guided_status: payload.status }]
         : [];
     const sourceAccounts = payloadAccounts.length ? payloadAccounts : singleStatus;
-    const runtimeById = new Map(
-        (Array.isArray(runtimeAccounts) ? runtimeAccounts : [])
-            .map(account => [String(account?.id || '').trim(), account])
-            .filter(([id]) => id)
-    );
-
     return sourceAccounts.map(account => {
         const guidedStatus = account?.guided_status || account?.status || null;
         const accountId = String(
             account?.cookie_id || account?.id || guidedStatus?.cookie_id || ''
         ).trim();
-        const runtimeAccount = runtimeById.get(accountId);
+        const runtimeReady = typeof account?.runtime_ready === 'boolean'
+            ? account.runtime_ready
+            : (typeof guidedStatus?.runtime_ready === 'boolean' ? guidedStatus.runtime_ready : false);
         return {
             id: accountId,
             guidedStatus,
-            runtimeStatus: runtimeAccount?.runtime_status || account?.runtime_status || null,
-            username: runtimeAccount?.username || '',
+            runtimeReady,
+            runtimeStatus: account?.runtime_status || null,
+            username: account?.username || '',
         };
-    }).filter(account => account.guidedStatus || account.runtimeStatus);
+    }).filter(account => account.guidedStatus || account.runtimeStatus || account.runtimeReady);
 }
 
 const GUIDED_MESSAGE_STREAM_UNREADY_STATES = new Set([
@@ -125,27 +122,33 @@ function normalizeGuidedRuntimeStatus(runtimeStatus) {
     };
 }
 
-function isGuidedRuntimeReady(runtimeStatus) {
+function isGuidedRuntimeReady(runtimeStatus, guidedStatus = null) {
+    if (guidedStatus && typeof guidedStatus.runtime_ready === 'boolean') {
+        return guidedStatus.runtime_ready === true;
+    }
     const normalized = normalizeGuidedRuntimeStatus(runtimeStatus);
+    const runtime = runtimeStatus && typeof runtimeStatus === 'object' ? runtimeStatus : {};
     return normalized.runtimeAvailable
         && normalized.connectionState === 'connected'
+        && runtime.running === true
         && normalized.messageStreamReadyPresent
         && normalized.messageStreamReady === true
         && !GUIDED_MESSAGE_STREAM_UNREADY_STATES.has(normalized.messageStreamStatus);
 }
 
-function isGuidedManualBrowserAvailable(runtimeStatus) {
+function isGuidedManualBrowserAvailable(runtimeStatus, guidedStatus = null) {
     const runtime = runtimeStatus && typeof runtimeStatus === 'object' ? runtimeStatus : {};
     const runtimeState = String(runtime.manual_browser_session_status || '').trim().toLowerCase();
     return GUIDED_SETUP_ACTIVE_BROWSER_STATES.has(runtimeState)
-        || runtime.vnc_manual_action_available === true;
+        || runtime.vnc_manual_action_available === true
+        || guidedStatus?.manual_browser_available === true;
 }
 
-function getGuidedManualPrimaryAction(primaryAction, runtimeStatus) {
+function getGuidedManualPrimaryAction(primaryAction, runtimeStatus, guidedStatus = null) {
     const action = String(primaryAction || '').trim();
     if (action === 'complete_manual_verification') return 'complete_manual_verification';
     if (action === 'open_manual_verification') {
-        return isGuidedManualBrowserAvailable(runtimeStatus)
+        return isGuidedManualBrowserAvailable(runtimeStatus, guidedStatus)
             ? 'takeover_browser'
             : 'open_manual_verification';
     }
@@ -160,12 +163,12 @@ function selectGuidedSetupAccount(accounts, selectedAccountId = '') {
     const availableAccounts = Array.isArray(accounts) ? accounts : [];
     const selected = availableAccounts.find(account => account.id === selectedAccountId) || null;
     const needsAction = availableAccounts.find(account => (
-        !isGuidedRuntimeReady(account?.runtimeStatus)
+        !isGuidedRuntimeReady(account?.runtimeStatus, account?.guidedStatus)
         && String(account?.guidedStatus?.primary_action || '').trim() !== 'finish'
     ));
     return needsAction
-        || (selected && !isGuidedRuntimeReady(selected.runtimeStatus) ? selected : null)
-        || availableAccounts.find(account => !isGuidedRuntimeReady(account?.runtimeStatus))
+        || (selected && !isGuidedRuntimeReady(selected.runtimeStatus, selected.guidedStatus) ? selected : null)
+        || availableAccounts.find(account => !isGuidedRuntimeReady(account?.runtimeStatus, account?.guidedStatus))
         || selected
         || availableAccounts[0]
         || null;
@@ -278,6 +281,8 @@ function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}
     const technicalStatus = String(status.technical_status || '').trim();
     const stepIndex = Number(status.step_index);
     const runtime = runtimeStatus && typeof runtimeStatus === 'object' ? runtimeStatus : {};
+    const hasSnapshotRuntimeReady = typeof status.runtime_ready === 'boolean';
+    const snapshotRuntimeReady = hasSnapshotRuntimeReady ? status.runtime_ready : null;
     const runtimeConnectionState = String(runtime.connection_state || runtime.status || '').trim().toLowerCase();
     const runtimeConnectionNeedsRecovery = new Set([
         'connecting',
@@ -285,8 +290,9 @@ function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}
         'disconnected',
         'connection_unready',
     ]).has(runtimeConnectionState);
-    const runtimeNeedsRecovery = runtimeConnectionNeedsRecovery
-        || isGuidedRuntimeMessageStreamUnready(runtime);
+    const runtimeNeedsRecovery = hasSnapshotRuntimeReady
+        ? snapshotRuntimeReady !== true
+        : (runtimeConnectionNeedsRecovery || isGuidedRuntimeMessageStreamUnready(runtime));
     const contractStep = Number.isFinite(stepIndex)
         ? Math.min(6, Math.max(1, stepIndex))
         : (primaryAction === 'finish' ? 6 : 4);
@@ -315,7 +321,9 @@ function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}
         mode = 'connected_wait';
     }
     const runtimeBlocksFinish = primaryAction === 'finish'
-        && (runtimeNeedsRecovery || !isGuidedRuntimeReady(runtimeStatus));
+        && (hasSnapshotRuntimeReady ? snapshotRuntimeReady !== true : (
+            runtimeNeedsRecovery || !isGuidedRuntimeReady(runtimeStatus)
+        ));
     if (runtimeBlocksFinish) mode = 'reconnect_wait';
 
     return {
@@ -435,10 +443,10 @@ function renderGuidedSetupStatus() {
         primary.dataset.guidedAction = 'start_scan';
     } else if (
         viewModel.action === 'open_manual_verification'
-        && isGuidedManualBrowserAvailable(runtimeStatus)
+        && isGuidedManualBrowserAvailable(runtimeStatus, guidedStatus)
     ) {
         primary.textContent = '接管验证';
-        primary.dataset.guidedAction = getGuidedManualPrimaryAction(viewModel.contractAction, runtimeStatus);
+        primary.dataset.guidedAction = getGuidedManualPrimaryAction(viewModel.contractAction, runtimeStatus, guidedStatus);
         secondary.hidden = true;
         secondary.textContent = '我已完成验证';
         secondary.dataset.guidedAction = 'complete_manual_verification';
@@ -479,11 +487,8 @@ async function loadGuidedSetupStatus(options = {}) {
     if (!document.getElementById('guidedSetupPanel')) return;
     guidedSetupState.requestInFlight = true;
     try {
-        const [payload, runtimeAccounts] = await Promise.all([
-            fetchJSON(`${apiBase}${GUIDED_SETUP_STATUS_ENDPOINT}`),
-            fetchJSON(`${apiBase}/cookies/details`),
-        ]);
-        guidedSetupState.accounts = getGuidedSetupAccounts(payload, runtimeAccounts);
+        const payload = await fetchJSON(`${apiBase}${GUIDED_SETUP_STATUS_ENDPOINT}`);
+        guidedSetupState.accounts = getGuidedSetupAccounts(payload);
         const selected = getGuidedSetupAccount();
         guidedSetupState.selectedAccountId = selected?.id || '';
         guidedSetupState.guidedStatus = selected?.guidedStatus || null;
@@ -522,6 +527,13 @@ async function handleGuidedSetupAction(action) {
     if (selectedAction === 'takeover_browser') {
         if (!isGuidedManualBrowserAvailable(account?.runtimeStatus, account?.guidedStatus)) return;
         window.open(getNoVncUrl(), '_blank', 'noopener');
+        return;
+    }
+    if (
+        selectedAction === 'finish'
+        && !isGuidedRuntimeReady(account?.runtimeStatus, account?.guidedStatus)
+    ) {
+        renderGuidedSetupStatus();
         return;
     }
     guidedSetupState.requestInFlight = true;

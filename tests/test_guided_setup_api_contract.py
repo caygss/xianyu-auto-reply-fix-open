@@ -61,6 +61,7 @@ def test_guided_setup_routes_require_login(client, method, path, json):
 def test_setup_status_returns_safe_guided_json_and_reuses_cookie_details(authenticated_client, monkeypatch):
     runtime_status = {
         "connection_state": "connected",
+        "running": True,
         "message_stream_ready": True,
         "token_refresh_status": "success",
         "current_token": "token-secret",
@@ -115,7 +116,7 @@ def test_setup_status_reuses_real_configured_delivery_summary(authenticated_clie
         "get_cookies_details",
         lambda current_user: [{
             "id": "account-1",
-            "runtime_status": {"connection_state": "connected", "message_stream_ready": True},
+            "runtime_status": {"connection_state": "connected", "running": True, "message_stream_ready": True},
         }],
     )
 
@@ -141,7 +142,7 @@ def test_setup_status_keeps_unconfigured_account_before_completion(authenticated
         "get_cookies_details",
         lambda current_user: [{
             "id": "account-1",
-            "runtime_status": {"connection_state": "connected", "message_stream_ready": True},
+            "runtime_status": {"connection_state": "connected", "running": True, "message_stream_ready": True},
         }],
     )
 
@@ -218,7 +219,7 @@ def test_setup_finish_is_blocked_until_account_is_running_and_delivery_is_config
     monkeypatch.setattr(
         reply_server,
         "_build_live_runtime_status",
-        lambda cid: {"connection_state": "connected", "message_stream_ready": True},
+        lambda cid: {"connection_state": "connected", "running": True, "message_stream_ready": True},
     )
 
     response = authenticated_client.post("/setup/action", json={"action": "finish", "cookie_id": "account-1"})
@@ -249,7 +250,7 @@ def test_setup_finish_uses_configured_delivery_summary_and_can_complete(authenti
     monkeypatch.setattr(
         reply_server,
         "_build_live_runtime_status",
-        lambda cid: {"connection_state": "connected", "message_stream_ready": True},
+        lambda cid: {"connection_state": "connected", "running": True, "message_stream_ready": True},
     )
 
     response = authenticated_client.post("/setup/action", json={"action": "finish", "cookie_id": "account-1"})
@@ -269,6 +270,8 @@ def test_setup_finish_uses_configured_delivery_summary_and_can_complete(authenti
         {"connection_state": "connected", "message_stream_status": "recovering", "message_stream_ready": True},
         {"connection_state": "connected", "message_stream_status": "suspected_stale", "message_stream_ready": True},
         {"connection_state": "connected", "message_stream_ready": "FALSE"},
+        {"connection_state": "connected", "message_stream_ready": True},
+        {"connection_state": "connected", "running": False, "message_stream_ready": True},
     ],
 )
 def test_setup_finish_fails_closed_when_runtime_readiness_is_missing_or_unready(

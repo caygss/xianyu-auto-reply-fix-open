@@ -44,7 +44,7 @@ REQUIRED_FIELDS = {
             "open_manual_verification",
             4,
         ),
-        ({"connection_state": "connected", "message_stream_ready": True}, "finish", 6),
+        ({"connection_state": "connected", "running": True, "message_stream_ready": True}, "finish", 6),
     ],
 )
 def test_guided_status_exposes_stable_fields_and_safe_chinese_copy(runtime_status, expected_action, expected_step):
@@ -72,7 +72,7 @@ def test_guided_status_exposes_stable_fields_and_safe_chinese_copy(runtime_statu
 
 def test_connected_account_with_delivery_ready_can_wait_for_order():
     status = build_guided_status(
-        {"connection_state": "connected", "message_stream_ready": True},
+        {"connection_state": "connected", "running": True, "message_stream_ready": True},
         delivery_summary={"configured": True},
     )
 
@@ -131,7 +131,7 @@ def test_configured_connected_account_with_unready_message_stream_stays_in_recov
 
 
 def test_connected_account_without_delivery_summary_must_go_to_delivery_config():
-    status = build_guided_status({"connection_state": "connected", "message_stream_ready": True})
+    status = build_guided_status({"connection_state": "connected", "running": True, "message_stream_ready": True})
 
     assert status["step_id"] == "delivery_config"
     assert status["primary_action"] == "go_to_delivery_config"
@@ -221,7 +221,7 @@ def test_complete_pending_manual_verification_has_priority_over_connected():
 )
 def test_false_like_delivery_values_are_not_treated_as_configured(delivery_summary):
     status = build_guided_status(
-        {"connection_state": "connected", "message_stream_ready": True},
+        {"connection_state": "connected", "running": True, "message_stream_ready": True},
         delivery_summary=delivery_summary,
     )
 
@@ -254,6 +254,8 @@ def test_invalid_runtime_and_deadline_inputs_are_safe(runtime_status):
         None,
         {},
         {"connection_state": "connected"},
+        {"connection_state": "connected", "message_stream_ready": True},
+        {"connection_state": "connected", "running": False, "message_stream_ready": True},
         {"connection_state": "connected", "message_stream_status": "recovering", "message_stream_ready": True},
         {"connection_state": "connected", "message_stream_status": "suspected_stale", "message_stream_ready": True},
         {"connection_state": "connected", "message_stream_ready": "FALSE"},
@@ -266,8 +268,8 @@ def test_guided_runtime_ready_helper_fails_closed(runtime_status):
 @pytest.mark.parametrize(
     "runtime_status",
     [
-        {"connection_state": "connected", "message_stream_ready": True},
-        {"status": "CONNECTED", "message_stream_status": "healthy", "message_stream_ready": "true"},
+        {"connection_state": "connected", "running": True, "message_stream_ready": True},
+        {"status": "CONNECTED", "running": True, "message_stream_status": "healthy", "message_stream_ready": "true"},
     ],
 )
 def test_guided_runtime_ready_helper_accepts_explicit_ready_values(runtime_status):
@@ -314,7 +316,7 @@ def test_runtime_deadline_fields_drive_dynamic_remaining_seconds(monkeypatch):
         ({"token_refresh_status": "qr_login_grace_wait", "qr_login_grace_until": 130}, 3),
         ({"token_refresh_status": "password_login_backoff_wait", "token_refresh_backoff_until": 130}, 4),
         ({"connection_state": "connecting"}, 5),
-        ({"connection_state": "connected", "message_stream_ready": True}, 6),
+        ({"connection_state": "connected", "running": True, "message_stream_ready": True}, 6),
     ],
 )
 def test_guided_step_index_tracks_the_real_login_state(runtime_status, expected_step, monkeypatch):

@@ -54,7 +54,7 @@ def test_guided_status_contract_exports_named_render_load_and_browser_helpers():
 
 def test_manual_verification_has_only_one_visible_primary_action():
     assert "secondary.hidden = false" not in APP
-    assert "getGuidedManualPrimaryAction(viewModel.contractAction, runtimeStatus)" in APP
+    assert "getGuidedManualPrimaryAction(viewModel.contractAction, runtimeStatus, guidedStatus)" in APP
 
 
 def test_waiting_states_use_server_actionability_and_keep_waiting_without_recheck_button():
@@ -71,6 +71,15 @@ def test_finish_action_waits_for_server_acceptance_before_hiding_wizard():
     request_start = APP.index("guidedSetupState.requestInFlight = true", handler_start)
     preflight = APP[handler_start:request_start]
     assert "toggleGuidedSetup(false)" not in preflight
+
+
+def test_guided_status_load_uses_one_setup_status_snapshot_for_readiness():
+    load_start = APP.index("async function loadGuidedSetupStatus")
+    load_end = APP.index("async function handleGuidedSetupAction", load_start)
+    load_block = APP[load_start:load_end]
+    assert "GUIDED_SETUP_STATUS_ENDPOINT" in load_block
+    assert "/cookies/details" not in load_block
+    assert "runtime_ready" in APP
     assert "正在恢复连接" in APP
     assert "请等待" in APP
 
