@@ -94,8 +94,9 @@ def test_setup_status_returns_safe_guided_json_and_reuses_cookie_details(authent
     assert "password-secret" not in response.text
 
 
-def test_setup_status_passes_explicit_unconfigured_delivery_summary(authenticated_client, monkeypatch):
+def test_setup_status_reuses_real_configured_delivery_summary(authenticated_client, monkeypatch):
     captured = []
+    summary_calls = []
     original_build_guided_status = reply_server.build_guided_status
 
     def spy_build_guided_status(runtime_status, account_details=None, delivery_summary=None):
@@ -105,6 +106,11 @@ def test_setup_status_passes_explicit_unconfigured_delivery_summary(authenticate
     monkeypatch.setattr(reply_server, "build_guided_status", spy_build_guided_status)
     monkeypatch.setattr(
         reply_server,
+        "_get_guided_delivery_summary",
+        lambda cookie_id: summary_calls.append(cookie_id) or {"configured": True, "template_count": 1},
+    )
+    monkeypatch.setattr(
+        reply_server,
         "get_cookies_details",
         lambda current_user: [{"id": "account-1", "runtime_status": {"connection_state": "connected"}}],
     )
@@ -112,8 +118,31 @@ def test_setup_status_passes_explicit_unconfigured_delivery_summary(authenticate
     response = authenticated_client.get("/setup/status")
 
     assert response.status_code == 200
-    assert captured == [{"configured": False}]
-    assert response.json()["accounts"][0]["guided_status"]["primary_action"] == "go_to_delivery_config"
+    assert summary_calls == ["account-1"]
+    assert captured == [{"configured": True, "template_count": 1}]
+    guided_status = response.json()["accounts"][0]["guided_status"]
+    assert guided_status["primary_action"] == "finish"
+    assert guided_status["step_index"] == 6
+
+
+def test_setup_status_keeps_unconfigured_account_before_completion(authenticated_client, monkeypatch):
+    monkeypatch.setattr(
+        reply_server,
+        "_get_guided_delivery_summary",
+        lambda cookie_id: {"configured": False, "template_count": 0},
+    )
+    monkeypatch.setattr(
+        reply_server,
+        "get_cookies_details",
+        lambda current_user: [{"id": "account-1", "runtime_status": {"connection_state": "connected"}}],
+    )
+
+    response = authenticated_client.get("/setup/status")
+
+    assert response.status_code == 200
+    guided_status = response.json()["accounts"][0]["guided_status"]
+    assert guided_status["primary_action"] == "go_to_delivery_config"
+    assert guided_status["step_index"] == 5
 
 
 def test_setup_action_rejects_unknown_action_and_keeps_allowed_actions(authenticated_client, monkeypatch):

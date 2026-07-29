@@ -69,6 +69,24 @@ const reconnecting = guided.getGuidedSetupStatusViewModel(
 );
 assert.equal(reconnecting.step, 5);
 assert.equal(reconnecting.action, 'refresh_status');
+assert.equal(reconnecting.mode, 'reconnect_wait');
+assert.equal(reconnecting.showPrimaryAction, false);
+
+const disconnected = guided.getGuidedSetupStatusViewModel(
+  { primary_action: 'refresh_status', step_index: 5, technical_status: 'disconnected', needs_user_action: false },
+  { connection_state: 'disconnected' },
+);
+assert.equal(disconnected.step, 5);
+assert.equal(disconnected.mode, 'reconnect_wait');
+assert.equal(disconnected.showPrimaryAction, false);
+
+const connectionUnready = guided.getGuidedSetupStatusViewModel(
+  { primary_action: 'refresh_status', step_index: 5, technical_status: 'connection_unready', needs_user_action: false },
+  { connection_state: 'connection_unready' },
+);
+assert.equal(connectionUnready.step, 5);
+assert.equal(connectionUnready.mode, 'reconnect_wait');
+assert.equal(connectionUnready.showPrimaryAction, false);
 
 const manual = guided.getGuidedSetupStatusViewModel(
   { primary_action: 'open_manual_verification', step_index: 4, technical_status: 'verification_pending_manual', manual_browser_available: false, needs_user_action: true },

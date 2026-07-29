@@ -182,8 +182,8 @@ function getGuidedSetupCopy(step, account, viewModel = {}) {
     if (viewModel.mode === 'reconnect_wait' || viewModel.mode === 'connected_wait') {
         return {
             title: '正在恢复连接',
-            message: '账号正在恢复连接，当前无需操作，系统会继续等待状态稳定。',
-            notice: '请保持浏览器窗口打开，连接恢复后会自动继续检查。',
+            message: '正在恢复连接，请保持浏览器窗口打开并耐心等待。',
+            notice: '请保持浏览器窗口打开，等待连接恢复后会自动继续检查。',
         };
     }
     if (viewModel.mode === 'error') {
@@ -236,6 +236,8 @@ function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}
         password_login_backoff_wait: 'backoff_wait',
         connecting: 'reconnect_wait',
         reconnecting: 'reconnect_wait',
+        disconnected: 'reconnect_wait',
+        connection_unready: 'reconnect_wait',
         verification_pending_manual: 'manual',
         manual_verification_required: 'manual',
         token_refresh_failed: 'error',

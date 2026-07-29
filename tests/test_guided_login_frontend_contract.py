@@ -61,6 +61,10 @@ def test_waiting_states_use_server_actionability_and_keep_waiting_without_rechec
     assert "showPrimaryAction" in APP
     assert "primary.hidden = !viewModel.showPrimaryAction" in APP
     assert "stepIndex + 3" not in APP
+    assert "disconnected: 'reconnect_wait'" in APP
+    assert "connection_unready: 'reconnect_wait'" in APP
+    assert "正在恢复连接" in APP
+    assert "请等待" in APP
 
 
 def test_ready_state_keeps_the_panel_visible_for_step_six_confirmation():

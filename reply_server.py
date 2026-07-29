@@ -4762,7 +4762,7 @@ def _build_guided_setup_account_status(cookie_id: str, account_details: Optional
         'guided_status': build_guided_status(
             runtime_status,
             account_details={'id': cookie_id},
-            delivery_summary={'configured': False},
+            delivery_summary=_get_guided_delivery_summary(cookie_id),
         ),
     }
 
@@ -4856,7 +4856,7 @@ def _build_manual_verification_action_response(
         'guided_status': build_guided_status(
             runtime_status,
             account_details={'id': cleaned_cookie_id},
-            delivery_summary={'configured': False},
+            delivery_summary=_get_guided_delivery_summary(cleaned_cookie_id),
         ),
     }
     guided_manual_verification_actions[cleaned_cookie_id] = pending_state
@@ -4927,7 +4927,7 @@ def _perform_guided_setup_action_impl(
                 'guided_status': build_guided_status(
                     _build_live_runtime_status(cleaned_cookie_id),
                     account_details={'id': cleaned_cookie_id},
-                    delivery_summary={'configured': False},
+                    delivery_summary=_get_guided_delivery_summary(cleaned_cookie_id),
                 ),
             }
         if action == 'finish':
