@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import math
 
 import pytest
 
@@ -74,6 +75,76 @@ def test_connected_account_with_delivery_ready_can_wait_for_order():
     assert status["step_index"] == status["step_total"]
     assert status["needs_user_action"] is False
     assert status["message"] == "账号已连接，交付配置已完成，现在可以等待买家下单。"
+
+
+def test_connected_account_without_delivery_summary_must_go_to_delivery_config():
+    status = build_guided_status({"connection_state": "connected"})
+
+    assert status["step_id"] == "delivery_config"
+    assert status["primary_action"] == "go_to_delivery_config"
+    assert status["needs_user_action"] is True
+
+
+@pytest.mark.parametrize(
+    "delivery_summary",
+    [None, {}, {"configured": "false"}, {"configured": "0"}, {"configured": "off"}],
+)
+def test_false_like_delivery_values_are_not_treated_as_configured(delivery_summary):
+    status = build_guided_status({"connection_state": "connected"}, delivery_summary=delivery_summary)
+
+    assert status["primary_action"] == "go_to_delivery_config"
+    assert status["step_id"] == "delivery_config"
+
+
+@pytest.mark.parametrize(
+    "runtime_status",
+    [
+        None,
+        [],
+        "not-a-runtime-mapping",
+        {"token_refresh_status": "qr_login_grace_wait", "qr_login_grace_until": math.nan},
+        {"token_refresh_status": "qr_login_grace_wait", "qr_login_grace_until": math.inf},
+        {"token_refresh_status": "qr_login_grace_wait", "qr_login_grace_until": "not-a-deadline"},
+    ],
+)
+def test_invalid_runtime_and_deadline_inputs_are_safe(runtime_status):
+    status = build_guided_status(runtime_status)
+
+    assert status["remaining_seconds"] == 0
+    assert status["retry_at"] is None
+    assert isinstance(status["technical_detail"], str)
+
+
+def test_technical_detail_is_bounded_and_does_not_copy_upstream_error_text():
+    status = build_guided_status(
+        {
+            "token_refresh_status": "https://example.test/?token=secret",
+            "token_refresh_error_message": "password=secret https://example.test/private",
+        }
+    )
+
+    assert len(status["technical_detail"]) <= 100
+    assert "secret" not in status["technical_detail"]
+    assert "example.test" not in status["technical_detail"]
+
+
+def test_runtime_deadline_fields_drive_dynamic_remaining_seconds(monkeypatch):
+    monkeypatch.setattr("guided_setup_service.time.time", lambda: 100)
+
+    qr_status = build_guided_status(
+        {"token_refresh_status": "qr_login_grace_wait", "qr_login_grace_until": 130}
+    )
+    backoff_status = build_guided_status(
+        {
+            "token_refresh_status": "password_login_backoff_wait",
+            "token_refresh_backoff_until": 140,
+        }
+    )
+
+    assert qr_status["retry_at"] == 130
+    assert qr_status["remaining_seconds"] == 30
+    assert backoff_status["retry_at"] == 140
+    assert backoff_status["remaining_seconds"] == 40
 
 
 def test_format_remaining_seconds_is_dynamic_and_never_negative():

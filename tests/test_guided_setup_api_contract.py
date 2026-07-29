@@ -15,12 +15,17 @@ def client():
 
 @pytest.fixture
 def authenticated_client():
+    previous = reply_server.app.dependency_overrides.get(reply_server.get_current_user)
     reply_server.app.dependency_overrides[reply_server.get_current_user] = lambda: USER
     try:
         with TestClient(reply_server.app) as test_client:
             yield test_client
     finally:
-        reply_server.app.dependency_overrides.pop(reply_server.get_current_user, None)
+        if previous is None:
+            reply_server.app.dependency_overrides.pop(reply_server.get_current_user, None)
+        else:
+            reply_server.app.dependency_overrides[reply_server.get_current_user] = previous
+        reply_server.guided_manual_verification_actions.clear()
 
 
 def test_guided_setup_routes_are_registered():
@@ -82,7 +87,7 @@ def test_setup_status_returns_safe_guided_json_and_reuses_cookie_details(authent
     assert calls == [USER]
     assert payload["success"] is True
     assert payload["accounts"][0]["cookie_id"] == "account-1"
-    assert payload["accounts"][0]["guided_status"]["step_id"] == "account_connected"
+    assert payload["accounts"][0]["guided_status"]["step_id"] == "delivery_config"
     assert "cookie-secret" not in response.text
     assert "token-secret" not in response.text
     assert "password-secret" not in response.text
@@ -118,3 +123,93 @@ def test_manual_verification_actions_use_cookie_access_check(authenticated_clien
     assert response.status_code == 200
     assert calls == [("account-1", USER)]
     assert response.json()["cookie_id"] == "account-1"
+
+
+def test_manual_verification_actions_record_pending_state_and_next_action(authenticated_client, monkeypatch):
+    reply_server.guided_manual_verification_actions.clear()
+    monkeypatch.setattr(
+        reply_server,
+        "_build_live_runtime_status",
+        lambda cid: {
+            "token_refresh_status": "verification_pending_manual",
+            "connection_state": "reconnecting",
+        },
+    )
+    monkeypatch.setattr(reply_server, "_ensure_cookie_access", lambda cid, user: cid)
+
+    opened = authenticated_client.post("/cookies/account-1/manual-verification/open", json={})
+    assert opened.status_code == 200
+    assert opened.json()["status"] == "pending"
+    assert opened.json()["next_action"] == "complete_manual_verification"
+    assert opened.json()["guided_status"]["primary_action"] == "complete_manual_verification"
+    assert reply_server.guided_manual_verification_actions["account-1"]["status"] == "open_pending"
+
+    monkeypatch.setattr(
+        reply_server,
+        "get_cookies_details",
+        lambda current_user: [{
+            "id": "account-1",
+            "runtime_status": {"token_refresh_status": "verification_pending_manual"},
+        }],
+    )
+    setup_status = authenticated_client.get("/setup/status")
+    assert setup_status.status_code == 200
+    assert setup_status.json()["accounts"][0]["guided_status"]["primary_action"] == "complete_manual_verification"
+
+    completed = authenticated_client.post("/cookies/account-1/manual-verification/complete", json={})
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "pending"
+    assert completed.json()["next_action"] == "refresh_status"
+    assert completed.json()["guided_status"]["primary_action"] == "refresh_status"
+    assert reply_server.guided_manual_verification_actions["account-1"]["status"] == "complete_pending"
+
+
+def test_manual_verification_cross_account_access_is_denied(authenticated_client, monkeypatch):
+    monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"own-account": "masked"})
+
+    response = authenticated_client.post("/cookies/other-account/manual-verification/open", json={})
+
+    assert response.status_code == 403
+    assert "secret" not in response.text
+
+
+def test_manual_verification_unexpected_error_uses_safe_client_message(authenticated_client, monkeypatch):
+    monkeypatch.setattr(reply_server, "_ensure_cookie_access", lambda cid, user: cid)
+    monkeypatch.setattr(
+        reply_server,
+        "_build_live_runtime_status",
+        lambda cid: (_ for _ in ()).throw(RuntimeError("password=secret https://private.example")),
+    )
+
+    response = authenticated_client.post("/cookies/account-1/manual-verification/open", json={})
+
+    assert response.status_code == 400
+    assert "secret" not in response.text
+    assert "private.example" not in response.text
+
+
+def test_live_runtime_exposes_real_grace_and_backoff_deadlines(monkeypatch):
+    from XianyuAutoAsync import XianyuLive
+
+    now = 1000
+    monkeypatch.setattr(reply_server.cookie_manager, "manager", None)
+    monkeypatch.setattr(reply_server.db_manager, "get_cookie_details", lambda cid: {"qr_login_grace_until": 1020})
+    monkeypatch.setattr(XianyuLive, "get_instance", lambda cid: None)
+    monkeypatch.setattr(XianyuLive, "get_auth_recovery_lock_state", lambda cid: None)
+    monkeypatch.setattr(
+        XianyuLive,
+        "get_password_login_failure_backoff",
+        lambda cid: {"until": 1030, "reason": "slider_failed"},
+    )
+    monkeypatch.setattr(reply_server.time, "time", lambda: now)
+
+    status = reply_server._build_live_runtime_status("account-1")
+
+    assert status["qr_login_grace_until"] == 1020
+    assert status["token_refresh_backoff_until"] == 1030
+    assert status["token_refresh_remaining_seconds"] == 30
+
+    monkeypatch.setattr(XianyuLive, "get_password_login_failure_backoff", lambda cid: None)
+    qr_only_status = reply_server._build_live_runtime_status("account-1")
+    assert qr_only_status["token_refresh_status"] == "qr_login_grace_wait"
+    assert qr_only_status["token_refresh_remaining_seconds"] == 20

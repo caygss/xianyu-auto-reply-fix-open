@@ -15,6 +15,7 @@ import os
 import re
 import uuid
 import base64
+import math
 from datetime import datetime, timedelta
 import uvicorn
 import pandas as pd
@@ -819,6 +820,7 @@ def get_ip_failure_count(client_ip: str) -> int:
 # 账号密码登录会话管理
 password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 password_login_locks = defaultdict(lambda: asyncio.Lock())
+guided_manual_verification_actions: Dict[str, Dict[str, Any]] = {}
 manual_cookie_import_sessions = {}  # {session_id: {'account_id': str, 'status': str, 'verification_url': str, 'screenshot_path': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 manual_cookie_import_locks = defaultdict(lambda: asyncio.Lock())
 PASSWORD_LOGIN_TERMINAL_STATUSES = {'success', 'failed', 'cancelled'}
@@ -4082,6 +4084,18 @@ def _is_runtime_timestamp_recent(value: Any, window_seconds: Any) -> bool:
     return (time.time() - timestamp) <= window
 
 
+def _safe_runtime_deadline(value: Any) -> int:
+    try:
+        if isinstance(value, bool):
+            return 0
+        timestamp = float(value)
+        if not math.isfinite(timestamp):
+            return 0
+        return int(timestamp)
+    except (OverflowError, TypeError, ValueError):
+        return 0
+
+
 def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     cleaned_cid = str(cookie_id or '').strip()
     runtime_status = {
@@ -4096,6 +4110,9 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'message_stream_note': None,
         'token_refresh_status': None,
         'token_refresh_error_message': None,
+        'qr_login_grace_until': 0,
+        'token_refresh_backoff_until': 0,
+        'token_refresh_remaining_seconds': 0,
         'token_last_refreshed_at': None,
         'token_last_refreshed_at_display': None,
         'token_age_seconds': None,
@@ -4140,9 +4157,30 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'vnc_manual_action_available': False,
         'manual_browser_session_status': None,
         'manual_browser_reason': None,
+        'manual_verification_action': None,
     }
     if not cleaned_cid:
         return runtime_status
+
+    try:
+        account_details = db_manager.get_cookie_details(cleaned_cid) or {}
+        runtime_status['qr_login_grace_until'] = _safe_runtime_deadline(
+            account_details.get('qr_login_grace_until')
+        )
+        if runtime_status['qr_login_grace_until'] > time.time():
+            runtime_status['token_refresh_status'] = 'qr_login_grace_wait'
+            runtime_status['token_refresh_remaining_seconds'] = max(
+                0,
+                int(runtime_status['qr_login_grace_until'] - time.time()),
+            )
+    except Exception as exc:
+        logger.warning(f"读取账号稳定期状态失败: {cleaned_cid}, {mask_sensitive_text(exc)}")
+
+    manual_action_state = guided_manual_verification_actions.get(cleaned_cid)
+    if manual_action_state:
+        action_timestamp = float(manual_action_state.get('updated_at') or 0)
+        if action_timestamp and time.time() - action_timestamp <= 1800:
+            runtime_status['manual_verification_action'] = manual_action_state.get('status')
 
     live_instance = None
     try:
@@ -4162,6 +4200,17 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
             live_instance = XianyuLive.get_instance(cleaned_cid)
         auth_recovery_state = XianyuLive.get_auth_recovery_lock_state(cleaned_cid)
         runtime_status['auth_recovery_owner'] = (auth_recovery_state or {}).get('owner')
+        try:
+            backoff_state = XianyuLive.get_password_login_failure_backoff(cleaned_cid) or {}
+            backoff_until = _safe_runtime_deadline(backoff_state.get('until'))
+            runtime_status['token_refresh_backoff_until'] = backoff_until
+            if backoff_until > time.time():
+                runtime_status['token_refresh_remaining_seconds'] = max(0, int(backoff_until - time.time()))
+                current_status = str(runtime_status.get('token_refresh_status') or '').strip()
+                if current_status not in {'verification_pending_manual', 'manual_verification_required', 'qr_login_grace_wait'}:
+                    runtime_status['token_refresh_status'] = 'password_login_backoff_wait'
+        except Exception as exc:
+            logger.warning(f"读取账号恢复等待状态失败: {cleaned_cid}, {mask_sensitive_text(exc)}")
 
     if not live_instance:
         return runtime_status
@@ -4173,7 +4222,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     ws_transport_ready = bool(ws and not getattr(ws, 'closed', False))
     session_transport_ready = bool(session and not getattr(session, 'closed', True))
     token_cached = bool(getattr(live_instance, 'current_token', None))
-    token_refresh_status = getattr(live_instance, 'last_token_refresh_status', None)
+    token_refresh_status = getattr(live_instance, 'last_token_refresh_status', None) or runtime_status.get('token_refresh_status')
     session_keepalive_status = getattr(live_instance, 'last_session_keepalive_status', None)
     heartbeat_response_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_heartbeat_response', 0))
     heartbeat_sent_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_heartbeat_time', 0))
@@ -4201,6 +4250,18 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     session_ready_window = max(session_keepalive_interval + session_keepalive_retry_interval + 30, 180)
     token_ready_window = max(token_refresh_interval + token_retry_interval, 300)
     now = time.time()
+
+    qr_login_grace_until = _safe_runtime_deadline(runtime_status.get('qr_login_grace_until'))
+    token_refresh_backoff_until = _safe_runtime_deadline(runtime_status.get('token_refresh_backoff_until'))
+    if qr_login_grace_until > now:
+        token_refresh_status = 'qr_login_grace_wait'
+        runtime_status['token_refresh_remaining_seconds'] = max(0, int(qr_login_grace_until - now))
+    elif token_refresh_backoff_until > now:
+        if token_refresh_status not in {'verification_pending_manual', 'manual_verification_required'}:
+            token_refresh_status = 'password_login_backoff_wait'
+        runtime_status['token_refresh_remaining_seconds'] = max(0, int(token_refresh_backoff_until - now))
+    else:
+        runtime_status['token_refresh_remaining_seconds'] = 0
 
     recent_connection = _is_runtime_timestamp_recent(last_successful_connection_at, recent_connection_window)
     recent_heartbeat_ok = _is_runtime_timestamp_recent(heartbeat_response_at, ws_ready_window)
@@ -4379,6 +4440,9 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'token_cached': token_cached,
         'token_refresh_status': token_refresh_status,
         'token_refresh_error_message': getattr(live_instance, 'last_token_refresh_error_message', None),
+        'qr_login_grace_until': qr_login_grace_until,
+        'token_refresh_backoff_until': token_refresh_backoff_until,
+        'token_refresh_remaining_seconds': runtime_status.get('token_refresh_remaining_seconds', 0),
         'token_last_refreshed_at': token_refreshed_at,
         'token_last_refreshed_at_display': _format_runtime_timestamp(token_refreshed_at),
         'token_age_seconds': _get_runtime_age_seconds(token_refreshed_at),
@@ -4421,6 +4485,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'vnc_manual_action_available': vnc_manual_action_available,
         'manual_browser_session_status': manual_browser_status,
         'manual_browser_reason': manual_browser_reason,
+        'manual_verification_action': runtime_status.get('manual_verification_action'),
     })
     return runtime_status
 
@@ -4529,6 +4594,11 @@ def _build_guided_setup_account_status(cookie_id: str, account_details: Optional
     runtime_status = account_details.get('runtime_status')
     if not isinstance(runtime_status, dict):
         runtime_status = _build_live_runtime_status(cookie_id)
+    else:
+        runtime_status = dict(runtime_status)
+    action_state = guided_manual_verification_actions.get(cookie_id)
+    if action_state:
+        runtime_status['manual_verification_action'] = action_state.get('status')
     return {
         'cookie_id': cookie_id,
         'guided_status': build_guided_status(
@@ -4560,27 +4630,65 @@ def _build_manual_verification_action_response(
     current_user: Dict[str, Any],
 ) -> Dict[str, Any]:
     cleaned_cookie_id = _ensure_cookie_access(cookie_id, current_user)
-    runtime_status = _build_live_runtime_status(cleaned_cookie_id)
+    state = 'open_pending' if action == 'open_manual_verification' else 'complete_pending'
+    guided_manual_verification_actions[cleaned_cookie_id] = {
+        'status': state,
+        'action': action,
+        'updated_at': time.time(),
+    }
+    runtime_status = dict(_build_live_runtime_status(cleaned_cookie_id) or {})
+    runtime_status['manual_verification_action'] = state
     return {
         'success': True,
         'action': action,
+        'status': 'pending',
+        'next_action': (
+            'complete_manual_verification'
+            if action == 'open_manual_verification'
+            else 'refresh_status'
+        ),
         'cookie_id': cleaned_cookie_id,
         'message': (
-            '已准备打开验证页面，请完成页面中的验证。'
+            '已记录打开验证页面请求，请完成验证后确认。'
             if action == 'open_manual_verification'
-            else '已记录验证完成请求，系统正在重新检查账号。'
+            else '已记录验证完成请求，正在重新检查账号。'
         ),
         'guided_status': build_guided_status(runtime_status, account_details={'id': cleaned_cookie_id}),
     }
 
 
+def _safe_manual_verification_action_response(
+    cookie_id: str,
+    action: str,
+    current_user: Dict[str, Any],
+) -> Dict[str, Any]:
+    try:
+        return _build_manual_verification_action_response(cookie_id, action, current_user)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log_with_user('error', f"向导人工验证操作失败: {mask_sensitive_text(exc)}", current_user)
+        raise HTTPException(
+            status_code=400,
+            detail=safe_client_error('向导操作失败，请稍后重试'),
+        )
+
+
 @app.get('/setup/status')
 def get_guided_setup_status(current_user: Dict[str, Any] = Depends(get_current_user)):
-    return _build_guided_setup_status_payload(current_user)
+    try:
+        return _build_guided_setup_status_payload(current_user)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log_with_user('error', f"读取向导状态失败: {mask_sensitive_text(exc)}", current_user)
+        raise HTTPException(
+            status_code=400,
+            detail=safe_client_error('读取向导状态失败，请稍后重试'),
+        )
 
 
-@app.post('/setup/action')
-def perform_guided_setup_action(
+def _perform_guided_setup_action_impl(
     request: GuidedSetupActionRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
@@ -4599,7 +4707,7 @@ def perform_guided_setup_action(
     if action in {'open_manual_verification', 'complete_manual_verification'}:
         if not cookie_id:
             raise HTTPException(status_code=400, detail='该操作需要指定账号')
-        return _build_manual_verification_action_response(cookie_id, action, current_user)
+        return _safe_manual_verification_action_response(cookie_id, action, current_user)
 
     if cookie_id:
         cleaned_cookie_id = _ensure_cookie_access(cookie_id, current_user)
@@ -4634,14 +4742,31 @@ def perform_guided_setup_action(
     }
 
 
+@app.post('/setup/action')
+def perform_guided_setup_action(
+    request: GuidedSetupActionRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        return _perform_guided_setup_action_impl(request, current_user)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log_with_user('error', f"执行向导操作失败: {mask_sensitive_text(exc)}", current_user)
+        raise HTTPException(
+            status_code=400,
+            detail=safe_client_error('向导操作失败，请稍后重试'),
+        )
+
+
 @app.post('/cookies/{cid}/manual-verification/open')
 def open_manual_verification(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    return _build_manual_verification_action_response(cid, 'open_manual_verification', current_user)
+    return _safe_manual_verification_action_response(cid, 'open_manual_verification', current_user)
 
 
 @app.post('/cookies/{cid}/manual-verification/complete')
 def complete_manual_verification(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    return _build_manual_verification_action_response(cid, 'complete_manual_verification', current_user)
+    return _safe_manual_verification_action_response(cid, 'complete_manual_verification', current_user)
 
 
 @app.get("/api/announcement")

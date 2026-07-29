@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import math
+import re
 import time
-from typing import Any, Mapping, Optional
+from collections.abc import Mapping
+from typing import Any, Optional
 
 
 STEP_TOTAL = 3
@@ -25,24 +28,37 @@ _WAIT_STATUSES = {
 def _timestamp(value: Any) -> Optional[float]:
     if value is None or value == "":
         return None
+    if isinstance(value, bool):
+        return None
     if isinstance(value, datetime):
-        return value.timestamp()
+        try:
+            timestamp = value.timestamp()
+        except (OverflowError, OSError, ValueError):
+            return None
+        return timestamp if math.isfinite(timestamp) else None
     if isinstance(value, date):
-        return datetime.combine(value, datetime.min.time()).timestamp()
+        try:
+            timestamp = datetime.combine(value, datetime.min.time()).timestamp()
+        except (OverflowError, OSError, ValueError):
+            return None
+        return timestamp if math.isfinite(timestamp) else None
     if isinstance(value, str):
         raw_value = value.strip()
         if not raw_value:
             return None
         try:
-            return float(raw_value)
+            timestamp = float(raw_value)
+            return timestamp if math.isfinite(timestamp) else None
         except ValueError:
             try:
-                return datetime.fromisoformat(raw_value.replace("Z", "+00:00")).timestamp()
-            except ValueError:
+                timestamp = datetime.fromisoformat(raw_value.replace("Z", "+00:00")).timestamp()
+                return timestamp if math.isfinite(timestamp) else None
+            except (OverflowError, OSError, ValueError):
                 return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        timestamp = float(value)
+        return timestamp if math.isfinite(timestamp) else None
+    except (OverflowError, TypeError, ValueError):
         return None
 
 
@@ -54,11 +70,14 @@ def format_remaining_seconds(deadline: Any, now: Any = None) -> int:
     now_timestamp = _timestamp(now) if now is not None else time.time()
     if now_timestamp is None:
         now_timestamp = time.time()
-    return max(0, int(deadline_timestamp - now_timestamp))
+    try:
+        return max(0, int(deadline_timestamp - now_timestamp))
+    except (OverflowError, ValueError):
+        return 0
 
 
 def _normalized_runtime_status(runtime_status: Optional[Mapping[str, Any]]) -> tuple[str, str]:
-    runtime_status = runtime_status or {}
+    runtime_status = runtime_status if isinstance(runtime_status, Mapping) else {}
     fallback_status = str(runtime_status.get("status") or "").strip().lower()
     token_status = str(runtime_status.get("token_refresh_status") or fallback_status).strip().lower()
     connection_state = str(runtime_status.get("connection_state") or fallback_status).strip().lower()
@@ -68,10 +87,18 @@ def _normalized_runtime_status(runtime_status: Optional[Mapping[str, Any]]) -> t
 def get_user_action_for_runtime(runtime_status: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     """Map an internal runtime state to one user-facing action."""
     token_status, connection_state = _normalized_runtime_status(runtime_status)
-    runtime_status = runtime_status or {}
+    runtime_status = runtime_status if isinstance(runtime_status, Mapping) else {}
 
     if token_status in _VERIFICATION_STATUSES:
-        if runtime_status.get("manual_verification_open"):
+        manual_action = str(runtime_status.get("manual_verification_action") or "").strip().lower()
+        if manual_action == "complete_pending":
+            return {
+                "action": "refresh_status",
+                "title": "正在检查验证结果",
+                "message": "已收到完成提示，系统正在重新检查账号，请稍候。",
+                "needs_user_action": False,
+            }
+        if manual_action in {"open_pending", "opened"} or runtime_status.get("manual_verification_open"):
             return {
                 "action": "complete_manual_verification",
                 "title": "需要确认验证已完成",
@@ -124,40 +151,49 @@ def get_user_action_for_runtime(runtime_status: Optional[Mapping[str, Any]]) -> 
     }
 
 
-def _retry_deadline(runtime_status: Mapping[str, Any], technical_status: str) -> Any:
-    candidates = [
-        "retry_at",
-        "token_refresh_retry_at",
-        "token_refresh_backoff_until",
-        "qr_login_grace_until",
-        "manual_verification_until",
-    ]
-    for key in candidates:
-        value = runtime_status.get(key)
-        if value not in (None, ""):
-            return value
-
-    if technical_status == "password_login_backoff_wait":
-        return runtime_status.get("backoff_until")
+def _retry_deadline(runtime_status: Mapping[str, Any], technical_status: str) -> Optional[float]:
     if technical_status == "qr_login_grace_wait":
-        return runtime_status.get("grace_until")
+        candidates = ["qr_login_grace_until", "grace_until"]
+    elif technical_status == "password_login_backoff_wait":
+        candidates = ["token_refresh_backoff_until", "backoff_until"]
+    else:
+        candidates = []
+    candidates.extend(["retry_at", "token_refresh_retry_at", "manual_verification_until"])
+    for key in candidates:
+        timestamp = _timestamp(runtime_status.get(key))
+        if timestamp is not None:
+            return int(timestamp) if timestamp.is_integer() else timestamp
     return None
 
 
-def _delivery_configured(delivery_summary: Optional[Mapping[str, Any]]) -> Optional[bool]:
-    if delivery_summary is None:
-        return None
+def _coerce_configured(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return math.isfinite(float(value)) and bool(value)
+    normalized = str(value or "").strip().lower()
+    return normalized in {"1", "true", "yes", "y", "on", "enabled"}
+
+
+def _delivery_configured(delivery_summary: Optional[Mapping[str, Any]]) -> bool:
     if not isinstance(delivery_summary, Mapping):
-        return bool(delivery_summary)
+        return False
     for key in ("configured", "is_configured", "complete", "ready"):
         if key in delivery_summary:
-            return bool(delivery_summary[key])
-    return None
+            return _coerce_configured(delivery_summary[key])
+    return False
+
+
+def _safe_status_value(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized or len(normalized) > 64 or not re.fullmatch(r"[a-z0-9_.-]+", normalized):
+        return "unknown"
+    return normalized
 
 
 def _technical_status(runtime_status: Mapping[str, Any]) -> str:
     token_status, connection_state = _normalized_runtime_status(runtime_status)
-    return token_status or connection_state or "unknown"
+    return _safe_status_value(token_status or connection_state)
 
 
 def _technical_detail(runtime_status: Mapping[str, Any], technical_status: str) -> str:
@@ -174,7 +210,7 @@ def build_guided_status(
 ) -> dict[str, Any]:
     """Convert runtime details into the stable guided setup status object."""
     del account_details  # Account details are intentionally never copied to the response.
-    runtime_status = runtime_status or {}
+    runtime_status = runtime_status if isinstance(runtime_status, Mapping) else {}
     action = get_user_action_for_runtime(runtime_status)
     technical_status = _technical_status(runtime_status)
     retry_at = _retry_deadline(runtime_status, technical_status)
@@ -195,7 +231,7 @@ def build_guided_status(
     _, connection_state = _normalized_runtime_status(runtime_status)
     if connection_state == "connected":
         configured = _delivery_configured(delivery_summary)
-        if configured is True:
+        if configured:
             status.update(
                 {
                     "step_id": "ready_to_wait_for_order",
