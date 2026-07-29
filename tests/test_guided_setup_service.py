@@ -82,6 +82,30 @@ def test_connected_account_with_delivery_ready_can_wait_for_order():
     assert status["message"] == "账号已连接，交付配置已完成，现在可以等待买家下单。"
 
 
+@pytest.mark.parametrize(
+    "runtime_status",
+    [
+        {
+            "connection_state": "connected",
+            "message_stream_status": "connection_unready",
+            "message_stream_ready": True,
+        },
+        {
+            "connection_state": "connected",
+            "message_stream_status": "healthy",
+            "message_stream_ready": False,
+        },
+    ],
+)
+def test_configured_connected_account_with_unready_message_stream_stays_in_recovery(runtime_status):
+    status = build_guided_status(runtime_status, delivery_summary={"configured": True})
+
+    assert status["primary_action"] == "refresh_status"
+    assert status["step_index"] == 5
+    assert status["needs_user_action"] is False
+    assert status["technical_status"] == "connection_unready"
+
+
 def test_connected_account_without_delivery_summary_must_go_to_delivery_config():
     status = build_guided_status({"connection_state": "connected"})
 

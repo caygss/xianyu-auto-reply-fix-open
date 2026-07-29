@@ -228,6 +228,16 @@ function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}
     const primaryAction = String(status.primary_action || 'refresh_status').trim() || 'refresh_status';
     const technicalStatus = String(status.technical_status || '').trim();
     const stepIndex = Number(status.step_index);
+    const runtime = runtimeStatus && typeof runtimeStatus === 'object' ? runtimeStatus : {};
+    const runtimeConnectionState = String(runtime.connection_state || '').trim().toLowerCase();
+    const runtimeNeedsRecovery = new Set([
+        'connecting',
+        'reconnecting',
+        'disconnected',
+        'connection_unready',
+    ]).has(runtimeConnectionState)
+        || String(runtime.message_stream_status || '').trim().toLowerCase() === 'connection_unready'
+        || runtime.message_stream_ready === false;
     const contractStep = Number.isFinite(stepIndex)
         ? Math.min(6, Math.max(1, stepIndex))
         : (primaryAction === 'finish' ? 6 : 4);
@@ -255,14 +265,16 @@ function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}
     if (primaryAction === 'go_to_delivery_config' && !technicalModes[technicalStatus]) {
         mode = 'connected_wait';
     }
+    if (runtimeNeedsRecovery) mode = 'reconnect_wait';
 
     return {
-        step: primaryAction === 'finish' ? 6 : contractStep,
+        step: runtimeNeedsRecovery ? 5 : (primaryAction === 'finish' ? 6 : contractStep),
         action: primaryAction,
         contractAction: primaryAction,
         mode,
-        showPrimaryAction: primaryAction === 'finish' || status.needs_user_action === true,
-        ready: primaryAction === 'finish',
+        showPrimaryAction: !runtimeNeedsRecovery
+            && (primaryAction === 'finish' || status.needs_user_action === true),
+        ready: primaryAction === 'finish' && !runtimeNeedsRecovery,
     };
 }
 

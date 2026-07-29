@@ -114,10 +114,24 @@ def _future_deadline(runtime_status: Mapping[str, Any], keys: tuple[str, ...]) -
     return None
 
 
+def _message_stream_unready(runtime_status: Mapping[str, Any]) -> bool:
+    runtime_status = runtime_status if isinstance(runtime_status, Mapping) else {}
+    stream_status = str(runtime_status.get("message_stream_status") or "").strip().lower()
+    return stream_status == "connection_unready" or runtime_status.get("message_stream_ready") is False
+
+
 def get_user_action_for_runtime(runtime_status: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     """Map an internal runtime state to one user-facing action."""
     token_status, connection_state = _normalized_runtime_status(runtime_status)
     runtime_status = runtime_status if isinstance(runtime_status, Mapping) else {}
+
+    if _message_stream_unready(runtime_status):
+        return {
+            "action": "refresh_status",
+            "title": "正在恢复连接",
+            "message": "连接状态尚未稳定，请保持浏览器窗口打开并等待系统自动恢复。",
+            "needs_user_action": False,
+        }
 
     manual_action = str(runtime_status.get("manual_verification_action") or "").strip().lower()
     if manual_action == "complete_pending":
@@ -273,6 +287,8 @@ def _safe_status_value(value: Any) -> str:
 
 def _technical_status(runtime_status: Mapping[str, Any]) -> str:
     token_status, connection_state = _normalized_runtime_status(runtime_status)
+    if _message_stream_unready(runtime_status):
+        return "connection_unready"
     manual_action = str(runtime_status.get("manual_verification_action") or "").strip().lower()
     if manual_action in {"open_pending", "opened", "complete_pending"} or runtime_status.get(
         "manual_verification_open"
@@ -302,6 +318,8 @@ def _guided_step_index(
     runtime_status = runtime_status if isinstance(runtime_status, Mapping) else {}
     token_status, connection_state = _normalized_runtime_status(runtime_status)
 
+    if _message_stream_unready(runtime_status):
+        return RECONNECT_STEP_INDEX
     if action == "finish":
         return READY_STEP_INDEX
     if action == "go_to_delivery_config":
@@ -359,6 +377,7 @@ def build_guided_status(
         technical_status in _VERIFICATION_STATUSES
         or technical_status in _WAIT_STATUSES
         or action["action"] in {"open_manual_verification", "complete_manual_verification"}
+        or _message_stream_unready(runtime_status)
         or active_deadline
     )
     if connection_state == "connected" and not blocking_runtime_state:

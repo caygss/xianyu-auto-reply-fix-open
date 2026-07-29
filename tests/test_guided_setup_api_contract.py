@@ -145,6 +145,37 @@ def test_setup_status_keeps_unconfigured_account_before_completion(authenticated
     assert guided_status["step_index"] == 5
 
 
+def test_setup_status_does_not_finish_configured_account_with_unready_message_stream(
+    authenticated_client, monkeypatch
+):
+    monkeypatch.setattr(
+        reply_server,
+        "_get_guided_delivery_summary",
+        lambda cookie_id: {"configured": True, "template_count": 1},
+    )
+    monkeypatch.setattr(
+        reply_server,
+        "get_cookies_details",
+        lambda current_user: [{
+            "id": "account-1",
+            "runtime_status": {
+                "connection_state": "connected",
+                "message_stream_status": "connection_unready",
+                "message_stream_ready": False,
+            },
+        }],
+    )
+
+    response = authenticated_client.get("/setup/status")
+
+    assert response.status_code == 200
+    guided_status = response.json()["accounts"][0]["guided_status"]
+    assert guided_status["primary_action"] == "refresh_status"
+    assert guided_status["step_index"] == 5
+    assert guided_status["needs_user_action"] is False
+    assert guided_status["technical_status"] == "connection_unready"
+
+
 def test_setup_action_rejects_unknown_action_and_keeps_allowed_actions(authenticated_client, monkeypatch):
     monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"account-1": "masked"})
 

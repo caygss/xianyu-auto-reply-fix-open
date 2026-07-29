@@ -50,7 +50,7 @@ assert.equal(refreshActionWins.action, 'refresh_status');
 
 const stepIndexWins = guided.getGuidedSetupStatusViewModel(
   { primary_action: 'refresh_status', step_index: 6, technical_status: 'token_refresh_failed' },
-  { connection_state: 'disconnected' },
+  { connection_state: 'connected' },
 );
 assert.equal(stepIndexWins.step, 6);
 assert.equal(stepIndexWins.action, 'refresh_status');
@@ -88,9 +88,26 @@ assert.equal(connectionUnready.step, 5);
 assert.equal(connectionUnready.mode, 'reconnect_wait');
 assert.equal(connectionUnready.showPrimaryAction, false);
 
+const runtimeMessageStreamUnready = guided.getGuidedSetupStatusViewModel(
+  { primary_action: 'finish', step_index: 6, technical_status: 'connected', needs_user_action: false },
+  { connection_state: 'connected', message_stream_status: 'healthy', message_stream_ready: false },
+);
+assert.equal(runtimeMessageStreamUnready.step, 5);
+assert.equal(runtimeMessageStreamUnready.mode, 'reconnect_wait');
+assert.equal(runtimeMessageStreamUnready.showPrimaryAction, false);
+assert.equal(runtimeMessageStreamUnready.ready, false);
+
+const runtimeStatusUnready = guided.getGuidedSetupStatusViewModel(
+  { primary_action: 'finish', step_index: 6, technical_status: 'connected', needs_user_action: false },
+  { connection_state: 'connected', message_stream_status: 'connection_unready', message_stream_ready: true },
+);
+assert.equal(runtimeStatusUnready.step, 5);
+assert.equal(runtimeStatusUnready.mode, 'reconnect_wait');
+assert.equal(runtimeStatusUnready.showPrimaryAction, false);
+
 const manual = guided.getGuidedSetupStatusViewModel(
   { primary_action: 'open_manual_verification', step_index: 4, technical_status: 'verification_pending_manual', manual_browser_available: false, needs_user_action: true },
-  { connection_state: 'disconnected', manual_browser_session_status: null, vnc_manual_action_available: false },
+  { connection_state: 'connected', manual_browser_session_status: null, vnc_manual_action_available: false },
 );
 assert.equal(manual.step, 4);
 assert.equal(manual.action, 'open_manual_verification');
