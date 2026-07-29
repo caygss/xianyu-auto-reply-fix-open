@@ -141,6 +141,21 @@ def test_active_runtime_deadline_has_priority_even_when_token_status_says_connec
     assert status["remaining_seconds"] == 30
 
 
+def test_complete_pending_manual_verification_has_priority_over_connected():
+    status = build_guided_status(
+        {
+            "connection_state": "connected",
+            "token_refresh_status": "success",
+            "manual_verification_action": "complete_pending",
+        },
+        delivery_summary={"configured": True},
+    )
+
+    assert status["primary_action"] == "refresh_status"
+    assert status["step_id"] != "ready_to_wait_for_order"
+    assert status["technical_status"] == "verification_pending_manual"
+
+
 @pytest.mark.parametrize(
     "delivery_summary",
     [None, {}, {"configured": "false"}, {"configured": "0"}, {"configured": "off"}],

@@ -244,6 +244,11 @@ def _safe_status_value(value: Any) -> str:
 
 def _technical_status(runtime_status: Mapping[str, Any]) -> str:
     token_status, connection_state = _normalized_runtime_status(runtime_status)
+    manual_action = str(runtime_status.get("manual_verification_action") or "").strip().lower()
+    if manual_action in {"open_pending", "opened", "complete_pending"} or runtime_status.get(
+        "manual_verification_open"
+    ):
+        return "verification_pending_manual"
     if token_status not in _VERIFICATION_STATUSES:
         if _future_deadline(runtime_status, ("qr_login_grace_until", "grace_until")) is not None:
             return "qr_login_grace_wait"
