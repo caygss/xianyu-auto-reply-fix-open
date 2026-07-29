@@ -112,7 +112,10 @@ def test_setup_status_reuses_real_configured_delivery_summary(authenticated_clie
     monkeypatch.setattr(
         reply_server,
         "get_cookies_details",
-        lambda current_user: [{"id": "account-1", "runtime_status": {"connection_state": "connected"}}],
+        lambda current_user: [{
+            "id": "account-1",
+            "runtime_status": {"connection_state": "connected", "message_stream_ready": True},
+        }],
     )
 
     response = authenticated_client.get("/setup/status")
@@ -134,7 +137,10 @@ def test_setup_status_keeps_unconfigured_account_before_completion(authenticated
     monkeypatch.setattr(
         reply_server,
         "get_cookies_details",
-        lambda current_user: [{"id": "account-1", "runtime_status": {"connection_state": "connected"}}],
+        lambda current_user: [{
+            "id": "account-1",
+            "runtime_status": {"connection_state": "connected", "message_stream_ready": True},
+        }],
     )
 
     response = authenticated_client.get("/setup/status")
@@ -145,8 +151,18 @@ def test_setup_status_keeps_unconfigured_account_before_completion(authenticated
     assert guided_status["step_index"] == 5
 
 
+@pytest.mark.parametrize(
+    "runtime_status",
+    [
+        {"connection_state": "connected", "message_stream_status": "recovering", "message_stream_ready": True},
+        {"connection_state": "connected", "message_stream_status": "SUSPECTED_STALE", "message_stream_ready": "true"},
+        {"connection_state": "connected", "message_stream_status": "HEALTHY", "message_stream_ready": "FALSE"},
+        {"connection_state": "connected", "message_stream_status": "healthy"},
+        {"status": "CONNECTED", "message_stream_status": "healthy"},
+    ],
+)
 def test_setup_status_does_not_finish_configured_account_with_unready_message_stream(
-    authenticated_client, monkeypatch
+    authenticated_client, monkeypatch, runtime_status
 ):
     monkeypatch.setattr(
         reply_server,
@@ -158,11 +174,7 @@ def test_setup_status_does_not_finish_configured_account_with_unready_message_st
         "get_cookies_details",
         lambda current_user: [{
             "id": "account-1",
-            "runtime_status": {
-                "connection_state": "connected",
-                "message_stream_status": "connection_unready",
-                "message_stream_ready": False,
-            },
+            "runtime_status": runtime_status,
         }],
     )
 

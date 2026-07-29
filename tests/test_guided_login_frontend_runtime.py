@@ -50,7 +50,7 @@ assert.equal(refreshActionWins.action, 'refresh_status');
 
 const stepIndexWins = guided.getGuidedSetupStatusViewModel(
   { primary_action: 'refresh_status', step_index: 6, technical_status: 'token_refresh_failed' },
-  { connection_state: 'connected' },
+  { connection_state: 'connected', message_stream_ready: true },
 );
 assert.equal(stepIndexWins.step, 6);
 assert.equal(stepIndexWins.action, 'refresh_status');
@@ -104,6 +104,40 @@ const runtimeStatusUnready = guided.getGuidedSetupStatusViewModel(
 assert.equal(runtimeStatusUnready.step, 5);
 assert.equal(runtimeStatusUnready.mode, 'reconnect_wait');
 assert.equal(runtimeStatusUnready.showPrimaryAction, false);
+
+for (const messageStreamStatus of ['Recovering', 'SUSPECTED-STALE']) {
+  const compatibilityState = guided.getGuidedSetupStatusViewModel(
+    { primary_action: 'finish', step_index: 6, technical_status: 'connected', needs_user_action: false },
+    { connection_state: 'connected', message_stream_status: messageStreamStatus, message_stream_ready: 'true' },
+  );
+  assert.equal(compatibilityState.step, 5);
+  assert.equal(compatibilityState.mode, 'reconnect_wait');
+  assert.equal(compatibilityState.showPrimaryAction, false);
+}
+
+const stringMessageStreamReady = guided.getGuidedSetupStatusViewModel(
+  { primary_action: 'finish', step_index: 6, technical_status: 'connected', needs_user_action: false },
+  { connection_state: 'connected', message_stream_status: 'healthy', message_stream_ready: 'FALSE' },
+);
+assert.equal(stringMessageStreamReady.step, 5);
+assert.equal(stringMessageStreamReady.mode, 'reconnect_wait');
+assert.equal(stringMessageStreamReady.showPrimaryAction, false);
+
+const missingMessageStreamReady = guided.getGuidedSetupStatusViewModel(
+  { primary_action: 'finish', step_index: 6, technical_status: 'connected', needs_user_action: false },
+  { connection_state: 'connected', message_stream_status: 'healthy' },
+);
+assert.equal(missingMessageStreamReady.step, 5);
+assert.equal(missingMessageStreamReady.mode, 'reconnect_wait');
+assert.equal(missingMessageStreamReady.showPrimaryAction, false);
+
+const missingMessageStreamReadyFromStatus = guided.getGuidedSetupStatusViewModel(
+  { primary_action: 'finish', step_index: 6, technical_status: 'connected', needs_user_action: false },
+  { status: 'CONNECTED', message_stream_status: 'healthy' },
+);
+assert.equal(missingMessageStreamReadyFromStatus.step, 5);
+assert.equal(missingMessageStreamReadyFromStatus.mode, 'reconnect_wait');
+assert.equal(missingMessageStreamReadyFromStatus.showPrimaryAction, false);
 
 const manual = guided.getGuidedSetupStatusViewModel(
   { primary_action: 'open_manual_verification', step_index: 4, technical_status: 'verification_pending_manual', manual_browser_available: false, needs_user_action: true },

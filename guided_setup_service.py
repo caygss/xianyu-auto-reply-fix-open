@@ -44,6 +44,13 @@ _ERROR_STATUSES = {
     "token_refresh_exception",
     "token_init_failed",
 }
+_MESSAGE_STREAM_UNREADY_STATUSES = {
+    "connection_unready",
+    "recovering",
+    "suspected_stale",
+    "unready",
+    "not_ready",
+}
 
 
 def _timestamp(value: Any) -> Optional[float]:
@@ -116,8 +123,25 @@ def _future_deadline(runtime_status: Mapping[str, Any], keys: tuple[str, ...]) -
 
 def _message_stream_unready(runtime_status: Mapping[str, Any]) -> bool:
     runtime_status = runtime_status if isinstance(runtime_status, Mapping) else {}
-    stream_status = str(runtime_status.get("message_stream_status") or "").strip().lower()
-    return stream_status == "connection_unready" or runtime_status.get("message_stream_ready") is False
+    _, connection_state = _normalized_runtime_status(runtime_status)
+    stream_status = re.sub(
+        r"[\s-]+",
+        "_",
+        str(runtime_status.get("message_stream_status") or "").strip().lower(),
+    )
+    if stream_status in _MESSAGE_STREAM_UNREADY_STATUSES:
+        return True
+    if "message_stream_ready" not in runtime_status:
+        return connection_state == "connected"
+    ready_value = runtime_status.get("message_stream_ready")
+    if isinstance(ready_value, bool):
+        return ready_value is False
+    normalized_ready = str(ready_value or "").strip().lower()
+    if normalized_ready in {"false", "0", "no", "off", "unready", "not_ready"}:
+        return True
+    if normalized_ready in {"true", "1", "yes", "on", "ready"}:
+        return False
+    return connection_state == "connected"
 
 
 def get_user_action_for_runtime(runtime_status: Optional[Mapping[str, Any]]) -> dict[str, Any]:

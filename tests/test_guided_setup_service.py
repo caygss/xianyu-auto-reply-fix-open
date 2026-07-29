@@ -92,8 +92,31 @@ def test_connected_account_with_delivery_ready_can_wait_for_order():
         },
         {
             "connection_state": "connected",
+            "message_stream_status": "Recovering",
+            "message_stream_ready": "true",
+        },
+        {
+            "connection_state": "connected",
+            "message_stream_status": "suspected_stale",
+            "message_stream_ready": True,
+        },
+        {
+            "connection_state": "connected",
             "message_stream_status": "healthy",
             "message_stream_ready": False,
+        },
+        {
+            "connection_state": "connected",
+            "message_stream_status": "HEALTHY",
+            "message_stream_ready": "FALSE",
+        },
+        {
+            "connection_state": "connected",
+            "message_stream_status": "healthy",
+        },
+        {
+            "status": "CONNECTED",
+            "message_stream_status": "healthy",
         },
     ],
 )
@@ -107,7 +130,7 @@ def test_configured_connected_account_with_unready_message_stream_stays_in_recov
 
 
 def test_connected_account_without_delivery_summary_must_go_to_delivery_config():
-    status = build_guided_status({"connection_state": "connected"})
+    status = build_guided_status({"connection_state": "connected", "message_stream_ready": True})
 
     assert status["step_id"] == "delivery_config"
     assert status["primary_action"] == "go_to_delivery_config"
@@ -123,6 +146,7 @@ def test_connected_account_without_delivery_summary_must_go_to_delivery_config()
                 "connection_state": "connected",
                 "token_refresh_status": "qr_login_grace_wait",
                 "qr_login_grace_until": 130,
+                "message_stream_ready": True,
             },
             "refresh_status",
         ),
@@ -131,6 +155,7 @@ def test_connected_account_without_delivery_summary_must_go_to_delivery_config()
                 "connection_state": "connected",
                 "token_refresh_status": "verification_pending_manual",
                 "manual_verification_open": True,
+                "message_stream_ready": True,
             },
             "complete_manual_verification",
         ),
@@ -139,6 +164,7 @@ def test_connected_account_without_delivery_summary_must_go_to_delivery_config()
                 "connection_state": "connected",
                 "token_refresh_status": "password_login_backoff_wait",
                 "token_refresh_backoff_until": 130,
+                "message_stream_ready": True,
             },
             "refresh_status",
         ),
@@ -161,6 +187,7 @@ def test_active_runtime_deadline_has_priority_even_when_token_status_says_connec
             "connection_state": "connected",
             "token_refresh_status": "success",
             "qr_login_grace_until": 130,
+            "message_stream_ready": True,
         },
         delivery_summary={"configured": True},
     )
@@ -177,6 +204,7 @@ def test_complete_pending_manual_verification_has_priority_over_connected():
             "connection_state": "connected",
             "token_refresh_status": "success",
             "manual_verification_action": "complete_pending",
+            "message_stream_ready": True,
         },
         delivery_summary={"configured": True},
     )
@@ -191,7 +219,10 @@ def test_complete_pending_manual_verification_has_priority_over_connected():
     [None, {}, {"configured": "false"}, {"configured": "0"}, {"configured": "off"}],
 )
 def test_false_like_delivery_values_are_not_treated_as_configured(delivery_summary):
-    status = build_guided_status({"connection_state": "connected"}, delivery_summary=delivery_summary)
+    status = build_guided_status(
+        {"connection_state": "connected", "message_stream_ready": True},
+        delivery_summary=delivery_summary,
+    )
 
     assert status["primary_action"] == "go_to_delivery_config"
     assert status["step_id"] == "delivery_config"

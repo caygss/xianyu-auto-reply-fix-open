@@ -212,6 +212,27 @@ function getGuidedSetupCopy(step, account, viewModel = {}) {
     return copies[step] || copies[1];
 }
 
+function isGuidedRuntimeMessageStreamUnready(runtimeStatus) {
+    const runtime = runtimeStatus && typeof runtimeStatus === 'object' ? runtimeStatus : {};
+    const runtimeConnectionState = String(runtime.connection_state || runtime.status || '').trim().toLowerCase();
+    const streamStatus = String(runtime.message_stream_status || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[\s-]+/g, '_');
+    if (new Set(['connection_unready', 'recovering', 'suspected_stale', 'unready', 'not_ready']).has(streamStatus)) {
+        return true;
+    }
+    if (!Object.prototype.hasOwnProperty.call(runtime, 'message_stream_ready')) {
+        return runtimeConnectionState === 'connected';
+    }
+    const readyValue = runtime.message_stream_ready;
+    if (typeof readyValue === 'boolean') return readyValue === false;
+    const normalizedReady = String(readyValue || '').trim().toLowerCase();
+    if (new Set(['false', '0', 'no', 'off', 'unready', 'not_ready']).has(normalizedReady)) return true;
+    if (new Set(['true', '1', 'yes', 'on', 'ready']).has(normalizedReady)) return false;
+    return runtimeConnectionState === 'connected';
+}
+
 function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}) {
     const status = guidedStatus && typeof guidedStatus === 'object' ? guidedStatus : null;
     if (!status) {
@@ -229,15 +250,15 @@ function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}
     const technicalStatus = String(status.technical_status || '').trim();
     const stepIndex = Number(status.step_index);
     const runtime = runtimeStatus && typeof runtimeStatus === 'object' ? runtimeStatus : {};
-    const runtimeConnectionState = String(runtime.connection_state || '').trim().toLowerCase();
-    const runtimeNeedsRecovery = new Set([
+    const runtimeConnectionState = String(runtime.connection_state || runtime.status || '').trim().toLowerCase();
+    const runtimeConnectionNeedsRecovery = new Set([
         'connecting',
         'reconnecting',
         'disconnected',
         'connection_unready',
-    ]).has(runtimeConnectionState)
-        || String(runtime.message_stream_status || '').trim().toLowerCase() === 'connection_unready'
-        || runtime.message_stream_ready === false;
+    ]).has(runtimeConnectionState);
+    const runtimeNeedsRecovery = runtimeConnectionNeedsRecovery
+        || isGuidedRuntimeMessageStreamUnready(runtime);
     const contractStep = Number.isFinite(stepIndex)
         ? Math.min(6, Math.max(1, stepIndex))
         : (primaryAction === 'finish' ? 6 : 4);
@@ -265,16 +286,17 @@ function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}
     if (primaryAction === 'go_to_delivery_config' && !technicalModes[technicalStatus]) {
         mode = 'connected_wait';
     }
-    if (runtimeNeedsRecovery) mode = 'reconnect_wait';
+    const runtimeBlocksFinish = primaryAction === 'finish' && runtimeNeedsRecovery;
+    if (runtimeBlocksFinish) mode = 'reconnect_wait';
 
     return {
-        step: runtimeNeedsRecovery ? 5 : (primaryAction === 'finish' ? 6 : contractStep),
+        step: runtimeBlocksFinish ? 5 : (primaryAction === 'finish' ? 6 : contractStep),
         action: primaryAction,
         contractAction: primaryAction,
         mode,
-        showPrimaryAction: !runtimeNeedsRecovery
+        showPrimaryAction: !runtimeBlocksFinish
             && (primaryAction === 'finish' || status.needs_user_action === true),
-        ready: primaryAction === 'finish' && !runtimeNeedsRecovery,
+        ready: primaryAction === 'finish' && !runtimeBlocksFinish,
     };
 }
 
