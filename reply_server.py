@@ -4084,16 +4084,23 @@ def _is_runtime_timestamp_recent(value: Any, window_seconds: Any) -> bool:
     return (time.time() - timestamp) <= window
 
 
-def _safe_runtime_deadline(value: Any) -> int:
+def _safe_runtime_deadline(value: Any) -> float:
     try:
         if isinstance(value, bool):
-            return 0
+            return 0.0
         timestamp = float(value)
         if not math.isfinite(timestamp):
-            return 0
-        return int(timestamp)
+            return 0.0
+        return timestamp
     except (OverflowError, TypeError, ValueError):
-        return 0
+        return 0.0
+
+
+def _runtime_remaining_seconds(deadline: Any, now: Optional[float] = None) -> int:
+    """Return at least one second until a real floating-point deadline is reached."""
+    deadline_value = _safe_runtime_deadline(deadline)
+    current_time = time.time() if now is None else float(now)
+    return max(0, math.ceil(deadline_value - current_time)) if deadline_value > current_time else 0
 
 
 def _build_token_refresh_action_contract(
@@ -4109,7 +4116,7 @@ def _build_token_refresh_action_contract(
     status = str(token_refresh_status or '').strip()
     reason = str(backoff_reason or '').strip() or None
     deadline = _safe_runtime_deadline(backoff_until)
-    remaining_seconds = max(0, math.ceil(deadline - now)) if deadline > now else 0
+    remaining_seconds = _runtime_remaining_seconds(deadline, now)
     manual_statuses = {
         'verification_pending_manual',
         'manual_verification_required',
@@ -4161,7 +4168,7 @@ def _build_password_login_backoff_response(cookie_id: str, now: Optional[float] 
 
     deadline = _safe_runtime_deadline(backoff_state.get('until'))
     current_time = time.time() if now is None else float(now)
-    remaining_seconds = max(0, math.ceil(deadline - current_time)) if deadline > current_time else 0
+    remaining_seconds = _runtime_remaining_seconds(deadline, current_time)
     if remaining_seconds <= 0:
         return None
 
@@ -4259,9 +4266,8 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         )
         if runtime_status['qr_login_grace_until'] > time.time():
             runtime_status['token_refresh_status'] = 'qr_login_grace_wait'
-            runtime_status['token_refresh_remaining_seconds'] = max(
-                0,
-                math.ceil(runtime_status['qr_login_grace_until'] - time.time()),
+            runtime_status['token_refresh_remaining_seconds'] = _runtime_remaining_seconds(
+                runtime_status['qr_login_grace_until']
             )
     except Exception as exc:
         logger.warning(f"读取账号稳定期状态失败: {cleaned_cid}, {mask_sensitive_text(exc)}")
@@ -4297,8 +4303,9 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
             backoff_reason = backoff_state.get('reason')
             runtime_status['token_refresh_backoff_until'] = backoff_until
             runtime_status['token_refresh_backoff_reason'] = backoff_reason
-            if backoff_until > time.time():
-                runtime_status['token_refresh_remaining_seconds'] = max(0, int(backoff_until - time.time()))
+            backoff_remaining_seconds = _runtime_remaining_seconds(backoff_until)
+            if backoff_remaining_seconds > 0:
+                runtime_status['token_refresh_remaining_seconds'] = backoff_remaining_seconds
                 current_status = str(runtime_status.get('token_refresh_status') or '').strip()
                 if current_status not in {'verification_pending_manual', 'manual_verification_required', 'qr_login_grace_wait'}:
                     runtime_status['token_refresh_status'] = 'password_login_backoff_wait'
@@ -4308,9 +4315,10 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
                 backoff_until=backoff_until,
             ))
             qr_deadline = _safe_runtime_deadline(runtime_status.get('qr_login_grace_until'))
-            if qr_deadline > time.time() and backoff_until <= time.time():
+            qr_remaining_seconds = _runtime_remaining_seconds(qr_deadline)
+            if qr_remaining_seconds > 0 and _runtime_remaining_seconds(backoff_until) <= 0:
                 runtime_status.update({
-                    'token_refresh_remaining_seconds': max(0, math.ceil(qr_deadline - time.time())),
+                    'token_refresh_remaining_seconds': qr_remaining_seconds,
                     'token_refresh_can_retry': False,
                     'user_action': 'wait_backoff',
                 })
@@ -4359,13 +4367,15 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     qr_login_grace_until = _safe_runtime_deadline(runtime_status.get('qr_login_grace_until'))
     token_refresh_backoff_until = _safe_runtime_deadline(runtime_status.get('token_refresh_backoff_until'))
     token_refresh_backoff_reason = runtime_status.get('token_refresh_backoff_reason')
-    if qr_login_grace_until > now:
+    qr_remaining_seconds = _runtime_remaining_seconds(qr_login_grace_until, now)
+    token_backoff_remaining_seconds = _runtime_remaining_seconds(token_refresh_backoff_until, now)
+    if qr_remaining_seconds > 0:
         token_refresh_status = 'qr_login_grace_wait'
-        runtime_status['token_refresh_remaining_seconds'] = max(0, int(qr_login_grace_until - now))
-    elif token_refresh_backoff_until > now:
+        runtime_status['token_refresh_remaining_seconds'] = qr_remaining_seconds
+    elif token_backoff_remaining_seconds > 0:
         if token_refresh_status not in {'verification_pending_manual', 'manual_verification_required'}:
             token_refresh_status = 'password_login_backoff_wait'
-        runtime_status['token_refresh_remaining_seconds'] = max(0, int(token_refresh_backoff_until - now))
+        runtime_status['token_refresh_remaining_seconds'] = token_backoff_remaining_seconds
     else:
         runtime_status['token_refresh_remaining_seconds'] = 0
 
@@ -4536,9 +4546,9 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         manual_browser_active=bool(manual_browser_status),
         now=now,
     )
-    if qr_login_grace_until > now:
+    if qr_remaining_seconds > 0:
         recovery_contract.update({
-            'token_refresh_remaining_seconds': max(0, int(qr_login_grace_until - now)),
+            'token_refresh_remaining_seconds': qr_remaining_seconds,
             'token_refresh_can_retry': False,
             'user_action': 'wait_backoff',
         })
@@ -7546,7 +7556,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     log_with_user('info', f"已获取真实cookie，长度: {len(real_cookies)}", current_user)
 
                     qr_login_grace_minutes = max(5, int(RISK_CONTROL.get('qr_login_grace_minutes', 15) or 15))
-                    qr_login_grace_until = int(time.time() + (qr_login_grace_minutes * 60))
+                    qr_login_grace_until = time.time() + (qr_login_grace_minutes * 60)
                     task_restarted = False
                     warning_message = None
                     final_cookies = temp_instance.cookies_str or real_cookies

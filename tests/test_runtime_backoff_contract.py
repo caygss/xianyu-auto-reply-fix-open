@@ -127,6 +127,75 @@ def test_subsecond_before_deadline_keeps_status_and_password_login_blocked(monke
     assert reply_server.password_login_sessions == {}
 
 
+def test_float_token_deadline_is_preserved_and_blocks_before_expiry(monkeypatch):
+    live = _fake_live_instance()
+    backoff = {
+        "reason": "slider_failed",
+        "until": 1600.9,
+        "seconds": 600,
+    }
+    _patch_runtime(monkeypatch, live, backoff, 1600.1)
+
+    runtime_status = reply_server._build_live_runtime_status("account-1")
+
+    assert runtime_status["token_refresh_backoff_until"] == 1600.9
+    assert runtime_status["token_refresh_remaining_seconds"] == 1
+    assert runtime_status["token_refresh_can_retry"] is False
+    assert runtime_status["user_action"] == "wait_backoff"
+
+    reply_server.password_login_sessions.clear()
+    monkeypatch.setattr(
+        reply_server.db_manager,
+        "get_cookie_details",
+        lambda cid: {
+            "user_id": 7,
+            "username": "demo-user",
+            "password": "demo-password",
+            "show_browser": True,
+        },
+    )
+    created_tasks = []
+    monkeypatch.setattr(reply_server, "_execute_password_login", lambda *args: created_tasks.append(args))
+    monkeypatch.setattr(
+        reply_server.asyncio,
+        "create_task",
+        lambda coroutine: created_tasks.append(coroutine) or object(),
+    )
+
+    response = asyncio.run(
+        reply_server.password_login(
+            {"account_id": "account-1", "refresh_mode": True, "show_browser": True},
+            {"user_id": 7, "username": "test-user"},
+        )
+    )
+
+    assert response["success"] is False
+    assert response["token_refresh_backoff_until"] == 1600.9
+    assert response["token_refresh_remaining_seconds"] == 1
+    assert response["token_refresh_can_retry"] is False
+    assert response["user_action"] == "wait_backoff"
+    assert created_tasks == []
+    assert reply_server.password_login_sessions == {}
+
+
+def test_float_qr_grace_deadline_is_preserved_and_blocks_before_expiry(monkeypatch):
+    live = _fake_live_instance(status=None)
+    _patch_runtime(monkeypatch, live, None, 1600.1)
+    monkeypatch.setattr(
+        reply_server.db_manager,
+        "get_cookie_details",
+        lambda cid: {"qr_login_grace_until": 1600.9},
+    )
+
+    runtime_status = reply_server._build_live_runtime_status("account-1")
+
+    assert runtime_status["qr_login_grace_until"] == 1600.9
+    assert runtime_status["token_refresh_remaining_seconds"] == 1
+    assert runtime_status["token_refresh_can_retry"] is False
+    assert runtime_status["user_action"] == "wait_backoff"
+    assert runtime_status["token_refresh_status"] == "qr_login_grace_wait"
+
+
 def test_expired_backend_deadline_reenables_retry_without_static_error_message(monkeypatch):
     live = _fake_live_instance()
     _patch_runtime(monkeypatch, live, None, 131)
