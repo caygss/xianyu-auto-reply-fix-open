@@ -88,6 +88,7 @@ def test_setup_status_returns_safe_guided_json_and_reuses_cookie_details(authent
     assert calls == [USER]
     assert payload["success"] is True
     assert payload["accounts"][0]["cookie_id"] == "account-1"
+    assert payload["accounts"][0]["runtime_ready"] is True
     assert payload["accounts"][0]["guided_status"]["step_id"] == "delivery_config"
     assert "cookie-secret" not in response.text
     assert "token-secret" not in response.text
@@ -126,6 +127,7 @@ def test_setup_status_reuses_real_configured_delivery_summary(authenticated_clie
     guided_status = response.json()["accounts"][0]["guided_status"]
     assert guided_status["primary_action"] == "finish"
     assert guided_status["step_index"] == 6
+    assert response.json()["accounts"][0]["runtime_ready"] is True
 
 
 def test_setup_status_keeps_unconfigured_account_before_completion(authenticated_client, monkeypatch):
@@ -186,6 +188,7 @@ def test_setup_status_does_not_finish_configured_account_with_unready_message_st
     assert guided_status["step_index"] == 5
     assert guided_status["needs_user_action"] is False
     assert guided_status["technical_status"] == "connection_unready"
+    assert response.json()["accounts"][0]["runtime_ready"] is False
 
 
 def test_setup_action_rejects_unknown_action_and_keeps_allowed_actions(authenticated_client, monkeypatch):
@@ -256,6 +259,45 @@ def test_setup_finish_uses_configured_delivery_summary_and_can_complete(authenti
     assert payload["success"] is True
     assert payload["guided_status"]["primary_action"] == "finish"
     assert "delivery-secret" not in response.text
+
+
+@pytest.mark.parametrize(
+    "runtime_status",
+    [
+        {},
+        {"connection_state": "connected"},
+        {"connection_state": "connected", "message_stream_status": "recovering", "message_stream_ready": True},
+        {"connection_state": "connected", "message_stream_status": "suspected_stale", "message_stream_ready": True},
+        {"connection_state": "connected", "message_stream_ready": "FALSE"},
+    ],
+)
+def test_setup_finish_fails_closed_when_runtime_readiness_is_missing_or_unready(
+    authenticated_client, monkeypatch, runtime_status
+):
+    monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"account-1": "masked"})
+    monkeypatch.setattr(
+        reply_server,
+        "_get_republish_store",
+        lambda: SimpleNamespace(
+            list_templates=lambda cookie_id: [
+                SimpleNamespace(
+                    auto_delivery=True,
+                    delivery_content="delivery-secret",
+                    sku_delivery={},
+                    delivery_choice="digital",
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(reply_server, "_build_live_runtime_status", lambda cid: runtime_status)
+
+    response = authenticated_client.post("/setup/action", json={"action": "finish", "cookie_id": "account-1"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["next_action"] == "refresh_status"
+    assert payload["guided_status"]["primary_action"] == "refresh_status"
 
 
 def test_setup_finish_is_blocked_when_account_is_not_running(authenticated_client, monkeypatch):

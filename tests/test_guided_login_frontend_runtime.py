@@ -161,6 +161,33 @@ assert.equal(ready.step, 6);
 assert.equal(ready.action, 'finish');
 assert.equal(ready.ready, true);
 
+for (const missingRuntime of [null, {}, { connection_state: 'connected' }]) {
+  const unavailable = guided.getGuidedSetupStatusViewModel(
+    { primary_action: 'finish', step_index: 6, technical_status: 'connected', needs_user_action: false },
+    missingRuntime,
+  );
+  assert.equal(unavailable.step, 5);
+  assert.equal(unavailable.mode, 'reconnect_wait');
+  assert.equal(unavailable.showPrimaryAction, false);
+  assert.equal(unavailable.ready, false);
+}
+
+const accounts = [
+  {
+    id: 'stale-finish',
+    guidedStatus: { primary_action: 'finish', step_index: 6 },
+    runtimeStatus: null,
+  },
+  {
+    id: 'needs-setup',
+    guidedStatus: { primary_action: 'refresh_status', step_index: 5 },
+    runtimeStatus: { connection_state: 'reconnecting' },
+  },
+];
+assert.equal(guided.selectGuidedSetupAccount(accounts, '').id, 'needs-setup');
+assert.equal(guided.isGuidedRuntimeReady(null), false);
+assert.equal(guided.isGuidedRuntimeReady({ connection_state: 'connected' }), false);
+
 assert.equal(guided.isGuidedManualBrowserAvailable(
   { vnc_manual_action_available: true, manual_browser_session_status: 'processing' },
   { manual_browser_available: true },

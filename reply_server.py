@@ -66,7 +66,7 @@ from republish_template_service import (
     normalize_delivery_content,
     safe_delivery_summary,
 )
-from guided_setup_service import build_guided_status
+from guided_setup_service import build_guided_status, is_guided_runtime_ready
 from runtime_paths import app_root
 
 from loguru import logger
@@ -4759,6 +4759,7 @@ def _build_guided_setup_account_status(cookie_id: str, account_details: Optional
         runtime_status['manual_verification_action'] = action_state.get('status')
     return {
         'cookie_id': cookie_id,
+        'runtime_ready': is_guided_runtime_ready(runtime_status),
         'guided_status': build_guided_status(
             runtime_status,
             account_details={'id': cookie_id},
@@ -4938,11 +4939,14 @@ def _perform_guided_setup_action_impl(
                 account_details={'id': cleaned_cookie_id},
                 delivery_summary=delivery_summary,
             )
-            connection_state = str(runtime_status.get('connection_state') or '').strip().lower()
+            connection_state = str(
+                runtime_status.get('connection_state') or runtime_status.get('status') or ''
+            ).strip().lower()
+            runtime_ready = is_guided_runtime_ready(runtime_status)
             account_running = (
-                runtime_status.get('running') is not False
+                runtime_ready
+                and runtime_status.get('running') is not False
                 and connection_state == 'connected'
-                and runtime_status.get('message_stream_ready') is not False
             )
             if account_running and guided_status.get('primary_action') == 'finish':
                 return {

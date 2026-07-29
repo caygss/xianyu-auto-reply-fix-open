@@ -7,6 +7,7 @@ from guided_setup_service import (
     build_guided_status,
     format_remaining_seconds,
     get_user_action_for_runtime,
+    is_guided_runtime_ready,
 )
 
 
@@ -245,6 +246,32 @@ def test_invalid_runtime_and_deadline_inputs_are_safe(runtime_status):
     assert status["remaining_seconds"] == 0
     assert status["retry_at"] is None
     assert isinstance(status["technical_detail"], str)
+
+
+@pytest.mark.parametrize(
+    "runtime_status",
+    [
+        None,
+        {},
+        {"connection_state": "connected"},
+        {"connection_state": "connected", "message_stream_status": "recovering", "message_stream_ready": True},
+        {"connection_state": "connected", "message_stream_status": "suspected_stale", "message_stream_ready": True},
+        {"connection_state": "connected", "message_stream_ready": "FALSE"},
+    ],
+)
+def test_guided_runtime_ready_helper_fails_closed(runtime_status):
+    assert is_guided_runtime_ready(runtime_status) is False
+
+
+@pytest.mark.parametrize(
+    "runtime_status",
+    [
+        {"connection_state": "connected", "message_stream_ready": True},
+        {"status": "CONNECTED", "message_stream_status": "healthy", "message_stream_ready": "true"},
+    ],
+)
+def test_guided_runtime_ready_helper_accepts_explicit_ready_values(runtime_status):
+    assert is_guided_runtime_ready(runtime_status) is True
 
 
 def test_technical_detail_is_bounded_and_does_not_copy_upstream_error_text():

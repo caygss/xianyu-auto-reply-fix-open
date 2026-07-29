@@ -112,6 +112,43 @@ def _normalized_runtime_status(runtime_status: Optional[Mapping[str, Any]]) -> t
     return token_status, connection_state
 
 
+def normalize_guided_runtime_status(runtime_status: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+    """Normalize the small runtime contract shared by guided status and finish guards."""
+    runtime_available = isinstance(runtime_status, Mapping)
+    runtime = runtime_status if runtime_available else {}
+    _, connection_state = _normalized_runtime_status(runtime)
+    stream_status = re.sub(
+        r"[\s-]+",
+        "_",
+        str(runtime.get("message_stream_status") or "").strip().lower(),
+    )
+    ready_present = "message_stream_ready" in runtime
+    ready_value = runtime.get("message_stream_ready")
+    if isinstance(ready_value, bool):
+        stream_ready = ready_value
+    else:
+        normalized_ready = str(ready_value or "").strip().lower()
+        if normalized_ready in {"true", "1", "yes", "on", "ready"}:
+            stream_ready = True
+        elif normalized_ready in {"false", "0", "no", "off", "unready", "not_ready"}:
+            stream_ready = False
+        else:
+            stream_ready = None
+    stream_unready = (
+        stream_status in _MESSAGE_STREAM_UNREADY_STATUSES
+        or not ready_present
+        or stream_ready is not True
+    )
+    return {
+        "runtime_available": runtime_available,
+        "connection_state": connection_state,
+        "message_stream_status": stream_status,
+        "message_stream_ready_present": ready_present,
+        "message_stream_ready": stream_ready,
+        "message_stream_unready": stream_unready,
+    }
+
+
 def _future_deadline(runtime_status: Mapping[str, Any], keys: tuple[str, ...]) -> Optional[float]:
     now = time.time()
     for key in keys:
@@ -122,26 +159,24 @@ def _future_deadline(runtime_status: Mapping[str, Any], keys: tuple[str, ...]) -
 
 
 def _message_stream_unready(runtime_status: Mapping[str, Any]) -> bool:
-    runtime_status = runtime_status if isinstance(runtime_status, Mapping) else {}
-    _, connection_state = _normalized_runtime_status(runtime_status)
-    stream_status = re.sub(
-        r"[\s-]+",
-        "_",
-        str(runtime_status.get("message_stream_status") or "").strip().lower(),
+    normalized = normalize_guided_runtime_status(runtime_status)
+    return bool(normalized["message_stream_unready"] and normalized["connection_state"] == "connected") or bool(
+        normalized["message_stream_status"] in _MESSAGE_STREAM_UNREADY_STATUSES
+    ) or bool(
+        normalized["message_stream_ready"] is False
     )
-    if stream_status in _MESSAGE_STREAM_UNREADY_STATUSES:
-        return True
-    if "message_stream_ready" not in runtime_status:
-        return connection_state == "connected"
-    ready_value = runtime_status.get("message_stream_ready")
-    if isinstance(ready_value, bool):
-        return ready_value is False
-    normalized_ready = str(ready_value or "").strip().lower()
-    if normalized_ready in {"false", "0", "no", "off", "unready", "not_ready"}:
-        return True
-    if normalized_ready in {"true", "1", "yes", "on", "ready"}:
-        return False
-    return connection_state == "connected"
+
+
+def is_guided_runtime_ready(runtime_status: Optional[Mapping[str, Any]]) -> bool:
+    """Return true only for an explicitly connected and ready runtime."""
+    normalized = normalize_guided_runtime_status(runtime_status)
+    return bool(
+        normalized["runtime_available"]
+        and normalized["connection_state"] == "connected"
+        and normalized["message_stream_ready_present"]
+        and normalized["message_stream_ready"] is True
+        and normalized["message_stream_status"] not in _MESSAGE_STREAM_UNREADY_STATUSES
+    )
 
 
 def get_user_action_for_runtime(runtime_status: Optional[Mapping[str, Any]]) -> dict[str, Any]:
@@ -447,4 +482,6 @@ __all__ = [
     "build_guided_status",
     "format_remaining_seconds",
     "get_user_action_for_runtime",
+    "is_guided_runtime_ready",
+    "normalize_guided_runtime_status",
 ]
