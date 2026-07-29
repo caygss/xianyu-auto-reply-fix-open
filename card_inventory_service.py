@@ -8,6 +8,9 @@ from loguru import logger
 
 
 DEFAULT_GENERATOR_CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+MAX_IMPORT_ITEMS = 1000
+MAX_CARD_SECRET_LENGTH = 4096
+MAX_IMPORT_REQUEST_BYTES = 1024 * 1024
 
 
 class CardInventoryError(ValueError):
@@ -182,7 +185,6 @@ class CardInventoryService:
         user_id, card_id, account_id = self._scope(user_id, card_id, account_id)
         with self._transaction() as cursor:
             settings = self._settings_dict(self._settings_row(cursor, user_id, card_id, account_id))
-        settings.pop("updated_at", None)
         return settings
 
     def get_inventory_summary(self, card_id, user_id, account_id):
@@ -224,6 +226,13 @@ class CardInventoryService:
             secrets_text = []
         if isinstance(secrets_text, str):
             secrets_text = secrets_text.splitlines()
+        else:
+            try:
+                secrets_text = list(secrets_text)
+            except TypeError as exc:
+                raise CardInventoryError("invalid_input", "导入卡密必须是列表") from exc
+        if len(secrets_text) > MAX_IMPORT_ITEMS:
+            raise CardInventoryError("invalid_input", f"单次最多导入 {MAX_IMPORT_ITEMS} 条卡密")
         normalized = []
         blank = 0
         duplicates = 0
@@ -235,6 +244,10 @@ class CardInventoryService:
                 if not secret_text:
                     blank += 1
                     continue
+                if len(secret_text) > MAX_CARD_SECRET_LENGTH:
+                    raise CardInventoryError(
+                        "invalid_input", f"单条卡密长度不能超过 {MAX_CARD_SECRET_LENGTH} 个字符"
+                    )
                 digest = self._secret_digest(secret_text)
                 if digest in seen:
                     duplicates += 1
@@ -275,7 +288,7 @@ class CardInventoryService:
                         user_id,
                         card_id,
                         account_id,
-                        self.db._encrypt_secret(secret_text),
+                        self.db._encrypt_secret(secret_text, force=True),
                         digest,
                         idempotency_key,
                     ),
@@ -335,7 +348,7 @@ class CardInventoryService:
                         user_id,
                         card_id,
                         account_id,
-                        self.db._encrypt_secret(secret_text),
+                        self.db._encrypt_secret(secret_text, force=True),
                         digest,
                         generated_batch,
                     ),

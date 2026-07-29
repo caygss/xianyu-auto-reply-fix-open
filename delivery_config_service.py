@@ -14,6 +14,8 @@ DELIVERY_MODES = {
     "generated_card",
     "provider_api",
 }
+MAX_DELIVERY_CONFIG_BYTES = 64 * 1024
+MAX_FIXED_LINK_BYTES = 2048
 
 
 class DeliveryConfigError(ValueError):
@@ -54,6 +56,8 @@ class DeliveryConfigService:
     def _validate_fixed_link(url):
         if not isinstance(url, str) or not url:
             raise DeliveryConfigError("invalid_config", "固定链接必须是有效的 HTTP 或 HTTPS 链接")
+        if len(url.encode("utf-8")) > MAX_FIXED_LINK_BYTES:
+            raise DeliveryConfigError("invalid_config", "固定链接长度超过限制")
         if any(
             char.isspace() or unicodedata.category(char) in {"Cc", "Cf"}
             for char in url
@@ -138,6 +142,8 @@ class DeliveryConfigService:
             normalized = json.loads(json.dumps(config, ensure_ascii=False))
         except (TypeError, ValueError) as exc:
             raise DeliveryConfigError("invalid_config", "交付配置格式无效") from exc
+        if len(json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_DELIVERY_CONFIG_BYTES:
+            raise DeliveryConfigError("invalid_config", "交付配置大小超过限制")
 
         if mode == "fixed_link":
             normalized["url"] = DeliveryConfigService._validate_fixed_link(

@@ -105,13 +105,13 @@ class DBManager:
     def _is_encrypted_secret(self, value: Any) -> bool:
         return isinstance(value, str) and value.startswith('enc$')
 
-    def _encrypt_secret(self, value: Any) -> Any:
+    def _encrypt_secret(self, value: Any, *, force: bool = False) -> Any:
         if value is None:
             return None
         text = str(value)
         if text == '':
             return ''
-        if self._is_encrypted_secret(text):
+        if self._is_encrypted_secret(text) and not force:
             return text
         token = self.secret_fernet.encrypt(text.encode('utf-8')).decode('utf-8')
         return f'enc${token}'

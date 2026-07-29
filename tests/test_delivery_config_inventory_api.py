@@ -4,8 +4,10 @@ import json
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 import reply_server
+from card_inventory_service import CardInventoryService
 from db_manager import DBManager
 
 
@@ -188,6 +190,34 @@ def test_fixed_link_rejects_invalid_percent_encoding(api_state, url):
     assert error.value.detail["code"] == "invalid_config"
 
 
+def test_delivery_config_rejects_oversized_fixed_link_and_config_object(api_state):
+    cases = [
+        {
+            "mode": "fixed_link",
+            "config": {"url": "https://example.com/" + ("x" * 4096)},
+        },
+        {"mode": "imported_card", "config": {"source": "x" * 65536}},
+    ]
+    for payload in cases:
+        with pytest.raises(HTTPException) as error:
+            _put_config(payload)
+        assert error.value.status_code == 400
+        assert error.value.detail["code"] == "invalid_config"
+
+
+@pytest.mark.parametrize(
+    "model, payload",
+    [
+        (reply_server.DeliveryConfigRequest, {"mode": "imported_card", "config": {}, "extra": True}),
+        (reply_server.InventorySettingsRequest, {"stock_ceiling": 3, "extra": True}),
+        (reply_server.InventoryImportRequest, {"secrets": ["x"], "extra": True}),
+    ],
+)
+def test_task5_request_models_reject_unknown_fields(model, payload):
+    with pytest.raises(ValidationError):
+        model.model_validate(payload)
+
+
 def test_delivery_config_rejects_cross_user_and_cross_account_scope(api_state):
     with pytest.raises(HTTPException) as other_user:
         _put_config(
@@ -257,6 +287,42 @@ def test_inventory_api_delegates_settings_import_generate_summary_and_masked_pre
     assert all("*" in item for item in preview["items"])
 
 
+def test_inventory_service_always_encrypts_enc_prefixed_secret_and_reads_it_back(api_state):
+    service = CardInventoryService(api_state)
+    secret = "enc$looks-like-plaintext"
+
+    service.import_items(7, 1, "cookie-a", [secret])
+
+    stored = api_state.conn.execute(
+        """
+        SELECT secret_text FROM card_inventory_items
+        WHERE user_id = 1 AND card_id = 7 AND account_id = 'cookie-a'
+        """
+    ).fetchone()[0]
+    assert stored != secret
+    assert stored.startswith("enc$")
+    assert api_state._decrypt_secret(stored) == secret
+    assert service.preview_items(7, 1, "cookie-a") == [service._mask_secret(secret)]
+
+
+def test_inventory_api_rejects_oversized_import_inputs(api_state):
+    oversized_cases = [
+        ["x"] * 1001,
+        ["x" * 4097],
+        ["x" * 4096] * 300,
+    ]
+    for secrets in oversized_cases:
+        with pytest.raises(HTTPException) as error:
+            reply_server.import_card_inventory(
+                card_id=7,
+                account_id="cookie-a",
+                request=reply_server.InventoryImportRequest(secrets=secrets),
+                current_user=USER,
+            )
+        assert error.value.status_code == 400
+        assert error.value.detail["code"] == "invalid_input"
+
+
 def test_inventory_settings_round_trip_returns_complete_generator_configuration(api_state):
     saved = reply_server.update_inventory_settings(
         card_id=7,
@@ -274,14 +340,8 @@ def test_inventory_settings_round_trip_returns_complete_generator_configuration(
     assert saved["settings"]["generator_prefix"] == "AC-"
 
     fetched = reply_server.get_inventory_settings(7, "cookie-a", USER)
-    assert fetched["settings"] == {
-        "stock_ceiling": 8,
-        "low_stock_threshold": 2,
-        "auto_replenish": True,
-        "generator_prefix": "AC-",
-        "generator_length": 20,
-        "generator_charset": "ABCDEFG234567",
-    }
+    assert fetched["settings"] == saved["settings"]
+    assert fetched["settings"]["updated_at"] == saved["settings"]["updated_at"]
 
 
 def test_inventory_api_rejects_cross_user_scope(api_state):

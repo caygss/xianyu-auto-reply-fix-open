@@ -2,7 +2,9 @@ from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, F
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from typing import List, Tuple, Optional, Dict, Any, Callable, Awaitable
 from pathlib import Path
 from urllib.parse import unquote
@@ -67,8 +69,15 @@ from republish_template_service import (
     safe_delivery_summary,
 )
 from guided_setup_service import build_guided_status, is_guided_runtime_ready
-from card_inventory_service import CardInventoryError, CardInventoryService
-from delivery_config_service import DeliveryConfigError, DeliveryConfigService
+from card_inventory_service import (
+    MAX_IMPORT_REQUEST_BYTES,
+    CardInventoryError,
+    CardInventoryService,
+)
+from delivery_config_service import (
+    DeliveryConfigError,
+    DeliveryConfigService,
+)
 from runtime_paths import app_root
 
 from loguru import logger
@@ -1196,12 +1205,16 @@ class PersonalBlacklistToggleRequest(BaseModel):
     is_enabled: bool
 
 
-class DeliveryConfigRequest(BaseModel):
+class Task5RequestModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class DeliveryConfigRequest(Task5RequestModel):
     mode: str
     config: Dict[str, Any]
 
 
-class InventorySettingsRequest(BaseModel):
+class InventorySettingsRequest(Task5RequestModel):
     stock_ceiling: Optional[int] = None
     low_stock_threshold: Optional[int] = None
     auto_replenish: Optional[bool] = None
@@ -1210,7 +1223,7 @@ class InventorySettingsRequest(BaseModel):
     generator_charset: Optional[str] = None
 
 
-class InventoryImportRequest(BaseModel):
+class InventoryImportRequest(Task5RequestModel):
     secrets: List[str]
     idempotency_key: Optional[str] = None
 
@@ -1222,6 +1235,19 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc"
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def task5_request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    path = request.url.path
+    if "/api/cards/" in path and (
+        "/delivery-config" in path or "/inventory" in path
+    ):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": {"code": "invalid_request", "message": "Task5 请求格式无效"}},
+        )
+    return await request_validation_exception_handler(request, exc)
 
 # 注册刮刮乐远程控制路由
 if CAPTCHA_ROUTER_AVAILABLE:
@@ -1343,6 +1369,28 @@ def _task5_inventory_summary(service, card_id, user_id, account_id):
     return summary
 
 
+def _task5_validate_import_request(request: InventoryImportRequest, http_request: Request = None):
+    content_length = http_request.headers.get("content-length") if http_request else None
+    if content_length:
+        try:
+            if int(content_length) > MAX_IMPORT_REQUEST_BYTES:
+                raise CardInventoryError("invalid_input", "导入请求体大小超过限制")
+        except ValueError as exc:
+            raise CardInventoryError("invalid_input", "导入请求体大小无效") from exc
+    try:
+        payload_size = len(
+            json.dumps(
+                request.model_dump(exclude_none=True),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+    except (TypeError, ValueError) as exc:
+        raise CardInventoryError("invalid_input", "导入请求体格式无效") from exc
+    if payload_size > MAX_IMPORT_REQUEST_BYTES:
+        raise CardInventoryError("invalid_input", "导入请求体大小超过限制")
+
+
 @app.get("/api/cards/{card_id}/delivery-config")
 def get_delivery_config(
     card_id: int,
@@ -1450,6 +1498,7 @@ def import_card_inventory(
     card_id: int,
     account_id: str = Query(...),
     request: InventoryImportRequest = None,
+    http_request: Request = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     user_id, card_id, account_id = _task5_scope(card_id, account_id, current_user)
@@ -1457,6 +1506,7 @@ def import_card_inventory(
         raise HTTPException(status_code=400, detail="导入卡密不能为空")
     service = CardInventoryService(db_manager)
     try:
+        _task5_validate_import_request(request, http_request)
         result = service.import_items(
             card_id,
             user_id,
