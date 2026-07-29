@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import re
+import unicodedata
 from contextlib import contextmanager
 from urllib.parse import urlparse
 
@@ -48,6 +51,76 @@ class DeliveryConfigService:
         return user_id, card_id, account_id
 
     @staticmethod
+    def _validate_fixed_link(url):
+        if not isinstance(url, str) or not url:
+            raise DeliveryConfigError("invalid_config", "固定链接必须是有效的 HTTP 或 HTTPS 链接")
+        if any(
+            char.isspace() or unicodedata.category(char) in {"Cc", "Cf"}
+            for char in url
+        ):
+            raise DeliveryConfigError("invalid_config", "固定链接不能包含空白或控制字符")
+        if re.search(r"%(?![0-9A-Fa-f]{2})", url):
+            raise DeliveryConfigError("invalid_config", "固定链接包含非法 percent 编码")
+
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.hostname
+        except (TypeError, ValueError) as exc:
+            raise DeliveryConfigError(
+                "invalid_config", "固定链接必须是有效的 HTTP 或 HTTPS 链接"
+            ) from exc
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or not hostname:
+            raise DeliveryConfigError("invalid_config", "固定链接必须是有效的 HTTP 或 HTTPS 链接")
+
+        authority = parsed.netloc.rsplit("@", 1)[-1]
+        if authority.startswith("["):
+            closing_bracket = authority.find("]")
+            suffix = authority[closing_bracket + 1:] if closing_bracket >= 0 else authority
+            if closing_bracket < 0 or (suffix and not suffix.startswith(":")):
+                raise DeliveryConfigError("invalid_config", "固定链接主机地址无效")
+            port_text = suffix[1:] if suffix else None
+            try:
+                ipaddress.ip_address(hostname)
+            except ValueError as exc:
+                raise DeliveryConfigError("invalid_config", "固定链接主机地址无效") from exc
+        else:
+            if authority.count(":") > 1:
+                raise DeliveryConfigError("invalid_config", "固定链接主机地址无效")
+            port_text = authority.rsplit(":", 1)[1] if ":" in authority else None
+            if ":" in hostname:
+                raise DeliveryConfigError("invalid_config", "固定链接主机地址无效")
+            try:
+                ipaddress.ip_address(hostname)
+            except ValueError:
+                try:
+                    ascii_hostname = hostname.encode("idna").decode("ascii")
+                except UnicodeError as exc:
+                    raise DeliveryConfigError("invalid_config", "固定链接主机地址无效") from exc
+                labels = ascii_hostname.split(".")
+                if (
+                    len(ascii_hostname) > 253
+                    or any(
+                        not label
+                        or len(label) > 63
+                        or label[0] == "-"
+                        or label[-1] == "-"
+                        or not re.fullmatch(r"[A-Za-z0-9-]+", label)
+                        for label in labels
+                    )
+                ):
+                    raise DeliveryConfigError("invalid_config", "固定链接主机地址无效")
+
+        if port_text is not None and (
+            not port_text
+            or not port_text.isascii()
+            or not port_text.isdecimal()
+        ):
+            raise DeliveryConfigError("invalid_config", "固定链接端口必须是数字")
+        if port_text is not None and not 0 <= int(port_text) <= 65535:
+            raise DeliveryConfigError("invalid_config", "固定链接端口超出范围")
+        return url
+
+    @staticmethod
     def _validate_config(mode, config):
         mode = str(mode or "").strip()
         if mode not in DELIVERY_MODES:
@@ -62,16 +135,9 @@ class DeliveryConfigService:
             raise DeliveryConfigError("invalid_config", "交付配置格式无效") from exc
 
         if mode == "fixed_link":
-            url = str(normalized.get("url") or "").strip()
-            try:
-                parsed = urlparse(url)
-            except (TypeError, ValueError) as exc:
-                raise DeliveryConfigError(
-                    "invalid_config", "固定链接必须是有效的 HTTP 或 HTTPS 链接"
-                ) from exc
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                raise DeliveryConfigError("invalid_config", "固定链接必须是有效的 HTTP 或 HTTPS 链接")
-            normalized["url"] = url
+            normalized["url"] = DeliveryConfigService._validate_fixed_link(
+                normalized.get("url")
+            )
         return mode, normalized
 
     @staticmethod

@@ -121,6 +121,65 @@ def test_delivery_config_rejects_empty_unknown_mode_and_non_http_link(api_state)
     assert malformed_ipv6.value.detail["code"] == "invalid_config"
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        " https://example.com/path",
+        "https://example.com/path ",
+        "https://example.com/path\nnext",
+        "https://example.com/path\x00next",
+    ],
+)
+def test_fixed_link_rejects_whitespace_and_control_characters(api_state, url):
+    with pytest.raises(HTTPException) as error:
+        _put_config({"mode": "fixed_link", "config": {"url": url}})
+    assert error.value.status_code == 400
+    assert error.value.detail["code"] == "invalid_config"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://:443/path",
+        "https://example..com/path",
+    ],
+)
+def test_fixed_link_rejects_invalid_hosts(api_state, url):
+    with pytest.raises(HTTPException) as error:
+        _put_config({"mode": "fixed_link", "config": {"url": url}})
+    assert error.value.status_code == 400
+    assert error.value.detail["code"] == "invalid_config"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com:abc/path",
+        "https://example.com:65536/path",
+    ],
+)
+def test_fixed_link_rejects_invalid_ports(api_state, url):
+    with pytest.raises(HTTPException) as error:
+        _put_config({"mode": "fixed_link", "config": {"url": url}})
+    assert error.value.status_code == 400
+    assert error.value.detail["code"] == "invalid_config"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/%ZZ",
+        "https://example.com/%",
+        "https://example.com/%2",
+    ],
+)
+def test_fixed_link_rejects_invalid_percent_encoding(api_state, url):
+    with pytest.raises(HTTPException) as error:
+        _put_config({"mode": "fixed_link", "config": {"url": url}})
+    assert error.value.status_code == 400
+    assert error.value.detail["code"] == "invalid_config"
+
+
 def test_delivery_config_rejects_cross_user_and_cross_account_scope(api_state):
     with pytest.raises(HTTPException) as other_user:
         _put_config(
