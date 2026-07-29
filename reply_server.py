@@ -4109,7 +4109,7 @@ def _build_token_refresh_action_contract(
     status = str(token_refresh_status or '').strip()
     reason = str(backoff_reason or '').strip() or None
     deadline = _safe_runtime_deadline(backoff_until)
-    remaining_seconds = max(0, int(deadline - now)) if deadline > now else 0
+    remaining_seconds = max(0, math.ceil(deadline - now)) if deadline > now else 0
     manual_statuses = {
         'verification_pending_manual',
         'manual_verification_required',
@@ -4161,7 +4161,7 @@ def _build_password_login_backoff_response(cookie_id: str, now: Optional[float] 
 
     deadline = _safe_runtime_deadline(backoff_state.get('until'))
     current_time = time.time() if now is None else float(now)
-    remaining_seconds = max(0, int(deadline - current_time)) if deadline > current_time else 0
+    remaining_seconds = max(0, math.ceil(deadline - current_time)) if deadline > current_time else 0
     if remaining_seconds <= 0:
         return None
 
@@ -4261,7 +4261,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
             runtime_status['token_refresh_status'] = 'qr_login_grace_wait'
             runtime_status['token_refresh_remaining_seconds'] = max(
                 0,
-                int(runtime_status['qr_login_grace_until'] - time.time()),
+                math.ceil(runtime_status['qr_login_grace_until'] - time.time()),
             )
     except Exception as exc:
         logger.warning(f"读取账号稳定期状态失败: {cleaned_cid}, {mask_sensitive_text(exc)}")
@@ -4310,7 +4310,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
             qr_deadline = _safe_runtime_deadline(runtime_status.get('qr_login_grace_until'))
             if qr_deadline > time.time() and backoff_until <= time.time():
                 runtime_status.update({
-                    'token_refresh_remaining_seconds': max(0, int(qr_deadline - time.time())),
+                    'token_refresh_remaining_seconds': max(0, math.ceil(qr_deadline - time.time())),
                     'token_refresh_can_retry': False,
                     'user_action': 'wait_backoff',
                 })
