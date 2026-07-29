@@ -165,6 +165,14 @@ def test_fixed_link_rejects_invalid_ports(api_state, url):
     assert error.value.detail["code"] == "invalid_config"
 
 
+def test_fixed_link_rejects_extremely_long_port_without_server_error(api_state):
+    url = "https://example.com:" + ("9" * 5000) + "/path"
+    with pytest.raises(HTTPException) as error:
+        _put_config({"mode": "fixed_link", "config": {"url": url}})
+    assert error.value.status_code == 400
+    assert error.value.detail["code"] == "invalid_config"
+
+
 @pytest.mark.parametrize(
     "url",
     [

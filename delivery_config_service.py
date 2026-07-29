@@ -116,8 +116,13 @@ class DeliveryConfigService:
             or not port_text.isdecimal()
         ):
             raise DeliveryConfigError("invalid_config", "固定链接端口必须是数字")
-        if port_text is not None and not 0 <= int(port_text) <= 65535:
-            raise DeliveryConfigError("invalid_config", "固定链接端口超出范围")
+        if port_text is not None:
+            try:
+                port_number = int(port_text)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise DeliveryConfigError("invalid_config", "固定链接端口超出范围") from exc
+            if not 0 <= port_number <= 65535:
+                raise DeliveryConfigError("invalid_config", "固定链接端口超出范围")
         return url
 
     @staticmethod
