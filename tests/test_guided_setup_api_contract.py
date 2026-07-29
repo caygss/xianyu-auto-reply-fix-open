@@ -305,6 +305,51 @@ def test_manual_verification_unexpected_error_uses_safe_client_message(authentic
     assert "private.example" not in response.text
 
 
+def test_manual_verification_build_failure_rolls_back_new_pending_state(authenticated_client, monkeypatch):
+    reply_server.guided_manual_verification_actions.clear()
+    monkeypatch.setattr(reply_server, "_ensure_cookie_access", lambda cid, user: cid)
+    monkeypatch.setattr(
+        reply_server,
+        "_build_live_runtime_status",
+        lambda cid: (_ for _ in ()).throw(RuntimeError("runtime unavailable")),
+    )
+
+    response = authenticated_client.post("/cookies/account-1/manual-verification/open", json={})
+
+    assert response.status_code == 400
+    assert "account-1" not in reply_server.guided_manual_verification_actions
+
+    monkeypatch.setattr(
+        reply_server,
+        "_build_live_runtime_status",
+        lambda cid: {"token_refresh_status": "verification_pending_manual", "connection_state": "reconnecting"},
+    )
+    recovered = authenticated_client.post("/cookies/account-1/manual-verification/open", json={})
+
+    assert recovered.status_code == 200
+    assert reply_server.guided_manual_verification_actions["account-1"]["status"] == "open_pending"
+
+
+def test_manual_verification_build_failure_preserves_previous_pending_state(authenticated_client, monkeypatch):
+    previous_state = {
+        "status": "open_pending",
+        "action": "open_manual_verification",
+        "updated_at": 123.0,
+    }
+    reply_server.guided_manual_verification_actions["account-1"] = dict(previous_state)
+    monkeypatch.setattr(reply_server, "_ensure_cookie_access", lambda cid, user: cid)
+    monkeypatch.setattr(
+        reply_server,
+        "_build_live_runtime_status",
+        lambda cid: (_ for _ in ()).throw(RuntimeError("runtime unavailable")),
+    )
+
+    response = authenticated_client.post("/cookies/account-1/manual-verification/complete", json={})
+
+    assert response.status_code == 400
+    assert reply_server.guided_manual_verification_actions["account-1"] == previous_state
+
+
 def test_live_runtime_exposes_real_grace_and_backoff_deadlines(monkeypatch):
     from XianyuAutoAsync import XianyuLive
 

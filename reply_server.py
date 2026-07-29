@@ -4665,14 +4665,14 @@ def _build_manual_verification_action_response(
 ) -> Dict[str, Any]:
     cleaned_cookie_id = _ensure_cookie_access(cookie_id, current_user)
     state = 'open_pending' if action == 'open_manual_verification' else 'complete_pending'
-    guided_manual_verification_actions[cleaned_cookie_id] = {
+    pending_state = {
         'status': state,
         'action': action,
         'updated_at': time.time(),
     }
     runtime_status = dict(_build_live_runtime_status(cleaned_cookie_id) or {})
     runtime_status['manual_verification_action'] = state
-    return {
+    response = {
         'success': True,
         'action': action,
         'status': 'pending',
@@ -4693,6 +4693,8 @@ def _build_manual_verification_action_response(
             delivery_summary={'configured': False},
         ),
     }
+    guided_manual_verification_actions[cleaned_cookie_id] = pending_state
+    return response
 
 
 def _safe_manual_verification_action_response(
