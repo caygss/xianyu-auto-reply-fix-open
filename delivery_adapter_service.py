@@ -186,6 +186,21 @@ class ProviderApiAdapter:
                 response = self.transport.request(
                     "POST", config["endpoint"], headers, payload, timeout
                 )
+            except HTTPError as exc:
+                status_code = exc.code
+                if isinstance(status_code, bool) or not isinstance(status_code, int):
+                    raise DeliveryDispatchError(
+                        "provider_response_invalid",
+                        "外部交付服务返回状态码格式异常",
+                        "provider_response",
+                    ) from exc
+                if status_code in {429, *range(500, 600)} and attempt < retries:
+                    continue
+                raise DeliveryDispatchError(
+                    "provider_http_error",
+                    f"外部交付服务返回 HTTP {status_code}",
+                    "provider_http",
+                ) from exc
             except Exception as exc:
                 if not isinstance(exc, (URLError, TimeoutError, ConnectionError)):
                     raise DeliveryDispatchError(

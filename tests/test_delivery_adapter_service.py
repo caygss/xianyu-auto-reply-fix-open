@@ -1,5 +1,6 @@
 import json
-from urllib.error import URLError
+from io import BytesIO
+from urllib.error import HTTPError, URLError
 
 import pytest
 from loguru import logger
@@ -357,6 +358,36 @@ def test_provider_max_retries_three_caps_retryable_http_to_four_calls(services):
 
     assert error.value.code == "provider_http_error"
     assert len(transport.calls) == 4
+
+
+@pytest.mark.parametrize("status_code", [400, 404])
+def test_provider_http_error_other_4xx_does_not_retry(services, status_code):
+    _, configs, inventory = services
+    configs.save(
+        1,
+        7,
+        "account-a",
+        "provider_api",
+        {"endpoint": "https://provider.test/issue", "token": "t", "max_retries": 3},
+    )
+    transport = FakeTransport(
+        [
+            HTTPError(
+                "https://provider.test/issue",
+                status_code,
+                "client error",
+                {},
+                BytesIO(b'{"error":"client"}'),
+            ),
+            ProviderResponse(200, {}, b'{"content":"must-not-be-used"}'),
+        ]
+    )
+
+    with pytest.raises(DeliveryDispatchError) as error:
+        DeliveryDispatcher(configs, inventory, transport=transport).prepare(request())
+
+    assert error.value.code == "provider_http_error"
+    assert len(transport.calls) == 1
 
 
 def test_xianyu_delivery_seam_reuses_existing_text_steps(monkeypatch):
