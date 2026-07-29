@@ -28,7 +28,8 @@ def test_wizard_reads_guided_status_and_uses_server_deadline_for_countdown():
 
 
 def test_manual_takeover_is_gated_by_active_browser_signal():
-    assert "manual_browser_available" in APP
+    assert "manual_browser_session_status" in APP
+    assert "vnc_manual_action_available" in APP
     assert "接管验证" in APP
     assert "保持浏览器窗口打开" in APP
     assert "不要重复扫码" in APP
@@ -47,7 +48,13 @@ def test_guided_status_contract_exports_named_render_load_and_browser_helpers():
     assert "function renderGuidedSetupStatus" in APP
     assert "function loadGuidedSetupStatus" in APP
     assert "function isGuidedManualBrowserAvailable" in APP
+    assert "function getGuidedManualPrimaryAction" in APP
     assert "module.exports" in APP
+
+
+def test_manual_verification_has_only_one_visible_primary_action():
+    assert "secondary.hidden = false" not in APP
+    assert "getGuidedManualPrimaryAction(viewModel.contractAction, runtimeStatus)" in APP
 
 
 def test_ready_state_keeps_the_panel_visible_for_step_six_confirmation():

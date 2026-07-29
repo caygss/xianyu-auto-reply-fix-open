@@ -101,11 +101,22 @@ function isGuidedRuntimeReady(runtimeStatus, guidedStatus) {
         && ['finish', 'go_to_delivery_config'].includes(String(guidedStatus?.primary_action || '').trim());
 }
 
-function isGuidedManualBrowserAvailable(runtimeStatus, guidedStatus) {
-    const runtimeState = String(runtimeStatus?.manual_browser_session_status || '').trim().toLowerCase();
+function isGuidedManualBrowserAvailable(runtimeStatus) {
+    const runtime = runtimeStatus && typeof runtimeStatus === 'object' ? runtimeStatus : {};
+    const runtimeState = String(runtime.manual_browser_session_status || '').trim().toLowerCase();
     return GUIDED_SETUP_ACTIVE_BROWSER_STATES.has(runtimeState)
-        && runtimeStatus?.vnc_manual_action_available === true
-        && (guidedStatus?.manual_browser_available === undefined || guidedStatus.manual_browser_available === true);
+        || runtime.vnc_manual_action_available === true;
+}
+
+function getGuidedManualPrimaryAction(primaryAction, runtimeStatus) {
+    const action = String(primaryAction || '').trim();
+    if (action === 'complete_manual_verification') return 'complete_manual_verification';
+    if (action === 'open_manual_verification') {
+        return isGuidedManualBrowserAvailable(runtimeStatus)
+            ? 'takeover_browser'
+            : 'open_manual_verification';
+    }
+    return action;
 }
 
 function getGuidedSetupAccount() {
@@ -207,60 +218,48 @@ function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}
         return {
             step: options.scanStarted ? 2 : 1,
             action: 'start_scan',
+            contractAction: 'start_scan',
             mode: 'prepare',
             ready: false,
         };
     }
 
-    const primaryAction = String(status.primary_action || 'refresh_status').trim();
+    const primaryAction = String(status.primary_action || 'refresh_status').trim() || 'refresh_status';
     const technicalStatus = String(status.technical_status || '').trim();
     const stepIndex = Number(status.step_index);
-    const runtimeReady = isGuidedRuntimeReady(runtimeStatus, status);
-    const errorStatuses = new Set([
-        'unknown',
-        'failed',
-        'token_refresh_failed',
-        'token_refresh_exception',
-        'captcha_max_retries_exceeded',
-        'token_init_failed',
-    ]);
+    const contractStep = Number.isFinite(stepIndex)
+        ? Math.min(6, Math.max(1, stepIndex + 3))
+        : (primaryAction === 'finish' ? 6 : 4);
+    const technicalModes = {
+        qr_login_grace_wait: 'qr_wait',
+        password_login_backoff_wait: 'backoff_wait',
+        connecting: 'reconnect_wait',
+        reconnecting: 'reconnect_wait',
+        verification_pending_manual: 'manual',
+        manual_verification_required: 'manual',
+        token_refresh_failed: 'error',
+        token_refresh_exception: 'error',
+        captcha_max_retries_exceeded: 'error',
+        token_init_failed: 'error',
+        unknown: 'error',
+        failed: 'error',
+    };
+    let mode = technicalModes[technicalStatus] || 'error';
+    if (primaryAction === 'finish') mode = 'ready';
+    if (primaryAction === 'open_manual_verification' || primaryAction === 'complete_manual_verification') {
+        mode = 'manual';
+    }
+    if (primaryAction === 'go_to_delivery_config' && !technicalModes[technicalStatus]) {
+        mode = 'connected_wait';
+    }
 
-    if (technicalStatus === 'qr_login_grace_wait') {
-        return { step: 3, action: 'wait', mode: 'qr_wait', ready: false };
-    }
-    if (technicalStatus === 'password_login_backoff_wait') {
-        return { step: 4, action: 'wait', mode: 'backoff_wait', ready: false };
-    }
-    if (technicalStatus === 'connecting' || technicalStatus === 'reconnecting') {
-        return { step: 5, action: 'wait', mode: 'reconnect_wait', ready: false };
-    }
-    if (
-        technicalStatus === 'verification_pending_manual'
-        || technicalStatus === 'manual_verification_required'
-        || primaryAction === 'open_manual_verification'
-        || primaryAction === 'complete_manual_verification'
-    ) {
-        return {
-            step: 4,
-            action: ['open_manual_verification', 'complete_manual_verification'].includes(primaryAction)
-                ? primaryAction
-                : 'open_manual_verification',
-            mode: 'manual',
-            ready: false,
-        };
-    }
-    if (stepIndex >= 3 || primaryAction === 'finish') {
-        return { step: 6, action: 'finish_local', mode: 'ready', ready: runtimeReady || stepIndex >= 3 };
-    }
-    if (primaryAction === 'go_to_delivery_config') {
-        return runtimeReady
-            ? { step: 6, action: 'finish_local', mode: 'ready', ready: true }
-            : { step: 5, action: 'wait', mode: 'connected_wait', ready: false };
-    }
-    if (errorStatuses.has(technicalStatus) || primaryAction === 'refresh_status') {
-        return { step: 4, action: 'refresh_status', mode: 'error', ready: false };
-    }
-    return { step: 4, action: 'refresh_status', mode: 'error', ready: false };
+    return {
+        step: primaryAction === 'finish' ? 6 : contractStep,
+        action: primaryAction,
+        contractAction: primaryAction,
+        mode,
+        ready: primaryAction === 'finish' || stepIndex >= 3,
+    };
 }
 
 function getGuidedDeadlineSeconds(deadline, now = Date.now()) {
@@ -337,7 +336,6 @@ function renderGuidedSetupStatus() {
     const copy = getGuidedSetupCopy(step, account, viewModel);
     const guidedStatus = account?.guidedStatus || {};
     const runtimeStatus = account?.runtimeStatus || {};
-    const hasActiveBrowser = isGuidedManualBrowserAvailable(runtimeStatus, guidedStatus);
 
     elements.account.textContent = account?.id || '准备添加账号';
     elements.step.textContent = `第 ${step} 步，共 6 步`;
@@ -365,16 +363,16 @@ function renderGuidedSetupStatus() {
     if (viewModel.action === 'start_scan') {
         primary.textContent = step === 1 ? '开始扫码登录' : '打开扫码登录';
         primary.dataset.guidedAction = 'start_scan';
-    } else if (viewModel.action === 'wait') {
+    } else if (viewModel.action === 'refresh_status' && getGuidedDeadlineSeconds(guidedStatus.retry_at) > 0) {
         primary.hidden = true;
         secondary.hidden = true;
     } else if (
-        (viewModel.action === 'open_manual_verification' || viewModel.action === 'complete_manual_verification')
-        && hasActiveBrowser
+        viewModel.action === 'open_manual_verification'
+        && isGuidedManualBrowserAvailable(runtimeStatus)
     ) {
         primary.textContent = '接管验证';
-        primary.dataset.guidedAction = 'takeover_browser';
-        secondary.hidden = false;
+        primary.dataset.guidedAction = getGuidedManualPrimaryAction(viewModel.contractAction, runtimeStatus);
+        secondary.hidden = true;
         secondary.textContent = '我已完成验证';
         secondary.dataset.guidedAction = 'complete_manual_verification';
     } else if (viewModel.action === 'open_manual_verification') {
@@ -386,6 +384,12 @@ function renderGuidedSetupStatus() {
     } else if (viewModel.action === 'refresh_status') {
         primary.textContent = '重新检查状态';
         primary.dataset.guidedAction = 'refresh_status';
+    } else if (viewModel.action === 'go_to_delivery_config') {
+        primary.textContent = '完成首次登录';
+        primary.dataset.guidedAction = 'go_to_delivery_config';
+    } else if (viewModel.action === 'finish') {
+        primary.textContent = '确认并完成首次登录';
+        primary.dataset.guidedAction = 'finish';
     } else {
         primary.textContent = '完成首次登录';
         primary.dataset.guidedAction = 'finish_local';
@@ -453,7 +457,7 @@ async function handleGuidedSetupAction(action) {
         window.open(getNoVncUrl(), '_blank', 'noopener');
         return;
     }
-    if (selectedAction === 'finish_local') {
+    if (selectedAction === 'finish' || selectedAction === 'finish_local') {
         toggleGuidedSetup(false);
         return;
     }
@@ -24969,6 +24973,7 @@ async function savePolishSchedule() {
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         getGuidedDeadlineSeconds,
+        getGuidedManualPrimaryAction,
         getGuidedSetupStatusViewModel,
         isGuidedManualBrowserAvailable,
         loadGuidedSetupStatus,

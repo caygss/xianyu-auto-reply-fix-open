@@ -33,21 +33,40 @@ const wait = guided.getGuidedSetupStatusViewModel(
   { connection_state: 'connected', running: true, ws_ready: true, session_ready: true, has_current_token: true, message_stream_ready: true },
 );
 assert.equal(wait.step, 4);
-assert.equal(wait.action, 'wait');
+assert.equal(wait.action, 'refresh_status');
+
+const primaryActionWins = guided.getGuidedSetupStatusViewModel(
+  { primary_action: 'open_manual_verification', step_index: 1, technical_status: 'password_login_backoff_wait' },
+  { connection_state: 'connected', running: true, ws_ready: true, session_ready: true, has_current_token: true, message_stream_ready: true },
+);
+assert.equal(primaryActionWins.action, 'open_manual_verification');
+
+const refreshActionWins = guided.getGuidedSetupStatusViewModel(
+  { primary_action: 'refresh_status', step_index: 1, technical_status: 'verification_pending_manual' },
+  { connection_state: 'disconnected' },
+);
+assert.equal(refreshActionWins.action, 'refresh_status');
+
+const stepIndexWins = guided.getGuidedSetupStatusViewModel(
+  { primary_action: 'refresh_status', step_index: 3, technical_status: 'token_refresh_failed' },
+  { connection_state: 'disconnected' },
+);
+assert.equal(stepIndexWins.step, 6);
+assert.equal(stepIndexWins.action, 'refresh_status');
 
 const qrWait = guided.getGuidedSetupStatusViewModel(
   { primary_action: 'refresh_status', step_index: 1, technical_status: 'qr_login_grace_wait' },
   { connection_state: 'connected' },
 );
-assert.equal(qrWait.step, 3);
-assert.equal(qrWait.action, 'wait');
+assert.equal(qrWait.step, 4);
+assert.equal(qrWait.action, 'refresh_status');
 
 const reconnecting = guided.getGuidedSetupStatusViewModel(
   { primary_action: 'refresh_status', step_index: 1, technical_status: 'reconnecting' },
   { connection_state: 'connected' },
 );
-assert.equal(reconnecting.step, 5);
-assert.equal(reconnecting.action, 'wait');
+assert.equal(reconnecting.step, 4);
+assert.equal(reconnecting.action, 'refresh_status');
 
 const manual = guided.getGuidedSetupStatusViewModel(
   { primary_action: 'open_manual_verification', step_index: 1, technical_status: 'verification_pending_manual', manual_browser_available: false },
@@ -68,7 +87,7 @@ const ready = guided.getGuidedSetupStatusViewModel(
   { connection_state: 'connected', running: true, ws_ready: true, session_ready: true, has_current_token: true, message_stream_ready: true },
 );
 assert.equal(ready.step, 6);
-assert.equal(ready.action, 'finish_local');
+assert.equal(ready.action, 'finish');
 assert.equal(ready.ready, true);
 
 assert.equal(guided.isGuidedManualBrowserAvailable(
@@ -78,10 +97,31 @@ assert.equal(guided.isGuidedManualBrowserAvailable(
 assert.equal(guided.isGuidedManualBrowserAvailable(
   { vnc_manual_action_available: true, manual_browser_session_status: null },
   { manual_browser_available: true },
+), true);
+assert.equal(guided.isGuidedManualBrowserAvailable(
+  { vnc_manual_action_available: false, manual_browser_session_status: 'active' },
+  { manual_browser_available: false },
+), true);
+assert.equal(guided.isGuidedManualBrowserAvailable(
+  { vnc_manual_action_available: false, manual_browser_session_status: 'false' },
+  { manual_browser_available: true },
 ), false);
 assert.equal(guided.isGuidedManualBrowserAvailable(
   { vnc_manual_action_available: true, manual_browser_session_status: 'active' },
 ), true);
+
+assert.equal(guided.getGuidedManualPrimaryAction(
+  'open_manual_verification',
+  { vnc_manual_action_available: true, manual_browser_session_status: 'active' },
+), 'takeover_browser');
+assert.equal(guided.getGuidedManualPrimaryAction(
+  'complete_manual_verification',
+  { vnc_manual_action_available: true, manual_browser_session_status: 'active' },
+), 'complete_manual_verification');
+assert.equal(guided.getGuidedManualPrimaryAction(
+  'open_manual_verification',
+  { vnc_manual_action_available: false, manual_browser_session_status: null },
+), 'open_manual_verification');
 """
     result = subprocess.run(
         ["node", "-e", script],
