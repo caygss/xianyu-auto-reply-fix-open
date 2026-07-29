@@ -29,61 +29,63 @@ assert.equal(guided.getGuidedDeadlineSeconds(1700000010, now), 10);
 assert.equal(guided.getGuidedDeadlineSeconds(1700000010, now + 10000), 0);
 
 const wait = guided.getGuidedSetupStatusViewModel(
-  { primary_action: 'refresh_status', step_index: 1, technical_status: 'password_login_backoff_wait' },
+  { primary_action: 'refresh_status', step_index: 4, technical_status: 'password_login_backoff_wait', needs_user_action: false },
   { connection_state: 'connected', running: true, ws_ready: true, session_ready: true, has_current_token: true, message_stream_ready: true },
 );
 assert.equal(wait.step, 4);
 assert.equal(wait.action, 'refresh_status');
+assert.equal(wait.showPrimaryAction, false);
 
 const primaryActionWins = guided.getGuidedSetupStatusViewModel(
-  { primary_action: 'open_manual_verification', step_index: 1, technical_status: 'password_login_backoff_wait' },
+  { primary_action: 'open_manual_verification', step_index: 4, technical_status: 'password_login_backoff_wait', needs_user_action: true },
   { connection_state: 'connected', running: true, ws_ready: true, session_ready: true, has_current_token: true, message_stream_ready: true },
 );
 assert.equal(primaryActionWins.action, 'open_manual_verification');
 
 const refreshActionWins = guided.getGuidedSetupStatusViewModel(
-  { primary_action: 'refresh_status', step_index: 1, technical_status: 'verification_pending_manual' },
+  { primary_action: 'refresh_status', step_index: 4, technical_status: 'verification_pending_manual', needs_user_action: true },
   { connection_state: 'disconnected' },
 );
 assert.equal(refreshActionWins.action, 'refresh_status');
 
 const stepIndexWins = guided.getGuidedSetupStatusViewModel(
-  { primary_action: 'refresh_status', step_index: 3, technical_status: 'token_refresh_failed' },
+  { primary_action: 'refresh_status', step_index: 6, technical_status: 'token_refresh_failed' },
   { connection_state: 'disconnected' },
 );
 assert.equal(stepIndexWins.step, 6);
 assert.equal(stepIndexWins.action, 'refresh_status');
+assert.equal(stepIndexWins.ready, false);
 
 const qrWait = guided.getGuidedSetupStatusViewModel(
-  { primary_action: 'refresh_status', step_index: 1, technical_status: 'qr_login_grace_wait' },
+  { primary_action: 'refresh_status', step_index: 3, technical_status: 'qr_login_grace_wait', needs_user_action: false },
   { connection_state: 'connected' },
 );
-assert.equal(qrWait.step, 4);
+assert.equal(qrWait.step, 3);
 assert.equal(qrWait.action, 'refresh_status');
 
 const reconnecting = guided.getGuidedSetupStatusViewModel(
-  { primary_action: 'refresh_status', step_index: 1, technical_status: 'reconnecting' },
+  { primary_action: 'refresh_status', step_index: 5, technical_status: 'reconnecting', needs_user_action: false },
   { connection_state: 'connected' },
 );
-assert.equal(reconnecting.step, 4);
+assert.equal(reconnecting.step, 5);
 assert.equal(reconnecting.action, 'refresh_status');
 
 const manual = guided.getGuidedSetupStatusViewModel(
-  { primary_action: 'open_manual_verification', step_index: 1, technical_status: 'verification_pending_manual', manual_browser_available: false },
+  { primary_action: 'open_manual_verification', step_index: 4, technical_status: 'verification_pending_manual', manual_browser_available: false, needs_user_action: true },
   { connection_state: 'disconnected', manual_browser_session_status: null, vnc_manual_action_available: false },
 );
 assert.equal(manual.step, 4);
 assert.equal(manual.action, 'open_manual_verification');
 
 const error = guided.getGuidedSetupStatusViewModel(
-  { primary_action: 'refresh_status', step_index: 1, technical_status: 'token_refresh_failed' },
+  { primary_action: 'refresh_status', step_index: 4, technical_status: 'token_refresh_failed', needs_user_action: true },
   { connection_state: 'connected' },
 );
 assert.equal(error.step, 4);
 assert.equal(error.action, 'refresh_status');
 
 const ready = guided.getGuidedSetupStatusViewModel(
-  { primary_action: 'finish', step_index: 3, technical_status: 'connected' },
+  { primary_action: 'finish', step_index: 6, technical_status: 'connected' },
   { connection_state: 'connected', running: true, ws_ready: true, session_ready: true, has_current_token: true, message_stream_ready: true },
 );
 assert.equal(ready.step, 6);

@@ -57,6 +57,12 @@ def test_manual_verification_has_only_one_visible_primary_action():
     assert "getGuidedManualPrimaryAction(viewModel.contractAction, runtimeStatus)" in APP
 
 
+def test_waiting_states_use_server_actionability_and_keep_waiting_without_recheck_button():
+    assert "showPrimaryAction" in APP
+    assert "primary.hidden = !viewModel.showPrimaryAction" in APP
+    assert "stepIndex + 3" not in APP
+
+
 def test_ready_state_keeps_the_panel_visible_for_step_six_confirmation():
     assert "elements.panel.hidden = true" not in APP
     assert "验证可用" in APP

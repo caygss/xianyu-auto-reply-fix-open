@@ -220,6 +220,7 @@ function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}
             action: 'start_scan',
             contractAction: 'start_scan',
             mode: 'prepare',
+            showPrimaryAction: true,
             ready: false,
         };
     }
@@ -228,7 +229,7 @@ function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}
     const technicalStatus = String(status.technical_status || '').trim();
     const stepIndex = Number(status.step_index);
     const contractStep = Number.isFinite(stepIndex)
-        ? Math.min(6, Math.max(1, stepIndex + 3))
+        ? Math.min(6, Math.max(1, stepIndex))
         : (primaryAction === 'finish' ? 6 : 4);
     const technicalModes = {
         qr_login_grace_wait: 'qr_wait',
@@ -258,7 +259,8 @@ function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}
         action: primaryAction,
         contractAction: primaryAction,
         mode,
-        ready: primaryAction === 'finish' || stepIndex >= 3,
+        showPrimaryAction: primaryAction === 'finish' || status.needs_user_action === true,
+        ready: primaryAction === 'finish',
     };
 }
 
@@ -355,17 +357,17 @@ function renderGuidedSetupStatus() {
 
     const primary = elements.primary;
     const secondary = elements.secondary;
-    primary.hidden = false;
+    primary.hidden = !viewModel.showPrimaryAction;
     secondary.hidden = true;
     primary.disabled = guidedSetupState.requestInFlight;
     secondary.disabled = guidedSetupState.requestInFlight;
 
-    if (viewModel.action === 'start_scan') {
-        primary.textContent = step === 1 ? '开始扫码登录' : '打开扫码登录';
-        primary.dataset.guidedAction = 'start_scan';
-    } else if (viewModel.action === 'refresh_status' && getGuidedDeadlineSeconds(guidedStatus.retry_at) > 0) {
+    if (!viewModel.showPrimaryAction) {
         primary.hidden = true;
         secondary.hidden = true;
+    } else if (viewModel.action === 'start_scan') {
+        primary.textContent = step === 1 ? '开始扫码登录' : '打开扫码登录';
+        primary.dataset.guidedAction = 'start_scan';
     } else if (
         viewModel.action === 'open_manual_verification'
         && isGuidedManualBrowserAvailable(runtimeStatus)

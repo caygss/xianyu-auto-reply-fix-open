@@ -10,10 +10,14 @@ from collections.abc import Mapping
 from typing import Any, Optional
 
 
-STEP_TOTAL = 3
-ACCOUNT_STEP_INDEX = 1
-DELIVERY_STEP_INDEX = 2
-READY_STEP_INDEX = STEP_TOTAL
+STEP_TOTAL = 6
+PREPARE_STEP_INDEX = 1
+QR_LOGIN_STEP_INDEX = 2
+QR_STABILIZING_STEP_INDEX = 3
+MANUAL_OR_BACKOFF_STEP_INDEX = 4
+RECONNECT_STEP_INDEX = 5
+DELIVERY_STEP_INDEX = RECONNECT_STEP_INDEX
+READY_STEP_INDEX = 6
 
 _VERIFICATION_STATUSES = {
     "verification_pending_manual",
@@ -22,6 +26,23 @@ _VERIFICATION_STATUSES = {
 _WAIT_STATUSES = {
     "qr_login_grace_wait",
     "password_login_backoff_wait",
+}
+_QR_LOGIN_STATUSES = {
+    "qr_login",
+    "qr_login_wait",
+    "qr_login_pending",
+    "qr_login_scanning",
+    "waiting_for_qr",
+    "qr_waiting",
+    "scanning",
+    "scanned",
+}
+_ERROR_STATUSES = {
+    "captcha_max_retries_exceeded",
+    "token_expired_recovery_failed",
+    "token_refresh_failed",
+    "token_refresh_exception",
+    "token_init_failed",
 }
 
 
@@ -167,6 +188,14 @@ def get_user_action_for_runtime(runtime_status: Optional[Mapping[str, Any]]) -> 
             "needs_user_action": False,
         }
 
+    if token_status in _ERROR_STATUSES:
+        return {
+            "action": "refresh_status",
+            "title": "自动验证未完成",
+            "message": "自动验证暂未完成，请重新检查状态。",
+            "needs_user_action": True,
+        }
+
     if connection_state in {"connecting", "reconnecting"}:
         return {
             "action": "refresh_status",
@@ -264,6 +293,36 @@ def _technical_detail(runtime_status: Mapping[str, Any], technical_status: str) 
     return f"内部状态：{technical_status}"
 
 
+def _guided_step_index(
+    runtime_status: Mapping[str, Any],
+    technical_status: str,
+    action: str,
+) -> int:
+    """Map the runtime state to the six visible guided-login steps."""
+    runtime_status = runtime_status if isinstance(runtime_status, Mapping) else {}
+    token_status, connection_state = _normalized_runtime_status(runtime_status)
+
+    if action == "finish":
+        return READY_STEP_INDEX
+    if action == "go_to_delivery_config":
+        return DELIVERY_STEP_INDEX
+    if technical_status == "qr_login_grace_wait":
+        return QR_STABILIZING_STEP_INDEX
+    if (
+        technical_status in _VERIFICATION_STATUSES
+        or technical_status == "password_login_backoff_wait"
+        or technical_status in _ERROR_STATUSES
+    ):
+        return MANUAL_OR_BACKOFF_STEP_INDEX
+    if connection_state in {"connecting", "reconnecting", "disconnected", "connection_unready"}:
+        return RECONNECT_STEP_INDEX
+    if token_status in _QR_LOGIN_STATUSES or connection_state in _QR_LOGIN_STATUSES:
+        return QR_LOGIN_STEP_INDEX
+    if connection_state == "connected":
+        return RECONNECT_STEP_INDEX
+    return PREPARE_STEP_INDEX
+
+
 def build_guided_status(
     runtime_status: Optional[Mapping[str, Any]],
     account_details: Optional[Mapping[str, Any]] = None,
@@ -277,7 +336,7 @@ def build_guided_status(
     retry_at = _retry_deadline(runtime_status, technical_status)
     status = {
         "step_id": "account_connection",
-        "step_index": ACCOUNT_STEP_INDEX,
+        "step_index": _guided_step_index(runtime_status, technical_status, action["action"]),
         "step_total": STEP_TOTAL,
         "title": action["title"],
         "message": action["message"],

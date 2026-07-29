@@ -26,13 +26,14 @@ REQUIRED_FIELDS = {
 
 
 @pytest.mark.parametrize(
-    ("runtime_status", "expected_action"),
+    ("runtime_status", "expected_action", "expected_step"),
     [
-        ({"connection_state": "reconnecting"}, "refresh_status"),
-        ({"token_refresh_status": "qr_login_grace_wait", "qr_login_grace_until": 130}, "refresh_status"),
+        ({"connection_state": "reconnecting"}, "refresh_status", 5),
+        ({"token_refresh_status": "qr_login_grace_wait", "qr_login_grace_until": 130}, "refresh_status", 3),
         (
             {"token_refresh_status": "password_login_backoff_wait", "token_refresh_backoff_until": 130},
             "refresh_status",
+            4,
         ),
         (
             {
@@ -40,11 +41,12 @@ REQUIRED_FIELDS = {
                 "vnc_manual_action_available": True,
             },
             "open_manual_verification",
+            4,
         ),
-        ({"connection_state": "connected", "message_stream_ready": True}, "finish"),
+        ({"connection_state": "connected", "message_stream_ready": True}, "finish", 6),
     ],
 )
-def test_guided_status_exposes_stable_fields_and_safe_chinese_copy(runtime_status, expected_action):
+def test_guided_status_exposes_stable_fields_and_safe_chinese_copy(runtime_status, expected_action, expected_step):
     status = build_guided_status(
         runtime_status,
         account_details={
@@ -58,6 +60,8 @@ def test_guided_status_exposes_stable_fields_and_safe_chinese_copy(runtime_statu
 
     assert REQUIRED_FIELDS <= status.keys()
     assert status["primary_action"] == expected_action
+    assert status["step_index"] == expected_step
+    assert status["step_total"] == 6
     assert status["technical_status"]
     assert "cookie-secret" not in repr(status)
     assert "password-secret" not in repr(status)
@@ -72,7 +76,8 @@ def test_connected_account_with_delivery_ready_can_wait_for_order():
     )
 
     assert status["step_id"] == "ready_to_wait_for_order"
-    assert status["step_index"] == status["step_total"]
+    assert status["step_index"] == 6
+    assert status["step_total"] == 6
     assert status["needs_user_action"] is False
     assert status["message"] == "账号已连接，交付配置已完成，现在可以等待买家下单。"
 
@@ -82,6 +87,7 @@ def test_connected_account_without_delivery_summary_must_go_to_delivery_config()
 
     assert status["step_id"] == "delivery_config"
     assert status["primary_action"] == "go_to_delivery_config"
+    assert status["step_index"] == 5
     assert status["needs_user_action"] is True
 
 
@@ -216,6 +222,26 @@ def test_runtime_deadline_fields_drive_dynamic_remaining_seconds(monkeypatch):
     assert qr_status["remaining_seconds"] == 30
     assert backoff_status["retry_at"] == 140
     assert backoff_status["remaining_seconds"] == 40
+
+
+@pytest.mark.parametrize(
+    ("runtime_status", "expected_step"),
+    [
+        ({"connection_state": "not_running"}, 1),
+        ({"token_refresh_status": "qr_login"}, 2),
+        ({"token_refresh_status": "qr_login_grace_wait", "qr_login_grace_until": 130}, 3),
+        ({"token_refresh_status": "password_login_backoff_wait", "token_refresh_backoff_until": 130}, 4),
+        ({"connection_state": "connecting"}, 5),
+        ({"connection_state": "connected", "message_stream_ready": True}, 6),
+    ],
+)
+def test_guided_step_index_tracks_the_real_login_state(runtime_status, expected_step, monkeypatch):
+    monkeypatch.setattr("guided_setup_service.time.time", lambda: 100)
+
+    status = build_guided_status(runtime_status, delivery_summary={"configured": True})
+
+    assert status["step_index"] == expected_step
+    assert 1 <= status["step_index"] <= 6
 
 
 def test_format_remaining_seconds_is_dynamic_and_never_negative():
