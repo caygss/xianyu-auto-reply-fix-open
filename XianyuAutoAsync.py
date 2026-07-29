@@ -8,6 +8,7 @@ import os
 import random
 import secrets
 import threading
+import math
 from datetime import datetime
 from enum import Enum
 from urllib.parse import parse_qs, urlparse
@@ -590,32 +591,32 @@ class XianyuLive:
             return
         cls._qr_login_grace_state.pop(cookie_id, None)
 
-    def _get_qr_login_grace_until(self) -> int:
+    def _get_qr_login_grace_until(self) -> float:
         try:
             account_info = db_manager.get_cookie_details(self.cookie_id) or {}
-            return int(account_info.get('qr_login_grace_until') or 0)
+            return float(account_info.get('qr_login_grace_until') or 0)
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】读取扫码稳定期截止时间失败: {self._safe_str(e)}")
-            return 0
+            return 0.0
 
     def _get_qr_login_grace_remaining_seconds(self, current_time: Optional[float] = None) -> int:
-        current_time = current_time or time.time()
+        current_time = time.time() if current_time is None else float(current_time)
         grace_until = self._get_qr_login_grace_until()
-        return max(0, int(grace_until - current_time))
+        return max(0, math.ceil(grace_until - current_time)) if grace_until > current_time else 0
 
     def _is_in_qr_login_grace_period(self, current_time: Optional[float] = None) -> bool:
         return self._get_qr_login_grace_remaining_seconds(current_time) > 0
 
-    def _set_qr_login_grace_until(self, grace_until: int) -> None:
-        db_manager.set_cookie_qr_login_grace_until(self.cookie_id, int(grace_until or 0))
+    def _set_qr_login_grace_until(self, grace_until: float) -> None:
+        db_manager.set_cookie_qr_login_grace_until(self.cookie_id, float(grace_until or 0))
 
     def _clear_qr_login_grace_period(self) -> None:
         self.clear_qr_login_grace(self.cookie_id)
         self._set_qr_login_grace_until(0)
 
-    def _enter_qr_login_grace_period(self, *, stage: str = 'qr_login_success') -> int:
+    def _enter_qr_login_grace_period(self, *, stage: str = 'qr_login_success') -> float:
         now = time.time()
-        grace_until = int(now + self.get_qr_login_grace_ttl_seconds())
+        grace_until = now + self.get_qr_login_grace_ttl_seconds()
         self.mark_qr_login_grace(self.cookie_id, stage=stage, entered_at=now)
         self._set_qr_login_grace_until(grace_until)
         return grace_until

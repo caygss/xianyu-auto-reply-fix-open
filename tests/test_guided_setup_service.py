@@ -220,6 +220,7 @@ def test_runtime_deadline_fields_drive_dynamic_remaining_seconds(monkeypatch):
 
 def test_format_remaining_seconds_is_dynamic_and_never_negative():
     assert format_remaining_seconds(130, now=100) == 30
+    assert format_remaining_seconds(1600.9, now=1600.1) == 1
     assert format_remaining_seconds(99, now=100) == 0
     assert format_remaining_seconds(
         datetime.fromtimestamp(130, tz=timezone.utc),

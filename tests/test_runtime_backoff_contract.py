@@ -196,6 +196,23 @@ def test_float_qr_grace_deadline_is_preserved_and_blocks_before_expiry(monkeypat
     assert runtime_status["token_refresh_status"] == "qr_login_grace_wait"
 
 
+def test_xianyu_live_qr_grace_helpers_preserve_float_deadline_and_block(monkeypatch):
+    live = XianyuLive.__new__(XianyuLive)
+    live.cookie_id = "account-1"
+    live.last_token_refresh_status = None
+    live.last_token_refresh_error_message = None
+    monkeypatch.setattr(
+        "XianyuAutoAsync.db_manager.get_cookie_details",
+        lambda cid: {"qr_login_grace_until": 1600.9},
+    )
+
+    assert live._get_qr_login_grace_until() == 1600.9
+    assert live._get_qr_login_grace_remaining_seconds(1600.1) == 1
+    assert live._should_defer_auth_recovery_for_qr_grace(1600.1) is True
+    assert live.last_token_refresh_status == "qr_login_grace_wait"
+    assert "1" in live.last_token_refresh_error_message
+
+
 def test_expired_backend_deadline_reenables_retry_without_static_error_message(monkeypatch):
     live = _fake_live_instance()
     _patch_runtime(monkeypatch, live, None, 131)

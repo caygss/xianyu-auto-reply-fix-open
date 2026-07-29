@@ -71,7 +71,7 @@ def format_remaining_seconds(deadline: Any, now: Any = None) -> int:
     if now_timestamp is None:
         now_timestamp = time.time()
     try:
-        return max(0, int(deadline_timestamp - now_timestamp))
+        return max(0, math.ceil(deadline_timestamp - now_timestamp))
     except (OverflowError, ValueError):
         return 0
 

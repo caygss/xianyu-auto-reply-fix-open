@@ -328,7 +328,7 @@ class DBManager:
                 auto_red_flower INTEGER DEFAULT 0,
                 remark TEXT DEFAULT '',
                 status_note TEXT DEFAULT '',
-                qr_login_grace_until INTEGER DEFAULT 0,
+                qr_login_grace_until REAL DEFAULT 0,
                 pause_duration INTEGER DEFAULT 10,
                 username TEXT DEFAULT '',
                 password TEXT DEFAULT '',
@@ -1064,7 +1064,7 @@ Cookie数量: {cookie_count}
 
             if 'qr_login_grace_until' not in cookie_columns:
                 logger.info("添加cookies表的qr_login_grace_until列...")
-                cursor.execute("ALTER TABLE cookies ADD COLUMN qr_login_grace_until INTEGER DEFAULT 0")
+                cursor.execute("ALTER TABLE cookies ADD COLUMN qr_login_grace_until REAL DEFAULT 0")
                 logger.info("数据库迁移完成：添加qr_login_grace_until列")
 
             # 检查cookies表是否存在pause_duration列
@@ -2375,7 +2375,7 @@ Cookie数量: {cookie_count}
                         'auto_confirm': bool(result[3]),
                         'remark': result[4] or '',
                         'status_note': result[5] or '',
-                        'qr_login_grace_until': int(result[6] or 0),
+                        'qr_login_grace_until': float(result[6] or 0),
                         'pause_duration': result[7] if result[7] is not None else 10,  # 0是有效值，表示不暂停
                         'username': result[8] or '',
                         'password': password,
@@ -2432,14 +2432,15 @@ Cookie数量: {cookie_count}
                 logger.error(f"更新账号状态文案失败: {e}")
                 return False
 
-    def set_cookie_qr_login_grace_until(self, cookie_id: str, grace_until: int) -> bool:
+    def set_cookie_qr_login_grace_until(self, cookie_id: str, grace_until: float) -> bool:
         """更新账号扫码登录稳定期截止时间"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "UPDATE cookies SET qr_login_grace_until = ? WHERE id = ?", (int(grace_until or 0), cookie_id))
+                grace_until_value = float(grace_until or 0)
+                self._execute_sql(cursor, "UPDATE cookies SET qr_login_grace_until = ? WHERE id = ?", (grace_until_value, cookie_id))
                 self.conn.commit()
-                logger.info(f"更新账号 {cookie_id} 扫码稳定期截止时间: {int(grace_until or 0)}")
+                logger.info(f"更新账号 {cookie_id} 扫码稳定期截止时间: {grace_until_value}")
                 return True
             except Exception as e:
                 logger.error(f"更新账号扫码稳定期失败: {e}")
