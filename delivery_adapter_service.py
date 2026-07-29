@@ -202,7 +202,7 @@ class ProviderApiAdapter:
                     "provider_http",
                 ) from exc
             except Exception as exc:
-                if not isinstance(exc, (URLError, TimeoutError, ConnectionError)):
+                if not isinstance(exc, (URLError, TimeoutError, OSError, ConnectionError)):
                     raise DeliveryDispatchError(
                         "provider_transport_error",
                         "外部交付服务调用失败，请检查适配器或配置",

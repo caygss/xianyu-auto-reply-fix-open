@@ -12210,6 +12210,16 @@ class XianyuLive:
                 logger.error(block_reason)
                 return build_result(False, error=block_reason, matched_rule=rule, match_mode_value='blocked_rule_mode_mismatch')
 
+            configured_delivery = None
+            if delivery_reservation_id:
+                configured_delivery = self._prepare_configured_delivery(
+                    card_id=rule['card_id'],
+                    order_id=order_id,
+                    buyer_id=send_user_id,
+                    reservation_id=delivery_reservation_id,
+                    item_id=item_id,
+                )
+
             # 注释掉自动发货时的商品信息保存逻辑，避免重复保存导致item_detail字段内容累积
             # 商品信息应该在商品列表获取、订单详情获取等其他环节已经保存过了
             # 保存商品信息到数据库（需要有商品标题才保存）
@@ -12309,7 +12319,10 @@ class XianyuLive:
                 data_reservation = None
 
                 # 根据卡券类型处理发货内容
-                if rule['card_type'] == 'api':
+                if configured_delivery is not None:
+                    delivery_content = configured_delivery.get('content')
+
+                elif rule['card_type'] == 'api':
                     # API类型：调用API获取内容，传入订单和商品信息用于动态参数替换
                     delivery_content = await self._get_api_card_content(rule, order_id, item_id, send_user_id, spec_name, spec_value)
 

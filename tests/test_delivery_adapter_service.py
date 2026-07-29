@@ -241,6 +241,25 @@ def test_provider_failure_is_readable_domain_error_and_does_not_log_token(servic
     assert "secret-token" not in "".join(sink)
 
 
+def test_provider_retries_oserror_from_transport(services):
+    _, configs, inventory = services
+    configs.save(
+        1,
+        7,
+        "account-a",
+        "provider_api",
+        {"endpoint": "https://provider.test/issue", "token": "t", "max_retries": 1},
+    )
+    transport = FakeTransport(
+        [OSError("socket closed"), ProviderResponse(200, {}, b'{"content":"ok"}')]
+    )
+
+    result = DeliveryDispatcher(configs, inventory, transport=transport).prepare(request())
+
+    assert result["content"] == "ok"
+    assert len(transport.calls) == 2
+
+
 def test_provider_rejects_oversized_response_without_returning_body(services):
     _, configs, inventory = services
     configs.save(
@@ -427,3 +446,64 @@ def test_xianyu_delivery_seam_reuses_existing_text_steps(monkeypatch):
     assert captured["request"].card_id == 7
     assert captured["request"].account_id == "account-a"
     assert captured["request"].reservation_id == "reservation-1"
+
+
+def test_xianyu_auto_delivery_routes_reserved_content_through_delivery_seam(monkeypatch):
+    from XianyuAutoAsync import XianyuLive
+
+    captured = {}
+    live = XianyuLive.__new__(XianyuLive)
+    live.user_id = 1
+    live.cookie_id = "account-a"
+    live.myid = "buyer-1"
+
+    async def fetch_order_detail_info(*args, **kwargs):
+        return None
+
+    def prepare_configured_delivery(**kwargs):
+        captured.update(kwargs)
+        return {"mode": "imported_card", "content": "reserved-secret", "content_type": "text"}
+
+    monkeypatch.setattr(live, "fetch_order_detail_info", fetch_order_detail_info)
+    monkeypatch.setattr(live, "_prepare_configured_delivery", prepare_configured_delivery)
+    monkeypatch.setattr("XianyuAutoAsync.db_manager.get_item_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "XianyuAutoAsync.db_manager.get_item_multi_spec_status",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        "XianyuAutoAsync.db_manager.get_delivery_rules_by_keyword",
+        lambda *args, **kwargs: [
+            {
+                "id": 11,
+                "keyword": "item title",
+                "card_name": "card",
+                "card_type": "text",
+                "card_id": 7,
+                "text_content": "legacy-content",
+                "card_description": "",
+            }
+        ],
+    )
+
+    import asyncio
+
+    result = asyncio.run(
+        live._auto_delivery(
+            "item-7",
+            "item title",
+            "order-1",
+            "buyer-1",
+            include_meta=True,
+            delivery_reservation_id="reservation-1",
+        )
+    )
+
+    assert result["content"] == "reserved-secret"
+    assert captured == {
+        "card_id": 7,
+        "order_id": "order-1",
+        "buyer_id": "buyer-1",
+        "reservation_id": "reservation-1",
+        "item_id": "item-7",
+    }
