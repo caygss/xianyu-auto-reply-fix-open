@@ -101,11 +101,11 @@ function isGuidedRuntimeReady(runtimeStatus, guidedStatus) {
         && ['finish', 'go_to_delivery_config'].includes(String(guidedStatus?.primary_action || '').trim());
 }
 
-function hasGuidedActiveBrowser(runtimeStatus, guidedStatus) {
+function isGuidedManualBrowserAvailable(runtimeStatus, guidedStatus) {
     const runtimeState = String(runtimeStatus?.manual_browser_session_status || '').trim().toLowerCase();
     return GUIDED_SETUP_ACTIVE_BROWSER_STATES.has(runtimeState)
         && runtimeStatus?.vnc_manual_action_available === true
-        && guidedStatus?.manual_browser_available === true;
+        && (guidedStatus?.manual_browser_available === undefined || guidedStatus.manual_browser_available === true);
 }
 
 function getGuidedSetupAccount() {
@@ -115,36 +115,9 @@ function getGuidedSetupAccount() {
         || null;
 }
 
-function getGuidedSetupStep(account) {
-    if (!account?.guidedStatus) {
-        return guidedSetupState.scanStarted ? 2 : 1;
-    }
-
-    const guidedStatus = account.guidedStatus;
-    const technicalStatus = String(guidedStatus.technical_status || '').trim();
-    if (technicalStatus === 'qr_login_grace_wait') return 3;
-    if (
-        technicalStatus === 'verification_pending_manual'
-        || technicalStatus === 'manual_verification_required'
-        || technicalStatus === 'password_login_backoff_wait'
-        || ['open_manual_verification', 'complete_manual_verification'].includes(guidedStatus.primary_action)
-    ) {
-        return 4;
-    }
-    if (isGuidedRuntimeReady(account.runtimeStatus, guidedStatus)) return 6;
-    if (
-        account.runtimeStatus?.connection_state === 'connected'
-        || technicalStatus === 'connected'
-        || ['finish', 'go_to_delivery_config'].includes(guidedStatus.primary_action)
-    ) {
-        return 5;
-    }
-    return 4;
-}
-
-function getGuidedSetupCopy(step, account) {
+function getGuidedSetupCopy(step, account, viewModel = {}) {
     const guidedStatus = account?.guidedStatus || {};
-    const hasActiveBrowser = hasGuidedActiveBrowser(account?.runtimeStatus, guidedStatus);
+    const hasActiveBrowser = isGuidedManualBrowserAvailable(account?.runtimeStatus, guidedStatus);
     const copies = {
         1: {
             title: '准备登录',
@@ -181,7 +154,113 @@ function getGuidedSetupCopy(step, account) {
             notice: '首次登录已完成，后续请保持浏览器窗口打开。',
         },
     };
+    if (viewModel.mode === 'qr_wait') {
+        return {
+            title: '等待账号稳定',
+            message: '扫码登录已完成，系统正在稳定账号，当前无需操作。',
+            notice: '请保持浏览器窗口打开，不要重复扫码，等待倒计时结束。',
+        };
+    }
+    if (viewModel.mode === 'backoff_wait') {
+        return {
+            title: '等待冷却结束',
+            message: '自动验证暂未完成，平台正在冷却，当前无需操作。',
+            notice: '冷却期间请等待，保持浏览器窗口打开，不要重复扫码。',
+        };
+    }
+    if (viewModel.mode === 'reconnect_wait' || viewModel.mode === 'connected_wait') {
+        return {
+            title: '正在恢复连接',
+            message: '账号正在恢复连接，当前无需操作，系统会继续等待状态稳定。',
+            notice: '请保持浏览器窗口打开，连接恢复后会自动继续检查。',
+        };
+    }
+    if (viewModel.mode === 'error') {
+        return {
+            title: '需要重新检查',
+            message: '自动验证暂未完成，请点击下一步重新检查账号状态。',
+            notice: '请保持浏览器窗口打开，不要重复扫码；如果仍未完成，请等待后再检查。',
+        };
+    }
+    if (viewModel.mode === 'ready') {
+        return {
+            title: '验证可用',
+            message: '账号已连接并通过可用性检查，请确认后完成首次登录。',
+            notice: '首次登录已完成，后续请保持浏览器窗口打开。',
+        };
+    }
+    if (viewModel.mode === 'manual' && viewModel.action === 'complete_manual_verification') {
+        return {
+            title: '确认人工验证',
+            message: '完成验证页面中的操作后，请点击“我已完成验证”，系统会重新检查账号。',
+            notice: hasActiveBrowser
+                ? '请保持浏览器窗口打开，不要重复扫码；完成验证后再点击确认。'
+                : '当前没有可接管的浏览器，请先完成已打开的验证页面。',
+        };
+    }
     return copies[step] || copies[1];
+}
+
+function getGuidedSetupStatusViewModel(guidedStatus, runtimeStatus, options = {}) {
+    const status = guidedStatus && typeof guidedStatus === 'object' ? guidedStatus : null;
+    if (!status) {
+        return {
+            step: options.scanStarted ? 2 : 1,
+            action: 'start_scan',
+            mode: 'prepare',
+            ready: false,
+        };
+    }
+
+    const primaryAction = String(status.primary_action || 'refresh_status').trim();
+    const technicalStatus = String(status.technical_status || '').trim();
+    const stepIndex = Number(status.step_index);
+    const runtimeReady = isGuidedRuntimeReady(runtimeStatus, status);
+    const errorStatuses = new Set([
+        'unknown',
+        'failed',
+        'token_refresh_failed',
+        'token_refresh_exception',
+        'captcha_max_retries_exceeded',
+        'token_init_failed',
+    ]);
+
+    if (technicalStatus === 'qr_login_grace_wait') {
+        return { step: 3, action: 'wait', mode: 'qr_wait', ready: false };
+    }
+    if (technicalStatus === 'password_login_backoff_wait') {
+        return { step: 4, action: 'wait', mode: 'backoff_wait', ready: false };
+    }
+    if (technicalStatus === 'connecting' || technicalStatus === 'reconnecting') {
+        return { step: 5, action: 'wait', mode: 'reconnect_wait', ready: false };
+    }
+    if (
+        technicalStatus === 'verification_pending_manual'
+        || technicalStatus === 'manual_verification_required'
+        || primaryAction === 'open_manual_verification'
+        || primaryAction === 'complete_manual_verification'
+    ) {
+        return {
+            step: 4,
+            action: ['open_manual_verification', 'complete_manual_verification'].includes(primaryAction)
+                ? primaryAction
+                : 'open_manual_verification',
+            mode: 'manual',
+            ready: false,
+        };
+    }
+    if (stepIndex >= 3 || primaryAction === 'finish') {
+        return { step: 6, action: 'finish_local', mode: 'ready', ready: runtimeReady || stepIndex >= 3 };
+    }
+    if (primaryAction === 'go_to_delivery_config') {
+        return runtimeReady
+            ? { step: 6, action: 'finish_local', mode: 'ready', ready: true }
+            : { step: 5, action: 'wait', mode: 'connected_wait', ready: false };
+    }
+    if (errorStatuses.has(technicalStatus) || primaryAction === 'refresh_status') {
+        return { step: 4, action: 'refresh_status', mode: 'error', ready: false };
+    }
+    return { step: 4, action: 'refresh_status', mode: 'error', ready: false };
 }
 
 function getGuidedDeadlineSeconds(deadline, now = Date.now()) {
@@ -201,19 +280,22 @@ function updateGuidedSetupCountdown(now = Date.now()) {
     const { countdown } = getGuidedSetupElements();
     if (!countdown) return;
     const deadline = guidedSetupState.guidedStatus?.retry_at;
-    const remaining = getGuidedDeadlineSeconds(deadline, now);
-    if (remaining > 0) {
-        countdown.hidden = false;
-        countdown.textContent = `预计还需等待 ${remaining} 秒，倒计时结束后会自动重新检查。`;
+    const remainingSeconds = getGuidedDeadlineSeconds(deadline, now);
+    if (remainingSeconds <= 0) {
+        countdown.hidden = true;
+        countdown.textContent = '';
+        const deadlineKey = String(deadline || '');
+        if (deadlineKey && !guidedSetupState.requestInFlight && guidedSetupState.expiredDeadline !== deadlineKey) {
+            guidedSetupState.expiredDeadline = deadlineKey;
+            loadGuidedSetupStatus({ force: true });
+        }
         return;
     }
 
-    countdown.hidden = true;
-    countdown.textContent = '';
-    const deadlineKey = String(deadline || '');
-    if (deadlineKey && !guidedSetupState.requestInFlight && guidedSetupState.expiredDeadline !== deadlineKey) {
-        guidedSetupState.expiredDeadline = deadlineKey;
-        refreshGuidedSetupStatus({ force: true });
+    if (remainingSeconds > 0) {
+        countdown.hidden = false;
+        countdown.textContent = `预计还需等待 ${remainingSeconds} 秒，倒计时结束后会自动重新检查。`;
+        return;
     }
 }
 
@@ -233,34 +315,29 @@ function scheduleGuidedSetupPoll() {
     if (!document.getElementById('accounts-section')?.classList.contains('active')) return;
     guidedSetupPollTimer = setTimeout(() => {
         guidedSetupPollTimer = null;
-        refreshGuidedSetupStatus();
+        loadGuidedSetupStatus();
     }, GUIDED_SETUP_POLL_INTERVAL);
 }
 
-function renderGuidedSetup() {
+function renderGuidedSetupStatus() {
     const elements = getGuidedSetupElements();
     if (!elements.panel) return;
-
-    const needsSetup = guidedSetupState.accounts.length === 0
-        || guidedSetupState.accounts.some(account => !isGuidedRuntimeReady(account.runtimeStatus, account.guidedStatus));
-    if (!needsSetup) {
-        elements.panel.hidden = true;
-        elements.reopen.hidden = true;
-        if (guidedSetupPollTimer) clearTimeout(guidedSetupPollTimer);
-        if (guidedSetupCountdownTimer) clearInterval(guidedSetupCountdownTimer);
-        return;
-    }
 
     elements.reopen.hidden = !guidedSetupState.hiddenByUser;
     elements.panel.hidden = guidedSetupState.hiddenByUser;
     if (guidedSetupState.hiddenByUser) return;
 
     const account = getGuidedSetupAccount();
-    const step = getGuidedSetupStep(account);
-    const copy = getGuidedSetupCopy(step, account);
+    const viewModel = getGuidedSetupStatusViewModel(
+        account?.guidedStatus,
+        account?.runtimeStatus,
+        { scanStarted: guidedSetupState.scanStarted },
+    );
+    const step = viewModel.step;
+    const copy = getGuidedSetupCopy(step, account, viewModel);
     const guidedStatus = account?.guidedStatus || {};
     const runtimeStatus = account?.runtimeStatus || {};
-    const hasActiveBrowser = hasGuidedActiveBrowser(runtimeStatus, guidedStatus);
+    const hasActiveBrowser = isGuidedManualBrowserAvailable(runtimeStatus, guidedStatus);
 
     elements.account.textContent = account?.id || '准备添加账号';
     elements.step.textContent = `第 ${step} 步，共 6 步`;
@@ -285,28 +362,29 @@ function renderGuidedSetup() {
     primary.disabled = guidedSetupState.requestInFlight;
     secondary.disabled = guidedSetupState.requestInFlight;
 
-    if (step <= 2 && !account?.guidedStatus) {
+    if (viewModel.action === 'start_scan') {
         primary.textContent = step === 1 ? '开始扫码登录' : '打开扫码登录';
         primary.dataset.guidedAction = 'start_scan';
-    } else if (step === 3) {
+    } else if (viewModel.action === 'wait') {
         primary.hidden = true;
-        secondary.hidden = false;
-        secondary.textContent = '重新检查状态';
-        secondary.dataset.guidedAction = 'refresh_status';
-    } else if (step === 4 && hasActiveBrowser) {
+        secondary.hidden = true;
+    } else if (
+        (viewModel.action === 'open_manual_verification' || viewModel.action === 'complete_manual_verification')
+        && hasActiveBrowser
+    ) {
         primary.textContent = '接管验证';
         primary.dataset.guidedAction = 'takeover_browser';
         secondary.hidden = false;
         secondary.textContent = '我已完成验证';
         secondary.dataset.guidedAction = 'complete_manual_verification';
-    } else if (step === 4) {
+    } else if (viewModel.action === 'open_manual_verification') {
         primary.textContent = '重新打开验证页面';
         primary.dataset.guidedAction = 'open_manual_verification';
-        secondary.hidden = false;
-        secondary.textContent = '重新检查状态';
-        secondary.dataset.guidedAction = 'refresh_status';
-    } else if (step === 5) {
-        primary.textContent = '检查连接可用性';
+    } else if (viewModel.action === 'complete_manual_verification') {
+        primary.textContent = '我已完成验证';
+        primary.dataset.guidedAction = 'complete_manual_verification';
+    } else if (viewModel.action === 'refresh_status') {
+        primary.textContent = '重新检查状态';
         primary.dataset.guidedAction = 'refresh_status';
     } else {
         primary.textContent = '完成首次登录';
@@ -319,13 +397,13 @@ function renderGuidedSetup() {
 
 function toggleGuidedSetup(visible) {
     guidedSetupState.hiddenByUser = !visible;
-    renderGuidedSetup();
+    renderGuidedSetupStatus();
     if (visible && !guidedSetupState.accounts.length && !guidedSetupState.guidedStatus) {
-        refreshGuidedSetupStatus();
+        loadGuidedSetupStatus();
     }
 }
 
-async function refreshGuidedSetupStatus(options = {}) {
+async function loadGuidedSetupStatus(options = {}) {
     if (guidedSetupState.requestInFlight && !options.force) return;
     if (!document.getElementById('guidedSetupPanel')) return;
     guidedSetupState.requestInFlight = true;
@@ -343,7 +421,7 @@ async function refreshGuidedSetupStatus(options = {}) {
         if (deadlineKey !== guidedSetupState.expiredDeadline && getGuidedDeadlineSeconds(deadlineKey) > 0) {
             guidedSetupState.expiredDeadline = '';
         }
-        renderGuidedSetup();
+        renderGuidedSetupStatus();
     } catch (error) {
         const { error: errorElement, panel, reopen } = getGuidedSetupElements();
         if (panel && !guidedSetupState.hiddenByUser) panel.hidden = false;
@@ -366,12 +444,12 @@ async function handleGuidedSetupAction(action) {
 
     if (selectedAction === 'start_scan') {
         guidedSetupState.scanStarted = true;
-        renderGuidedSetup();
+        renderGuidedSetupStatus();
         showQRCodeLogin();
         return;
     }
     if (selectedAction === 'takeover_browser') {
-        if (!hasGuidedActiveBrowser(account?.runtimeStatus, account?.guidedStatus)) return;
+        if (!isGuidedManualBrowserAvailable(account?.runtimeStatus, account?.guidedStatus)) return;
         window.open(getNoVncUrl(), '_blank', 'noopener');
         return;
     }
@@ -381,7 +459,7 @@ async function handleGuidedSetupAction(action) {
     }
 
     guidedSetupState.requestInFlight = true;
-    renderGuidedSetup();
+    renderGuidedSetupStatus();
     try {
         const response = await fetchJSON(`${apiBase}${GUIDED_SETUP_ACTION_ENDPOINT}`, {
             method: 'POST',
@@ -391,7 +469,7 @@ async function handleGuidedSetupAction(action) {
         if (response?.guided_status && cookieId) {
             guidedSetupState.guidedStatus = response.guided_status;
         }
-        await refreshGuidedSetupStatus({ force: true });
+        await loadGuidedSetupStatus({ force: true });
     } catch (error) {
         const { error: errorElement } = getGuidedSetupElements();
         if (errorElement) {
@@ -400,7 +478,7 @@ async function handleGuidedSetupAction(action) {
         }
     } finally {
         guidedSetupState.requestInFlight = false;
-        renderGuidedSetup();
+        renderGuidedSetupStatus();
     }
 }
 
@@ -5671,7 +5749,7 @@ async function loadCookies() {
     toggleLoading(false);
     if (document.getElementById('accounts-section')?.classList.contains('active')) {
         loadAboutDiagnostics();
-        refreshGuidedSetupStatus();
+        loadGuidedSetupStatus();
     }
     }
 }
@@ -24886,4 +24964,14 @@ async function savePolishSchedule() {
     } catch (error) {
         console.error('保存定时擦亮设置失败:', error);
     }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        getGuidedDeadlineSeconds,
+        getGuidedSetupStatusViewModel,
+        isGuidedManualBrowserAvailable,
+        loadGuidedSetupStatus,
+        renderGuidedSetupStatus,
+    };
 }

@@ -41,3 +41,16 @@ def test_wizard_has_clear_actions_and_responsive_styles():
     assert "type=\"button\"" in INDEX
     assert "@media (max-width: 768px)" in CSS
     assert "grid-template-columns: 1fr" in CSS
+
+
+def test_guided_status_contract_exports_named_render_load_and_browser_helpers():
+    assert "function renderGuidedSetupStatus" in APP
+    assert "function loadGuidedSetupStatus" in APP
+    assert "function isGuidedManualBrowserAvailable" in APP
+    assert "module.exports" in APP
+
+
+def test_ready_state_keeps_the_panel_visible_for_step_six_confirmation():
+    assert "elements.panel.hidden = true" not in APP
+    assert "验证可用" in APP
+    assert "完成首次登录" in APP
