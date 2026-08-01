@@ -3,6 +3,7 @@
 import inspect
 import json
 import re
+import sqlite3
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping
 
@@ -68,6 +69,13 @@ def normalize_order_line_id(order_line_id: Any, item_id: Any = None) -> str:
     return "default"
 
 
+def build_idempotency_key(user_id: int, account_id: str, order_id: str,
+                          order_line_id: str, card_id: int) -> str:
+    return "|".join(
+        (str(user_id), str(account_id), str(order_id), str(order_line_id), str(card_id))
+    )
+
+
 class DeliveryOrchestrationService:
     def __init__(self, db_manager, inventory_service, dispatcher):
         self.db = db_manager
@@ -106,10 +114,16 @@ class DeliveryOrchestrationService:
         quantity = normalize_quantity(request.quantity)
         order_line_id = normalize_order_line_id(request.order_line_id, request.item_id)
         mode, config = self._config(request.delivery_config)
-        idempotency_key = str(request.idempotency_key or "").strip()
-        if not idempotency_key:
-            idempotency_key = "|".join(
-                (str(user_id), account_id, order_id, order_line_id, str(card_id))
+        idempotency_key = build_idempotency_key(
+            user_id, account_id, order_id, order_line_id, card_id
+        )
+        supplied_key = str(request.idempotency_key or "").strip()
+        if supplied_key and supplied_key != idempotency_key:
+            raise DeliveryOrchestrationError(
+                "idempotency_key_mismatch",
+                "骞傜瓑閿繀椤讳笌璁㈠崟銆佽銆佽处鍙峰拰鍟嗗搧浣滅敤鍩熶竴鑷?",
+                "validation",
+                expected=idempotency_key,
             )
         context = dict(request.context or {})
         context.update(
@@ -182,7 +196,7 @@ class DeliveryOrchestrationService:
                 cursor.execute("BEGIN IMMEDIATE")
                 cursor.execute(
                     """
-                    INSERT OR IGNORE INTO delivery_orchestration_states(
+                    INSERT INTO delivery_orchestration_states(
                         user_id, card_id, account_id, order_id, order_line_id,
                         quantity, mode, idempotency_key, status, result_meta,
                         created_at, updated_at
@@ -218,6 +232,51 @@ class DeliveryOrchestrationService:
                         request.order_line_id,
                     ),
                 ).fetchone()
+                if row is None:
+                    row = cursor.execute(
+                        """
+                        SELECT id, user_id, card_id, account_id, order_id, order_line_id,
+                               quantity, mode, idempotency_key, reservation_id, status,
+                               result_meta, last_error_code, last_error, created_at,
+                               updated_at, sent_at
+                        FROM delivery_orchestration_states
+                        WHERE idempotency_key = ?
+                        """,
+                        (request.idempotency_key,),
+                    ).fetchone()
+                if row is None:
+                    raise DeliveryOrchestrationError(
+                        "idempotency_state_missing",
+                        "骞傜瓑鐘舵€佸垱寤哄悗鏃犳硶璇诲洖",
+                        "storage",
+                    )
+                self.db.conn.commit()
+            except sqlite3.IntegrityError:
+                row = cursor.execute(
+                    """
+                    SELECT id, user_id, card_id, account_id, order_id, order_line_id,
+                           quantity, mode, idempotency_key, reservation_id, status,
+                           result_meta, last_error_code, last_error, created_at,
+                           updated_at, sent_at
+                    FROM delivery_orchestration_states
+                    WHERE user_id = ? AND card_id = ? AND account_id = ?
+                      AND order_id = ? AND order_line_id = ?
+                    """,
+                    (
+                        request.user_id,
+                        request.card_id,
+                        request.account_id,
+                        request.order_id,
+                        request.order_line_id,
+                    ),
+                ).fetchone()
+                if row is None:
+                    self.db.conn.rollback()
+                    raise DeliveryOrchestrationError(
+                        "idempotency_state_missing",
+                        "骞傜瓑鐘舵€佸垱寤哄悗鏃犳硶璇诲洖",
+                        "storage",
+                    )
                 self.db.conn.commit()
             except Exception:
                 self.db.conn.rollback()
@@ -289,9 +348,10 @@ class DeliveryOrchestrationService:
             contents = contents[:1]
         return contents
 
-    def _result(self, state, *, contents=None, request=None):
+    def _result(self, state, *, contents=None, request=None, status_override=None,
+                claimed=False):
         result = {
-            "status": state["status"],
+            "status": status_override or state["status"],
             "user_id": state["user_id"],
             "card_id": state["card_id"],
             "account_id": state["account_id"],
@@ -305,19 +365,52 @@ class DeliveryOrchestrationService:
             "error": state.get("last_error"),
             "meta": state.get("result_meta") or {},
         }
+        if status_override:
+            result["state"] = state["status"]
+        if claimed:
+            result["claimed"] = True
         if contents is not None:
             result["contents"] = list(contents)
         return result
 
+    def _claim_sending(self, state_id: int, allowed_statuses):
+        allowed_statuses = tuple(allowed_statuses)
+        placeholders = ",".join("?" for _ in allowed_statuses)
+        with self.db.lock:
+            cursor = self.db.conn.execute(
+                f"""
+                UPDATE delivery_orchestration_states
+                SET status = 'sending', updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status IN ({placeholders})
+                """,
+                (state_id, *allowed_statuses),
+            )
+            self.db.conn.commit()
+        return cursor.rowcount == 1
+
     def _prepare(self, request: DeliveryOrchestrationRequest, *, allow_retry=False):
         request = self._normalize_request(request)
         state = self._get_state(request)
-        if state and not allow_retry:
-            if state["quantity"] != request.quantity or state["mode"] != request.delivery_config["mode"]:
-                raise DeliveryOrchestrationError("idempotency_conflict", "同一幂等键的订单参数不一致")
-            return self._result(state)
         if state is None:
             state = self._insert_state(request, request.delivery_config["mode"])
+        if state["quantity"] != request.quantity or state["mode"] != request.delivery_config["mode"]:
+            raise DeliveryOrchestrationError("idempotency_conflict", "同一幂等键的订单参数不一致")
+        if state["status"] == "sent":
+            return self._result(state)
+        if state["status"] == "sending":
+            return self._result(state, status_override="in_progress")
+        if not allow_retry and state["status"] in {"paused", "failed"}:
+            return self._result(state)
+
+        claim_statuses = {"pending", "reserved"}
+        if allow_retry:
+            claim_statuses.update({"paused", "failed"})
+        if not self._claim_sending(state["id"], claim_statuses):
+            current = self._get_state(request)
+            if current and current["status"] == "sending":
+                return self._result(current, status_override="in_progress")
+            return self._result(current or state)
+        state = self._get_state(request)
         mode = request.delivery_config["mode"]
         reservation_id = state.get("reservation_id")
         if mode in CARD_MODES and not reservation_id:
@@ -329,9 +422,10 @@ class DeliveryOrchestrationService:
                     request.order_id,
                     request.quantity,
                     idempotency_key=request.idempotency_key,
+                    order_line_id=request.order_line_id,
                 )
                 reservation_id = reservation["reservation_id"]
-                self._update_state(state["id"], status="reserved", reservation_id=reservation_id)
+                self._update_state(state["id"], status="sending", reservation_id=reservation_id)
                 state = self._get_state(request)
             except CardInventoryError as exc:
                 code, message, _, details = self._error_info(exc, "inventory")
@@ -372,7 +466,9 @@ class DeliveryOrchestrationService:
             result_meta={"content_count": len(contents), "technical_category": "delivery"},
             error_code=None, error=None,
         )
-        return self._result(self._get_state(request), contents=contents, request=request)
+        return self._result(
+            self._get_state(request), contents=contents, request=request, claimed=True
+        )
 
     def prepare(self, request: DeliveryOrchestrationRequest):
         return self._prepare(request)
@@ -388,7 +484,7 @@ class DeliveryOrchestrationService:
     def orchestrate(self, request: DeliveryOrchestrationRequest, sender: Callable):
         normalized = self._normalize_request(request)
         prepared = self._prepare(normalized)
-        if prepared["status"] != "sending":
+        if not prepared.get("claimed"):
             return prepared
         try:
             self._sender_result(sender, prepared.get("contents") or [], normalized)
@@ -411,6 +507,8 @@ class DeliveryOrchestrationService:
             return self.orchestrate(normalized, sender)
         if state["status"] == "sent":
             return self._result(state)
+        if state["status"] == "sending":
+            return self._result(state, status_override="in_progress")
         if state["status"] not in {"paused", "failed"}:
             return self._result(state)
         self._update_state(
@@ -418,7 +516,7 @@ class DeliveryOrchestrationService:
             result_meta=state.get("result_meta") or {},
         )
         prepared = self._prepare(normalized, allow_retry=True)
-        if prepared["status"] != "sending":
+        if not prepared.get("claimed"):
             return prepared
         try:
             self._sender_result(sender, prepared.get("contents") or [], normalized)

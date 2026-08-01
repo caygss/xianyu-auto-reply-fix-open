@@ -795,10 +795,80 @@ class DBManager:
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 committed_at TIMESTAMP,
                 released_at TIMESTAMP,
-                UNIQUE (user_id, card_id, account_id, order_id),
-                UNIQUE (user_id, card_id, account_id, idempotency_key)
+                order_line_id TEXT NOT NULL DEFAULT 'default',
+                UNIQUE (user_id, card_id, account_id, order_id, order_line_id),
+                UNIQUE (user_id, card_id, account_id, order_line_id, idempotency_key)
             )
             ''')
+
+            reservation_columns = {
+                row[1]
+                for row in cursor.execute(
+                    "PRAGMA table_info(card_inventory_reservations)"
+                ).fetchall()
+            }
+            if "order_line_id" not in reservation_columns:
+                cursor.execute(
+                    "DROP INDEX IF EXISTS idx_card_inventory_reservations_scope_order"
+                )
+                cursor.execute(
+                    "ALTER TABLE card_inventory_reservations "
+                    "RENAME TO card_inventory_reservations_legacy"
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE card_inventory_reservations_new (
+                        reservation_id TEXT PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        card_id INTEGER NOT NULL,
+                        account_id TEXT NOT NULL,
+                        order_id TEXT NOT NULL,
+                        quantity INTEGER NOT NULL CHECK (quantity > 0),
+                        status TEXT NOT NULL DEFAULT 'reserved'
+                            CHECK (status IN ('reserved', 'committed', 'released')),
+                        idempotency_key TEXT,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        committed_at TIMESTAMP,
+                        released_at TIMESTAMP,
+                        order_line_id TEXT NOT NULL DEFAULT 'default'
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO card_inventory_reservations_new(
+                        reservation_id, user_id, card_id, account_id, order_id,
+                        quantity, status, idempotency_key, created_at, updated_at,
+                        committed_at, released_at, order_line_id
+                    )
+                    SELECT reservation_id, user_id, card_id, account_id, order_id,
+                           quantity, status, idempotency_key, created_at, updated_at,
+                           committed_at, released_at, 'default'
+                    FROM card_inventory_reservations_legacy
+                    """
+                )
+                cursor.execute("DROP TABLE card_inventory_reservations_legacy")
+                cursor.execute(
+                    "ALTER TABLE card_inventory_reservations_new "
+                    "RENAME TO card_inventory_reservations"
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX ux_card_inventory_reservations_scope_line
+                    ON card_inventory_reservations(
+                        user_id, card_id, account_id, order_id, order_line_id
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX ux_card_inventory_reservations_scope_key_line
+                    ON card_inventory_reservations(
+                        user_id, card_id, account_id, order_line_id, idempotency_key
+                    )
+                    """
+                )
 
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS card_inventory_items (
@@ -834,8 +904,8 @@ class DBManager:
             )
             self._execute_sql(
                 cursor,
-                "CREATE INDEX IF NOT EXISTS idx_card_inventory_reservations_scope_order "
-                "ON card_inventory_reservations(user_id, card_id, account_id, order_id)",
+                "CREATE INDEX IF NOT EXISTS idx_card_inventory_reservations_scope_order_line "
+                "ON card_inventory_reservations(user_id, card_id, account_id, order_id, order_line_id)",
             )
 
             cursor.execute('''

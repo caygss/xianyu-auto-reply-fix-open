@@ -394,7 +394,7 @@ class CardInventoryService:
             """
             SELECT reservation_id, user_id, card_id, account_id, order_id,
                    quantity, status, idempotency_key, created_at, updated_at,
-                   committed_at, released_at
+                   committed_at, released_at, order_line_id
             FROM card_inventory_reservations
             WHERE reservation_id = ?
             """,
@@ -416,6 +416,7 @@ class CardInventoryService:
             "updated_at": row[9],
             "committed_at": row[10],
             "released_at": row[11],
+            "order_line_id": row[12],
             "items": [],
         }
 
@@ -433,16 +434,18 @@ class CardInventoryService:
             result["items"] = [self.db._decrypt_secret(item[0]) for item in item_rows]
         return result
 
-    def _existing_reservation(self, cursor, user_id, card_id, account_id, order_id, idempotency_key):
+    def _existing_reservation(self, cursor, user_id, card_id, account_id, order_id,
+                              order_line_id, idempotency_key):
         row = cursor.execute(
             """
             SELECT reservation_id, user_id, card_id, account_id, order_id,
                    quantity, status, idempotency_key, created_at, updated_at,
-                   committed_at, released_at
+                   committed_at, released_at, order_line_id
             FROM card_inventory_reservations
-            WHERE user_id = ? AND card_id = ? AND account_id = ? AND order_id = ?
+            WHERE user_id = ? AND card_id = ? AND account_id = ?
+              AND order_id = ? AND order_line_id = ?
             """,
-            (user_id, card_id, account_id, order_id),
+            (user_id, card_id, account_id, order_id, order_line_id),
         ).fetchone()
         if row or not idempotency_key:
             return row
@@ -450,25 +453,28 @@ class CardInventoryService:
             """
             SELECT reservation_id, user_id, card_id, account_id, order_id,
                    quantity, status, idempotency_key, created_at, updated_at,
-                   committed_at, released_at
+                   committed_at, released_at, order_line_id
             FROM card_inventory_reservations
             WHERE user_id = ? AND card_id = ? AND account_id = ?
-              AND idempotency_key = ?
+              AND order_line_id = ? AND idempotency_key = ?
             """,
-            (user_id, card_id, account_id, idempotency_key),
+            (user_id, card_id, account_id, order_line_id, idempotency_key),
         ).fetchone()
 
-    def reserve_items(self, card_id, user_id, account_id, order_id, quantity, idempotency_key=None):
+    def reserve_items(self, card_id, user_id, account_id, order_id, quantity,
+                      idempotency_key=None, order_line_id=None):
         user_id, card_id, account_id = self._scope(user_id, card_id, account_id)
         order_id = str(order_id or "").strip()
         if not order_id:
             raise CardInventoryError("invalid_order", "订单号不能为空")
         if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
             raise CardInventoryError("invalid_quantity", "购买数量必须是正整数")
+        order_line_id = str(order_line_id or "default").strip() or "default"
         idempotency_key = str(idempotency_key).strip() if idempotency_key else None
         with self._transaction() as cursor:
             existing = self._existing_reservation(
-                cursor, user_id, card_id, account_id, order_id, idempotency_key
+                cursor, user_id, card_id, account_id, order_id, order_line_id,
+                idempotency_key,
             )
             if existing:
                 if existing[4] != order_id or existing[5] != quantity:
@@ -497,8 +503,9 @@ class CardInventoryService:
                     """
                     INSERT INTO card_inventory_reservations(
                         reservation_id, user_id, card_id, account_id, order_id,
-                        quantity, status, idempotency_key, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        quantity, status, idempotency_key, created_at, updated_at,
+                        order_line_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
                     """,
                     (
                         reservation_id,
@@ -508,6 +515,7 @@ class CardInventoryService:
                         order_id,
                         quantity,
                         idempotency_key,
+                        order_line_id,
                     ),
                 )
                 items = cursor.execute(

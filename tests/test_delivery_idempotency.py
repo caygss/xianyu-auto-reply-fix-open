@@ -1,5 +1,11 @@
 from test_delivery_quantity_contract import Sender, make_request, services
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import pytest
+
+from delivery_orchestration_service import DeliveryOrchestrationError
+
 
 def test_duplicate_callback_returns_existing_result_without_sending_again(services):
     service, inventory, dispatcher, manager = services
@@ -27,7 +33,9 @@ def test_order_line_fallback_matches_item_id_for_idempotency(services):
     second = service.prepare(second_request)
 
     assert first["idempotency_key"] == second["idempotency_key"]
-    assert first["status"] == second["status"] == "sending"
+    assert first["status"] == "sending"
+    assert second["status"] == "in_progress"
+    assert second["state"] == "sending"
     assert len(dispatcher.requests) == 1
     assert manager.conn.execute(
         "SELECT COUNT(*) FROM delivery_orchestration_states"
@@ -57,3 +65,66 @@ def test_provider_request_carries_quantity_and_idempotency_key(services):
     assert result["status"] == "sending"
     assert captured.quantity == 3
     assert captured.idempotency_key == result["idempotency_key"]
+
+
+def test_concurrent_duplicate_callbacks_only_claim_one_sender(services):
+    service, _, dispatcher, _ = services
+    sender_started = threading.Event()
+    release_sender = threading.Event()
+    calls = []
+
+    def blocking_sender(contents, request):
+        calls.append(list(contents))
+        sender_started.set()
+        assert release_sender.wait(5)
+        return True
+
+    request = make_request(1)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(service.orchestrate, request, blocking_sender)
+        assert sender_started.wait(5)
+        second = service.orchestrate(request, Sender())
+        release_sender.set()
+        first = first_future.result(timeout=5)
+
+    assert first["status"] == "sent"
+    assert second["status"] == "in_progress"
+    assert second["state"] == "sending"
+    assert len(calls) == 1
+    assert len(dispatcher.requests) == 1
+
+
+def test_supplied_idempotency_key_must_match_internal_scope(services):
+    service, _, _, manager = services
+    request = make_request(1)
+    request = request.__class__(**{**request.__dict__, "idempotency_key": "external-key"})
+
+    with pytest.raises(DeliveryOrchestrationError) as error:
+        service.prepare(request)
+
+    assert error.value.code == "idempotency_key_mismatch"
+    assert manager.conn.execute(
+        "SELECT COUNT(*) FROM delivery_orchestration_states"
+    ).fetchone()[0] == 0
+
+
+def test_same_order_different_lines_reserve_and_send_distinct_cards(services):
+    service, inventory, _, manager = services
+    inventory.import_items(7, 1, "account-a", ["a", "b"])
+
+    first = service.orchestrate(
+        make_request(1, order_line_id="line-1", item_id="item-7", mode="imported_card"),
+        Sender(),
+    )
+    second_sender = Sender()
+    second = service.orchestrate(
+        make_request(1, order_line_id="line-2", item_id="item-7", mode="imported_card"),
+        second_sender,
+    )
+
+    assert first["status"] == second["status"] == "sent"
+    assert second_sender.calls[0]["contents"] != ["a"]
+    assert manager.conn.execute(
+        "SELECT COUNT(*) FROM card_inventory_reservations"
+    ).fetchone()[0] == 2
+    assert inventory.get_inventory_summary(7, 1, "account-a")["sent"] == 2
