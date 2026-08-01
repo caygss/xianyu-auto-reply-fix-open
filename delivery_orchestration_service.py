@@ -511,10 +511,6 @@ class DeliveryOrchestrationService:
             return self._result(state, status_override="in_progress")
         if state["status"] not in {"paused", "failed"}:
             return self._result(state)
-        self._update_state(
-            state["id"], status="pending", error_code=None, error=None,
-            result_meta=state.get("result_meta") or {},
-        )
         prepared = self._prepare(normalized, allow_retry=True)
         if not prepared.get("claimed"):
             return prepared
