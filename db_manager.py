@@ -717,6 +717,8 @@ class DBManager:
                 mode TEXT NOT NULL,
                 idempotency_key TEXT NOT NULL,
                 reservation_id TEXT,
+                claim_token TEXT,
+                claimed_at TIMESTAMP,
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'paused', 'reserved', 'sending', 'sent', 'failed')),
                 result_meta TEXT NOT NULL DEFAULT '{}',
@@ -729,6 +731,20 @@ class DBManager:
                 UNIQUE (idempotency_key)
             )
             ''')
+            orchestration_columns = {
+                row[1]
+                for row in cursor.execute(
+                    "PRAGMA table_info(delivery_orchestration_states)"
+                ).fetchall()
+            }
+            if "claim_token" not in orchestration_columns:
+                cursor.execute(
+                    "ALTER TABLE delivery_orchestration_states ADD COLUMN claim_token TEXT"
+                )
+            if "claimed_at" not in orchestration_columns:
+                cursor.execute(
+                    "ALTER TABLE delivery_orchestration_states ADD COLUMN claimed_at TIMESTAMP"
+                )
             self._execute_sql(
                 cursor,
                 "CREATE INDEX IF NOT EXISTS idx_delivery_orchestration_states_order_line "

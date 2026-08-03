@@ -4,6 +4,7 @@ import inspect
 import json
 import re
 import sqlite3
+import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping
 
@@ -14,6 +15,7 @@ from delivery_adapter_service import DeliveryDispatchError, DeliveryRequest
 DELIVERY_STATES = {"pending", "paused", "reserved", "sending", "sent", "failed"}
 CARD_MODES = {"imported_card", "generated_card"}
 MAX_DELIVERY_QUANTITY = 100
+DEFAULT_CLAIM_LEASE_SECONDS = 300
 _UNSET = object()
 
 
@@ -77,10 +79,12 @@ def build_idempotency_key(user_id: int, account_id: str, order_id: str,
 
 
 class DeliveryOrchestrationService:
-    def __init__(self, db_manager, inventory_service, dispatcher):
+    def __init__(self, db_manager, inventory_service, dispatcher,
+                 claim_lease_seconds=DEFAULT_CLAIM_LEASE_SECONDS):
         self.db = db_manager
         self.inventory = inventory_service
         self.dispatcher = dispatcher
+        self.claim_lease_seconds = max(1, int(claim_lease_seconds))
 
     @staticmethod
     def _scope(request: DeliveryOrchestrationRequest):
@@ -158,7 +162,7 @@ class DeliveryOrchestrationService:
             "id", "user_id", "card_id", "account_id", "order_id", "order_line_id",
             "quantity", "mode", "idempotency_key", "reservation_id", "status",
             "result_meta", "last_error_code", "last_error", "created_at",
-            "updated_at", "sent_at",
+            "updated_at", "sent_at", "claim_token", "claimed_at",
         )
         state = dict(zip(columns, row))
         try:
@@ -174,7 +178,7 @@ class DeliveryOrchestrationService:
                 SELECT id, user_id, card_id, account_id, order_id, order_line_id,
                        quantity, mode, idempotency_key, reservation_id, status,
                        result_meta, last_error_code, last_error, created_at,
-                       updated_at, sent_at
+                       updated_at, sent_at, claim_token, claimed_at
                 FROM delivery_orchestration_states
                 WHERE user_id = ? AND card_id = ? AND account_id = ?
                   AND order_id = ? AND order_line_id = ?
@@ -219,7 +223,7 @@ class DeliveryOrchestrationService:
                     SELECT id, user_id, card_id, account_id, order_id, order_line_id,
                            quantity, mode, idempotency_key, reservation_id, status,
                            result_meta, last_error_code, last_error, created_at,
-                           updated_at, sent_at
+                           updated_at, sent_at, claim_token, claimed_at
                     FROM delivery_orchestration_states
                     WHERE user_id = ? AND card_id = ? AND account_id = ?
                       AND order_id = ? AND order_line_id = ?
@@ -238,7 +242,7 @@ class DeliveryOrchestrationService:
                         SELECT id, user_id, card_id, account_id, order_id, order_line_id,
                                quantity, mode, idempotency_key, reservation_id, status,
                                result_meta, last_error_code, last_error, created_at,
-                               updated_at, sent_at
+                               updated_at, sent_at, claim_token, claimed_at
                         FROM delivery_orchestration_states
                         WHERE idempotency_key = ?
                         """,
@@ -257,7 +261,7 @@ class DeliveryOrchestrationService:
                     SELECT id, user_id, card_id, account_id, order_id, order_line_id,
                            quantity, mode, idempotency_key, reservation_id, status,
                            result_meta, last_error_code, last_error, created_at,
-                           updated_at, sent_at
+                           updated_at, sent_at, claim_token, claimed_at
                     FROM delivery_orchestration_states
                     WHERE user_id = ? AND card_id = ? AND account_id = ?
                       AND order_id = ? AND order_line_id = ?
@@ -349,7 +353,7 @@ class DeliveryOrchestrationService:
         return contents
 
     def _result(self, state, *, contents=None, request=None, status_override=None,
-                claimed=False):
+                claimed=False, claim_token=None):
         result = {
             "status": status_override or state["status"],
             "user_id": state["user_id"],
@@ -369,24 +373,86 @@ class DeliveryOrchestrationService:
             result["state"] = state["status"]
         if claimed:
             result["claimed"] = True
+            result["claim_token"] = claim_token
         if contents is not None:
             result["contents"] = list(contents)
         return result
 
-    def _claim_sending(self, state_id: int, allowed_statuses):
+    def _claim_sending(self, state_id: int, allowed_statuses, *, reclaim_stale=False):
         allowed_statuses = tuple(allowed_statuses)
         placeholders = ",".join("?" for _ in allowed_statuses)
+        claim_token = uuid.uuid4().hex
+        conditions = f"status IN ({placeholders})"
+        condition_params = list(allowed_statuses)
+        if reclaim_stale:
+            conditions += (
+                " OR (status = 'sending' AND (claim_token IS NULL OR claimed_at IS NULL "
+                "OR datetime(claimed_at) <= datetime('now', ?)))"
+            )
+            condition_params.append(f"-{self.claim_lease_seconds} seconds")
         with self.db.lock:
             cursor = self.db.conn.execute(
                 f"""
                 UPDATE delivery_orchestration_states
-                SET status = 'sending', updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND status IN ({placeholders})
+                SET status = 'sending', claim_token = ?, claimed_at = CURRENT_TIMESTAMP,
+                    last_error_code = NULL, last_error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND ({conditions})
                 """,
-                (state_id, *allowed_statuses),
+                (claim_token, state_id, *condition_params),
+            )
+            self.db.conn.commit()
+        return claim_token if cursor.rowcount == 1 else None
+
+    def _transition_claim(self, state_id: int, claim_token: str, *, status: str,
+                          reservation_id=_UNSET, result_meta=None,
+                          error_code=None, error=None, clear_claim=False):
+        if status not in DELIVERY_STATES:
+            raise DeliveryOrchestrationError("invalid_state_transition", "交付状态无效")
+        reservation_sql = "reservation_id = reservation_id"
+        reservation_params = ()
+        if reservation_id is not _UNSET:
+            reservation_sql = "reservation_id = ?"
+            reservation_params = (reservation_id,)
+        meta_json = json.dumps(result_meta or {}, ensure_ascii=False, separators=(",", ":"))
+        claim_sql = (
+            "claim_token = NULL, claimed_at = NULL"
+            if clear_claim
+            else "claim_token = claim_token, claimed_at = CURRENT_TIMESTAMP"
+        )
+        with self.db.lock:
+            cursor = self.db.conn.execute(
+                f"""
+                UPDATE delivery_orchestration_states
+                SET status = ?, {reservation_sql}, result_meta = ?,
+                    last_error_code = ?, last_error = ?, {claim_sql},
+                    sent_at = CASE WHEN ? = 'sent' THEN CURRENT_TIMESTAMP ELSE sent_at END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'sending' AND claim_token = ?
+                """,
+                (
+                    status,
+                    *reservation_params,
+                    meta_json,
+                    error_code,
+                    str(error or "")[:1000] or None,
+                    status,
+                    state_id,
+                    claim_token,
+                ),
             )
             self.db.conn.commit()
         return cursor.rowcount == 1
+
+    def _claim_lost_result(self, request):
+        current = self._get_state(request)
+        if current and current["status"] == "sending":
+            return self._result(current, status_override="in_progress")
+        return self._result(current) if current else {
+            "status": "failed",
+            "error_code": "claim_state_missing",
+            "error": "交付 claim 状态不存在",
+        }
 
     def _prepare(self, request: DeliveryOrchestrationRequest, *, allow_retry=False):
         request = self._normalize_request(request)
@@ -397,7 +463,7 @@ class DeliveryOrchestrationService:
             raise DeliveryOrchestrationError("idempotency_conflict", "同一幂等键的订单参数不一致")
         if state["status"] == "sent":
             return self._result(state)
-        if state["status"] == "sending":
+        if state["status"] == "sending" and not allow_retry:
             return self._result(state, status_override="in_progress")
         if not allow_retry and state["status"] in {"paused", "failed"}:
             return self._result(state)
@@ -405,7 +471,10 @@ class DeliveryOrchestrationService:
         claim_statuses = {"pending", "reserved"}
         if allow_retry:
             claim_statuses.update({"paused", "failed"})
-        if not self._claim_sending(state["id"], claim_statuses):
+        claim_token = self._claim_sending(
+            state["id"], claim_statuses, reclaim_stale=allow_retry
+        )
+        if not claim_token:
             current = self._get_state(request)
             if current and current["status"] == "sending":
                 return self._result(current, status_override="in_progress")
@@ -425,14 +494,20 @@ class DeliveryOrchestrationService:
                     order_line_id=request.order_line_id,
                 )
                 reservation_id = reservation["reservation_id"]
-                self._update_state(state["id"], status="sending", reservation_id=reservation_id)
+                if not self._transition_claim(
+                    state["id"], claim_token, status="sending",
+                    reservation_id=reservation_id,
+                ):
+                    return self._claim_lost_result(request)
                 state = self._get_state(request)
             except CardInventoryError as exc:
                 code, message, _, details = self._error_info(exc, "inventory")
-                self._update_state(
-                    state["id"], status="paused", error_code=code, error=message,
+                if not self._transition_claim(
+                    state["id"], claim_token, status="paused",
+                    error_code=code, error=message, clear_claim=True,
                     result_meta={"available": details.get("available"), "requested": request.quantity},
-                )
+                ):
+                    return self._claim_lost_result(request)
                 return self._result(self._get_state(request))
 
         delivery_request = DeliveryRequest(
@@ -453,25 +528,81 @@ class DeliveryOrchestrationService:
             prepared = self.dispatcher.prepare(delivery_request)
             contents = self._contents(prepared, mode, request.quantity)
         except Exception as exc:
-            code, message, category, details = self._error_info(exc)
-            self._update_state(
-                state["id"], status="failed", reservation_id=reservation_id,
-                error_code=code, error=message,
-                result_meta={"technical_category": category, **details},
-            )
-            return self._result(self._get_state(request))
+            try:
+                return self.mark_failed(request, claim_token, exc)
+            except DeliveryOrchestrationError as mark_error:
+                if mark_error.code != "claim_token_mismatch":
+                    raise
+                return self._claim_lost_result(request)
 
-        self._update_state(
-            state["id"], status="sending", reservation_id=reservation_id,
+        if not self._transition_claim(
+            state["id"], claim_token, status="sending", reservation_id=reservation_id,
             result_meta={"content_count": len(contents), "technical_category": "delivery"},
             error_code=None, error=None,
-        )
+        ):
+            return self._claim_lost_result(request)
         return self._result(
-            self._get_state(request), contents=contents, request=request, claimed=True
+            self._get_state(request), contents=contents, request=request, claimed=True,
+            claim_token=claim_token,
         )
 
     def prepare(self, request: DeliveryOrchestrationRequest):
         return self._prepare(request)
+
+    def mark_sent(self, request: DeliveryOrchestrationRequest, claim_token: str):
+        normalized = self._normalize_request(request)
+        state = self._get_state(normalized)
+        token = str(claim_token or "").strip()
+        if not state or not token or not self._transition_claim(
+            state["id"],
+            token,
+            status="sent",
+            result_meta=state.get("result_meta") or {},
+            error_code=None,
+            error=None,
+            clear_claim=True,
+        ):
+            raise DeliveryOrchestrationError(
+                "claim_token_mismatch",
+                "交付 claim 已失效或不属于当前调用",
+                "concurrency",
+            )
+        return self._result(self._get_state(normalized))
+
+    def mark_failed(self, request: DeliveryOrchestrationRequest, claim_token: str,
+                    error=None, *, error_code=None, technical_category="sender",
+                    details=None):
+        normalized = self._normalize_request(request)
+        state = self._get_state(normalized)
+        token = str(claim_token or "").strip()
+        if isinstance(error, Exception):
+            code, message, category, error_details = self._error_info(
+                error, technical_category
+            )
+        else:
+            code = error_code or "delivery_failed"
+            message = "交付处理失败，请稍后重试"
+            category = technical_category
+            error_details = {}
+        if error_code:
+            code = str(error_code)
+        if details:
+            error_details.update(dict(details))
+        if not state or not token or not self._transition_claim(
+            state["id"],
+            token,
+            status="failed",
+            result_meta={"technical_category": category, **error_details},
+            error_code=code,
+            error=message,
+            clear_claim=True,
+        ):
+            raise DeliveryOrchestrationError(
+                "claim_token_mismatch",
+                "交付 claim 已失效或不属于当前调用",
+                "concurrency",
+            )
+        return self._result(self._get_state(normalized))
 
     def _sender_result(self, sender: Callable, contents, request):
         result = sender(contents, request)
@@ -489,16 +620,18 @@ class DeliveryOrchestrationService:
         try:
             self._sender_result(sender, prepared.get("contents") or [], normalized)
         except Exception as exc:
-            code, message, category, details = self._error_info(exc, "sender")
-            state = self._get_state(normalized)
-            self._update_state(
-                state["id"], status="failed", error_code=code, error=message,
-                result_meta={"technical_category": category, **details},
-            )
-            return self._result(self._get_state(normalized))
-        state = self._get_state(normalized)
-        self._update_state(state["id"], status="sent", error_code=None, error=None)
-        return self._result(self._get_state(normalized))
+            try:
+                return self.mark_failed(normalized, prepared["claim_token"], exc)
+            except DeliveryOrchestrationError as mark_error:
+                if mark_error.code != "claim_token_mismatch":
+                    raise
+                return self._claim_lost_result(normalized)
+        try:
+            return self.mark_sent(normalized, prepared["claim_token"])
+        except DeliveryOrchestrationError as mark_error:
+            if mark_error.code != "claim_token_mismatch":
+                raise
+            return self._claim_lost_result(normalized)
 
     def retry(self, request: DeliveryOrchestrationRequest, sender: Callable):
         normalized = self._normalize_request(request)
@@ -507,9 +640,7 @@ class DeliveryOrchestrationService:
             return self.orchestrate(normalized, sender)
         if state["status"] == "sent":
             return self._result(state)
-        if state["status"] == "sending":
-            return self._result(state, status_override="in_progress")
-        if state["status"] not in {"paused", "failed"}:
+        if state["status"] not in {"paused", "failed", "sending"}:
             return self._result(state)
         prepared = self._prepare(normalized, allow_retry=True)
         if not prepared.get("claimed"):
@@ -517,13 +648,15 @@ class DeliveryOrchestrationService:
         try:
             self._sender_result(sender, prepared.get("contents") or [], normalized)
         except Exception as exc:
-            code, message, category, details = self._error_info(exc, "sender")
-            state = self._get_state(normalized)
-            self._update_state(
-                state["id"], status="failed", error_code=code, error=message,
-                result_meta={"technical_category": category, **details},
-            )
-            return self._result(self._get_state(normalized))
-        state = self._get_state(normalized)
-        self._update_state(state["id"], status="sent", error_code=None, error=None)
-        return self._result(self._get_state(normalized))
+            try:
+                return self.mark_failed(normalized, prepared["claim_token"], exc)
+            except DeliveryOrchestrationError as mark_error:
+                if mark_error.code != "claim_token_mismatch":
+                    raise
+                return self._claim_lost_result(normalized)
+        try:
+            return self.mark_sent(normalized, prepared["claim_token"])
+        except DeliveryOrchestrationError as mark_error:
+            if mark_error.code != "claim_token_mismatch":
+                raise
+            return self._claim_lost_result(normalized)

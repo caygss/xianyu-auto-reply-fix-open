@@ -170,9 +170,9 @@ def test_concurrent_retries_only_one_thread_claims_sender(monkeypatch, services)
                 assert first_claimed.wait(5)
         return original_update_state(state_id, status=status, **kwargs)
 
-    def coordinated_claim_sending(state_id, allowed_statuses):
+    def coordinated_claim_sending(state_id, allowed_statuses, **kwargs):
         nonlocal retry_claims
-        claimed = original_claim_sending(state_id, allowed_statuses)
+        claimed = original_claim_sending(state_id, allowed_statuses, **kwargs)
         claim_number = None
         with coordination_lock:
             if claimed and pending_updates:
@@ -218,3 +218,134 @@ def test_concurrent_retries_only_one_thread_claims_sender(monkeypatch, services)
     ).fetchone()[0] == 1
     assert {result["reservation_id"] for result in results} == {reservation_id}
     assert inventory.get_inventory_summary(7, 1, "account-a")["sent"] == 2
+
+
+def test_external_prepare_can_mark_sent_with_current_claim(services):
+    service, _, _, _ = services
+    request = make_request(1, order_line_id="line-sent")
+
+    prepared = service.prepare(request)
+
+    assert prepared["status"] == "sending"
+    assert prepared["claim_token"]
+    assert "claim_token" not in prepared["meta"]
+
+    sent = service.mark_sent(request, prepared["claim_token"])
+
+    assert sent["status"] == "sent"
+    assert "claim_token" not in sent
+    assert "contents" not in sent
+
+
+def test_external_prepare_can_mark_failed_with_current_claim(services):
+    service, _, _, _ = services
+    request = make_request(1, order_line_id="line-failed")
+    prepared = service.prepare(request)
+
+    failed = service.mark_failed(
+        request,
+        prepared["claim_token"],
+        DeliveryOrchestrationError("send_failed", "交付消息发送失败", "sender"),
+    )
+
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "send_failed"
+    assert "claim_token" not in failed
+
+
+def test_wrong_claim_token_cannot_mark_terminal_state(services):
+    service, _, _, manager = services
+    request = make_request(1, order_line_id="line-token")
+    prepared = service.prepare(request)
+
+    with pytest.raises(DeliveryOrchestrationError) as sent_error:
+        service.mark_sent(request, "wrong-token")
+    with pytest.raises(DeliveryOrchestrationError) as failed_error:
+        service.mark_failed(request, "wrong-token", RuntimeError("send failed"))
+
+    assert sent_error.value.code == "claim_token_mismatch"
+    assert failed_error.value.code == "claim_token_mismatch"
+    assert manager.conn.execute(
+        "SELECT status FROM delivery_orchestration_states WHERE order_line_id = ?",
+        ("line-token",),
+    ).fetchone()[0] == "sending"
+    assert service.mark_sent(request, prepared["claim_token"])["status"] == "sent"
+
+
+def test_retry_reclaims_stale_sending_and_reuses_reservation(services):
+    service, inventory, _, manager = services
+    inventory.import_items(7, 1, "account-a", ["a", "b"])
+    request = make_request(2, order_line_id="line-stale", mode="imported_card")
+    prepared = service.prepare(request)
+    reservation_id = prepared["reservation_id"]
+    active_sender = Sender()
+
+    active = service.retry(request, active_sender)
+
+    assert active["status"] == "in_progress"
+    assert active_sender.calls == []
+
+    manager.conn.execute(
+        """
+        UPDATE delivery_orchestration_states
+        SET claimed_at = datetime('now', '-10 minutes')
+        WHERE order_line_id = ?
+        """,
+        ("line-stale",),
+    )
+    manager.conn.commit()
+    recovered_sender = Sender()
+
+    recovered = service.retry(request, recovered_sender)
+
+    assert recovered["status"] == "sent"
+    assert len(recovered_sender.calls) == 1
+    assert len(recovered_sender.calls[0]["contents"]) == 2
+    assert recovered["reservation_id"] == reservation_id
+    assert manager.conn.execute(
+        "SELECT COUNT(*) FROM card_inventory_reservations"
+    ).fetchone()[0] == 1
+    assert inventory.get_inventory_summary(7, 1, "account-a")["sent"] == 2
+
+
+def test_expired_claim_token_cannot_overwrite_reclaimed_sender(services):
+    service, _, _, manager = services
+    request = make_request(1, order_line_id="line-reclaimed")
+    prepared = service.prepare(request)
+    stale_token = prepared["claim_token"]
+    manager.conn.execute(
+        """
+        UPDATE delivery_orchestration_states
+        SET claimed_at = datetime('now', '-10 minutes')
+        WHERE order_line_id = ?
+        """,
+        ("line-reclaimed",),
+    )
+    manager.conn.commit()
+    sender_started = threading.Event()
+    release_sender = threading.Event()
+
+    def blocking_sender(contents, normalized_request):
+        sender_started.set()
+        assert release_sender.wait(5)
+        return True
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        recovered_future = executor.submit(service.retry, request, blocking_sender)
+        assert sender_started.wait(5)
+        with pytest.raises(DeliveryOrchestrationError) as error:
+            service.mark_failed(request, stale_token, RuntimeError("late failure"))
+        current = manager.conn.execute(
+            """
+            SELECT status, claim_token FROM delivery_orchestration_states
+            WHERE order_line_id = ?
+            """,
+            ("line-reclaimed",),
+        ).fetchone()
+        release_sender.set()
+        recovered = recovered_future.result(timeout=5)
+
+    assert error.value.code == "claim_token_mismatch"
+    assert current[0] == "sending"
+    assert current[1] != stale_token
+    assert recovered["status"] == "sent"
