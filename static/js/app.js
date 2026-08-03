@@ -12851,6 +12851,473 @@ async function checkRepublishNow(templateId) {
     }
 }
 
+const DELIVERY_UI_STATE_KEY = 'deliveryConfigUiState';
+const DELIVERY_DEFAULT_CONTENT_KEY = 'deliveryDefaultContent';
+let deliveryConfigContext = null;
+
+function readDeliveryConfigUiState() {
+    try {
+        return JSON.parse(localStorage.getItem(DELIVERY_UI_STATE_KEY) || '{}');
+    } catch (error) {
+        return {};
+    }
+}
+
+function writeDeliveryConfigUiState(nextState) {
+    localStorage.setItem(DELIVERY_UI_STATE_KEY, JSON.stringify(nextState));
+}
+
+function syncDeliveryConfigPanelState(collapsed) {
+    const panel = document.getElementById('deliveryConfigPanel');
+    const body = document.getElementById('deliveryConfigPanelBody');
+    const toggle = document.getElementById('deliveryConfigToggleButton');
+    const openButton = document.getElementById('deliveryConfigOpenButton');
+    if (panel) panel.hidden = false;
+    if (body) body.hidden = collapsed;
+    const expandedAttribute = 'aria-expanded'; [toggle, openButton].forEach(button => button?.setAttribute(expandedAttribute, String(!collapsed)));
+    if (toggle) {
+        toggle.firstChild.textContent = collapsed ? '展开配置 ' : '收起配置 ';
+        const icon = toggle.querySelector('i');
+        if (icon) icon.className = `bi ${collapsed ? 'bi-chevron-down' : 'bi-chevron-up'}`;
+    }
+}
+
+function closeDeliveryConfigPrompt() {
+    const state = { ...readDeliveryConfigUiState(), promptClosed: true };
+    writeDeliveryConfigUiState(state);
+    const prompt = document.getElementById('deliveryConfigPrompt');
+    if (prompt) prompt.hidden = true;
+}
+
+function toggleDeliveryConfigPanel() {
+    const state = readDeliveryConfigUiState();
+    state.collapsed = !Boolean(state.collapsed);
+    writeDeliveryConfigUiState(state);
+    syncDeliveryConfigPanelState(state.collapsed);
+}
+
+function openDeliveryConfigPanel() {
+    const state = { ...readDeliveryConfigUiState(), collapsed: false };
+    writeDeliveryConfigUiState(state);
+    syncDeliveryConfigPanelState(false);
+}
+
+function setDeliveryConfigStatus(message, type = 'info') {
+    const status = document.getElementById('deliveryConfigStatus');
+    if (!status) return;
+    status.textContent = message;
+    status.dataset.status = type;
+}
+
+function setDeliveryConfigBusy(busy) {
+    const panel = document.getElementById('deliveryConfigPanel');
+    panel?.setAttribute('aria-busy', String(busy));
+    [
+        'deliveryConfigSaveButton', 'deliveryConfigDeleteButton', 'cardImportButton',
+        'cardGenerateButton', 'cardReplenishButton', 'cardContinueButton'
+    ].forEach(id => {
+        const button = document.getElementById(id);
+        if (button) button.disabled = busy;
+    });
+}
+
+function deliveryConfigErrorMessage(payload, fallback = '请求失败，请稍后重试') {
+    const detail = payload?.detail;
+    if (detail && typeof detail === 'object' && detail.message) return String(detail.message);
+    if (typeof detail === 'string' && detail.trim()) return detail;
+    if (payload?.message) return String(payload.message);
+    return fallback;
+}
+
+async function deliveryConfigFetch(path, options = {}) {
+    const headers = {
+        'Authorization': `Bearer ${authToken}`,
+        ...(options.body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        ...(options.headers || {})
+    };
+    const response = await fetch(`${apiBase}${path}`, { ...options, headers });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const error = new Error(deliveryConfigErrorMessage(payload));
+        error.status = response.status;
+        throw error;
+    }
+    return payload;
+}
+
+async function deliveryConfigFetchOptional(path) {
+    try {
+        return await deliveryConfigFetch(path);
+    } catch (error) {
+        if (error.status === 404) return null;
+        throw error;
+    }
+}
+
+function deliveryCardPaths(cardId, accountId) {
+    const account = encodeURIComponent(accountId);
+    return {
+        config: `/api/cards/${cardId}/delivery-config?account_id=${account}`,
+        settings: `/api/cards/${cardId}/inventory/settings?account_id=${account}`,
+        inventory: `/api/cards/${cardId}/inventory?account_id=${account}`,
+        importItems: `/api/cards/${cardId}/inventory/import?account_id=${account}`,
+        generate: `/api/cards/${cardId}/inventory/generate?account_id=${account}`,
+        preview: `/api/cards/${cardId}/inventory/preview?account_id=${account}`
+    };
+}
+
+function updateDeliveryMethodSections() {
+    const mode = document.getElementById('deliveryMethodSelect')?.value || 'fixed_link';
+    document.querySelectorAll('[data-delivery-method]').forEach(section => {
+        section.hidden = section.dataset.deliveryMethod !== mode;
+    });
+    const usesInventory = mode === 'imported_card' || mode === 'generated_card';
+    const summary = document.getElementById('cardInventorySummary');
+    if (summary) summary.hidden = !usesInventory;
+    const preview = document.getElementById('inventoryPreviewList')?.closest('.delivery-config-method-card');
+    if (preview) preview.hidden = !usesInventory;
+    const shortage = document.getElementById('deliveryInventoryShortage');
+    if (shortage) shortage.hidden = !usesInventory || shortage.dataset.hasShortage !== 'true';
+}
+
+function renderInventorySummary(inventory = {}) {
+    const values = [
+        inventory.stock_ceiling, inventory.available, inventory.reserved, inventory.sent,
+        inventory.low_stock_threshold, inventory.auto_replenish ? '已开启' : '已关闭'
+    ];
+    document.querySelectorAll('#cardInventorySummary dd').forEach((element, index) => {
+        element.textContent = values[index] ?? '—';
+    });
+    const deficit = Math.max(Number(inventory.shortage ?? inventory.deficit ?? 0), 0);
+    const shortage = document.getElementById('deliveryInventoryShortage');
+    if (shortage) {
+        shortage.dataset.hasShortage = String(deficit > 0);
+        shortage.hidden = deficit <= 0;
+    }
+    const shortageText = document.getElementById('deliveryInventoryShortageText');
+    if (shortageText) shortageText.textContent = `库存不足，还需要 ${deficit} 个`;
+    updateDeliveryMethodSections();
+}
+
+function renderInventoryPreview(items = []) {
+    const list = document.getElementById('inventoryPreviewList');
+    if (!list) return;
+    list.replaceChildren();
+    const maskedItems = Array.isArray(items) ? items : [];
+    maskedItems.forEach(item => {
+        const value = typeof item === 'string'
+            ? item
+            : (item.masked_secret || item.masked_value || item.masked || item.preview || '');
+        if (!value) return;
+        const row = document.createElement('li');
+        row.textContent = String(value);
+        list.appendChild(row);
+    });
+    if (!list.children.length) {
+        const empty = document.createElement('li');
+        empty.textContent = '暂无可预览库存';
+        list.appendChild(empty);
+    }
+}
+
+function applyInventorySettings(settings = {}) {
+    const setValue = (id, value) => {
+        const input = document.getElementById(id);
+        if (input && value !== undefined && value !== null) input.value = value;
+    };
+    setValue('inventoryStockCeiling', settings.stock_ceiling);
+    setValue('inventoryLowStockThreshold', settings.low_stock_threshold);
+    setValue('cardGeneratorPrefix', settings.generator_prefix);
+    setValue('cardGeneratorLength', settings.generator_length);
+    setValue('cardGeneratorCharset', settings.generator_charset);
+    const auto = document.getElementById('inventoryAutoReplenish');
+    if (auto) auto.checked = Boolean(settings.auto_replenish);
+}
+
+function applyDeliveryConfig(config) {
+    const mode = config?.mode || 'fixed_link';
+    const select = document.getElementById('deliveryMethodSelect');
+    if (select) select.value = mode;
+    ['fixedLinkInput', 'providerEndpoint', 'providerToken', 'providerResponseField',
+        'providerHeaders', 'providerRequestBody', 'providerFieldMapping'].forEach(id => {
+        const input = document.getElementById(id);
+        if (input) input.value = '';
+    });
+    updateDeliveryMethodSections();
+}
+
+async function openDeliveryConfigForItem(accountId, itemId, itemTitle) {
+    const normalizedAccountId = String(accountId || '').trim();
+    const normalizedItemId = String(itemId || '').trim();
+    if (!normalizedAccountId || !normalizedItemId) {
+        setDeliveryConfigStatus('商品信息无效，无法打开交付配置', 'error');
+        return;
+    }
+    setDeliveryConfigBusy(true);
+    setDeliveryConfigStatus('正在准备当前商品的交付配置…');
+    try {
+        const resolved = await deliveryConfigFetch(
+            `/api/items/${encodeURIComponent(itemId)}/delivery-card?account_id=${encodeURIComponent(accountId)}`,
+            { method: 'POST' }
+        );
+        const cardId = resolved.card_id;
+        deliveryConfigContext = { accountId: normalizedAccountId, itemId: normalizedItemId, itemTitle: String(itemTitle || ''), cardId };
+        openDeliveryConfigPanel();
+        document.getElementById('deliveryConfigPanel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        const paths = deliveryCardPaths(cardId, normalizedAccountId);
+        const [config, settingsPayload, inventoryPayload, previewPayload] = await Promise.all([
+            deliveryConfigFetchOptional(paths.config),
+            deliveryConfigFetch(paths.settings),
+            deliveryConfigFetch(paths.inventory),
+            deliveryConfigFetch(paths.preview)
+        ]);
+        applyDeliveryConfig(config);
+        applyInventorySettings(settingsPayload?.settings || {});
+        renderInventorySummary(inventoryPayload?.inventory || {});
+        renderInventoryPreview(previewPayload?.items || []);
+        setDeliveryConfigStatus(config ? `已加载“${itemTitle || '当前商品'}”的交付配置` : `请为“${itemTitle || '当前商品'}”选择交付方式`);
+    } catch (error) {
+        setDeliveryConfigStatus(`打开交付配置失败：${error.message}`, 'error');
+    } finally {
+        setDeliveryConfigBusy(false);
+    }
+}
+
+function parseAdvancedJson(elementId) {
+    const text = document.getElementById(elementId)?.value.trim() || '';
+    return text ? JSON.parse(text) : {};
+}
+
+function buildDeliveryConfigPayload() {
+    const mode = document.getElementById('deliveryMethodSelect')?.value;
+    if (mode === 'fixed_link') {
+        const url = document.getElementById('fixedLinkInput')?.value.trim() || '';
+        return { mode: 'fixed_link', config: { url } };
+    }
+    if (mode === 'imported_card') return { mode: 'imported_card', config: { source: 'local-import' } };
+    if (mode === 'generated_card') return { mode: 'generated_card', config: { source: 'local-generated' } };
+    return {
+        mode: 'provider_api',
+        config: {
+            endpoint: document.getElementById('providerEndpoint')?.value.trim() || '',
+            token: document.getElementById('providerToken')?.value || '',
+            timeout_seconds: Number(document.getElementById('providerTimeoutSeconds')?.value || 10),
+            max_retries: Number(document.getElementById('providerMaxRetries')?.value || 0),
+            response_field: document.getElementById('providerResponseField')?.value.trim() || '',
+            headers: parseAdvancedJson('providerHeaders'),
+            request_body: parseAdvancedJson('providerRequestBody'),
+            field_mapping: parseAdvancedJson('providerFieldMapping')
+        }
+    };
+}
+
+function buildInventorySettingsPayload() {
+    return {
+        stock_ceiling: Number(document.getElementById('inventoryStockCeiling')?.value || 0),
+        low_stock_threshold: Number(document.getElementById('inventoryLowStockThreshold')?.value || 0),
+        auto_replenish: Boolean(document.getElementById('inventoryAutoReplenish')?.checked),
+        generator_prefix: document.getElementById('cardGeneratorPrefix')?.value || '',
+        generator_length: Number(document.getElementById('cardGeneratorLength')?.value || 0),
+        generator_charset: document.getElementById('cardGeneratorCharset')?.value || ''
+    };
+}
+
+function requireDeliveryConfigContext() {
+    if (deliveryConfigContext) return deliveryConfigContext;
+    setDeliveryConfigStatus('请先从商品列表点击“设置交付方式”', 'error');
+    return null;
+}
+
+async function saveInventorySettings() {
+    const context = requireDeliveryConfigContext();
+    if (!context) return null;
+    const paths = deliveryCardPaths(context.cardId, context.accountId);
+    return deliveryConfigFetch(paths.settings, {
+        method: 'PUT', body: JSON.stringify(buildInventorySettingsPayload())
+    });
+}
+
+async function refreshDeliveryInventory() {
+    const context = requireDeliveryConfigContext();
+    if (!context) return;
+    const paths = deliveryCardPaths(context.cardId, context.accountId);
+    const [inventoryPayload, previewPayload] = await Promise.all([
+        deliveryConfigFetch(paths.inventory),
+        deliveryConfigFetch(paths.preview)
+    ]);
+    renderInventorySummary(inventoryPayload?.inventory || {});
+    renderInventoryPreview(previewPayload?.items || []);
+}
+
+async function saveCurrentDeliveryConfig() {
+    const context = requireDeliveryConfigContext();
+    if (!context) return;
+    const jsonError = document.getElementById('deliveryJsonError');
+    if (jsonError) jsonError.hidden = true;
+    let payload;
+    try {
+        payload = buildDeliveryConfigPayload();
+    } catch (error) {
+        if (jsonError) jsonError.hidden = false;
+        setDeliveryConfigStatus('高级设置 JSON 格式错误', 'error');
+        return;
+    }
+    setDeliveryConfigBusy(true);
+    setDeliveryConfigStatus('正在保存当前商品配置…');
+    try {
+        const paths = deliveryCardPaths(context.cardId, context.accountId);
+        await deliveryConfigFetch(paths.config, {
+            method: 'PUT', body: JSON.stringify(payload)
+        });
+        if (payload.mode === 'imported_card' || payload.mode === 'generated_card') await saveInventorySettings();
+        setDeliveryConfigStatus('当前商品交付配置已保存', 'success');
+    } catch (error) {
+        setDeliveryConfigStatus(`保存失败：${error.message}`, 'error');
+    } finally {
+        setDeliveryConfigBusy(false);
+    }
+}
+
+async function deleteCurrentDeliveryConfig() {
+    const context = requireDeliveryConfigContext();
+    if (!context) return;
+    setDeliveryConfigBusy(true);
+    try {
+        await deliveryConfigFetch(deliveryCardPaths(context.cardId, context.accountId).config, { method: 'DELETE' });
+        applyDeliveryConfig(null);
+        setDeliveryConfigStatus('当前商品交付配置已删除', 'success');
+    } catch (error) {
+        setDeliveryConfigStatus(`删除失败：${error.message}`, 'error');
+    } finally {
+        setDeliveryConfigBusy(false);
+    }
+}
+
+function parseCsvFirstColumn(line) {
+    const value = String(line || '').trim();
+    if (!value.startsWith('"')) return value.split(',')[0].trim();
+    let result = '';
+    for (let index = 1; index < value.length; index += 1) {
+        if (value[index] === '"' && value[index + 1] === '"') {
+            result += '"';
+            index += 1;
+        } else if (value[index] === '"') {
+            break;
+        } else {
+            result += value[index];
+        }
+    }
+    return result.trim();
+}
+
+function readCardImportFile(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const extension = file.name.toLowerCase().split('.').pop();
+    if (!['txt', 'csv'].includes(extension)) {
+        setDeliveryConfigStatus('请选择 TXT 或 CSV 文件', 'error');
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+        const lines = String(reader.result || '').split(/\r?\n/)
+            .map(line => extension === 'csv' ? parseCsvFirstColumn(line) : line.trim())
+            .filter(Boolean);
+        const input = document.getElementById('cardImportInput');
+        if (input) input.value = lines.join('\n');
+        setDeliveryConfigStatus(`已读取 ${lines.length} 条内容，请确认后导入`);
+    };
+    reader.onerror = () => setDeliveryConfigStatus('读取文件失败，请重试', 'error');
+    reader.readAsText(file, 'UTF-8');
+}
+
+async function importCardInventory() {
+    const context = requireDeliveryConfigContext();
+    if (!context) return;
+    const secrets = (document.getElementById('cardImportInput')?.value || '')
+        .split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+    if (!secrets.length) {
+        setDeliveryConfigStatus('请先粘贴或选择要导入的卡密', 'error');
+        return;
+    }
+    setDeliveryConfigBusy(true);
+    try {
+        await deliveryConfigFetch(deliveryCardPaths(context.cardId, context.accountId).importItems, {
+            method: 'POST', body: JSON.stringify({ secrets })
+        });
+        document.getElementById('cardImportInput').value = '';
+        await refreshDeliveryInventory();
+        setDeliveryConfigStatus('卡密已导入，页面仅显示脱敏预览', 'success');
+    } catch (error) {
+        setDeliveryConfigStatus(`导入失败：${error.message}`, 'error');
+    } finally {
+        setDeliveryConfigBusy(false);
+    }
+}
+
+async function generateCardInventory() {
+    const context = requireDeliveryConfigContext();
+    if (!context) return;
+    setDeliveryConfigBusy(true);
+    try {
+        await saveInventorySettings();
+        await deliveryConfigFetch(deliveryCardPaths(context.cardId, context.accountId).generate, { method: 'POST' });
+        await refreshDeliveryInventory();
+        setDeliveryConfigStatus('库存已按当前生成设置补充', 'success');
+    } catch (error) {
+        setDeliveryConfigStatus(`生成失败：${error.message}`, 'error');
+    } finally {
+        setDeliveryConfigBusy(false);
+    }
+}
+
+async function continueDeliveryProcessing() {
+    setDeliveryConfigBusy(true);
+    try {
+        await refreshDeliveryInventory();
+        setDeliveryConfigStatus('库存状态已刷新；补足后系统将重试');
+    } catch (error) {
+        setDeliveryConfigStatus(`刷新库存失败：${error.message}`, 'error');
+    } finally {
+        setDeliveryConfigBusy(false);
+    }
+}
+
+function initDeliveryConfigUi() {
+    const state = readDeliveryConfigUiState();
+    const prompt = document.getElementById('deliveryConfigPrompt');
+    if (prompt) prompt.hidden = Boolean(state.promptClosed);
+    syncDeliveryConfigPanelState(Boolean(state.collapsed));
+    const defaultContent = document.getElementById('defaultDeliveryContent');
+    if (defaultContent) defaultContent.value = localStorage.getItem(DELIVERY_DEFAULT_CONTENT_KEY) || '';
+
+    document.getElementById('deliveryDefaultSaveButton')?.addEventListener('click', () => {
+        localStorage.setItem(DELIVERY_DEFAULT_CONTENT_KEY, defaultContent?.value || '');
+        setDeliveryConfigStatus('常用默认内容已保存到本机', 'success');
+    });
+    document.getElementById('deliveryDefaultApplyButton')?.addEventListener('click', () => {
+        const input = document.getElementById('fixedLinkInput');
+        if (input) input.value = defaultContent?.value || '';
+        document.getElementById('deliveryMethodSelect').value = 'fixed_link';
+        updateDeliveryMethodSections();
+        setDeliveryConfigStatus('已填入当前商品；点击保存后才会实际保存');
+    });
+    document.getElementById('deliveryConfigSaveButton')?.addEventListener('click', saveCurrentDeliveryConfig);
+    document.getElementById('deliveryConfigDeleteButton')?.addEventListener('click', deleteCurrentDeliveryConfig);
+    document.getElementById('cardImportButton')?.addEventListener('click', importCardInventory);
+    document.getElementById('cardReplenishButton')?.addEventListener('click', generateCardInventory);
+    document.getElementById('cardContinueButton')?.addEventListener('click', continueDeliveryProcessing);
+    document.getElementById('cardImportFileInput')?.addEventListener('change', readCardImportFile);
+    document.getElementById('deliveryMethodSelect')?.addEventListener('change', updateDeliveryMethodSections);
+    document.getElementById('cardGenerateForm')?.addEventListener('submit', event => {
+        event.preventDefault();
+        void generateCardInventory();
+    });
+    updateDeliveryMethodSections();
+}
+
+document.addEventListener('DOMContentLoaded', initDeliveryConfigUi);
+
 function displayItems(items) {
     // 存储所有商品数据
     allItemsData = items || [];
@@ -12923,7 +13390,7 @@ function displayCurrentPageItems() {
     const endIndex = startIndex + itemsPerPage;
     const currentPageItems = filteredItemsData.slice(startIndex, endIndex);
 
-    const itemsHtml = currentPageItems.map(item => {
+    const itemsHtml = currentPageItems.map((item, itemIndex) => {
         // 处理商品标题显示
         let itemTitleDisplay = item.item_title || '未设置';
         if (itemTitleDisplay.length > 30) {
@@ -12967,7 +13434,10 @@ function displayCurrentPageItems() {
         <td>${displayRepublishStatus(item)}</td>
         <td>${formatDateTime(item.updated_at)}</td>
             <td>
-                <div class="btn-group" role="group">
+                <div class="d-flex flex-wrap gap-1" role="group">
+                <button type="button" class="btn btn-sm btn-outline-success" data-delivery-item-index="${itemIndex}">
+                    设置交付方式
+                </button>
                 <button class="btn btn-sm btn-outline-primary" onclick="editItem('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}')" title="编辑详情">
                     <i class="bi bi-pencil"></i>
                 </button>
@@ -12988,6 +13458,10 @@ function displayCurrentPageItems() {
 
     // 更新表格内容
     tbody.innerHTML = itemsHtml;
+    tbody.querySelectorAll('[data-delivery-item-index]').forEach(button => {
+        const item = currentPageItems[Number(button.dataset.deliveryItemIndex)];
+        button.addEventListener('click', () => openDeliveryConfigForItem(item.cookie_id, item.item_id, item.item_title));
+    });
 
     // 重置选择状态
     resetItemsSelection();

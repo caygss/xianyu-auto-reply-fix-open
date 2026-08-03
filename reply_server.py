@@ -1391,6 +1391,41 @@ def _task5_validate_import_request(request: InventoryImportRequest, http_request
         raise CardInventoryError("invalid_input", "导入请求体大小超过限制")
 
 
+@app.post("/api/items/{item_id}/delivery-card")
+def create_item_delivery_card(
+    item_id: str,
+    account_id: str = Query(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    cleaned_item_id = str(item_id or '').strip()
+    if not cleaned_item_id:
+        raise HTTPException(status_code=400, detail="商品 ID 不能为空")
+    cleaned_account_id = _ensure_cookie_access(account_id, current_user)
+
+    item = db_manager.get_item_info(cleaned_account_id, cleaned_item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="商品不存在")
+
+    try:
+        resolved = db_manager.get_or_create_item_delivery_card(
+            current_user["user_id"],
+            cleaned_account_id,
+            cleaned_item_id,
+            item.get("item_title"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="商品不存在") from exc
+
+    return {
+        "card_id": resolved["card_id"],
+        "item_id": cleaned_item_id,
+        "account_id": cleaned_account_id,
+        "created": resolved["created"],
+    }
+
+
 @app.get("/api/cards/{card_id}/delivery-config")
 def get_delivery_config(
     card_id: int,

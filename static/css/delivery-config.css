@@ -9,6 +9,10 @@
   box-sizing: border-box;
 }
 
+.delivery-config-shell [hidden] {
+  display: none !important;
+}
+
 .delivery-config-prompt,
 .delivery-config-panel,
 .delivery-config-section,

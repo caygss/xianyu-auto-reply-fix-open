@@ -1086,10 +1086,10 @@
               <strong>第一次配置自动交付？</strong>
               <p>先选择交付方式，再为当前商品填写内容或准备卡密库存。</p>
             </div>
-            <button type="button" class="delivery-config-icon-button" onclick="closeDeliveryConfigPrompt()" aria-label="关闭新手提示">×</button>
+            <button id="deliveryPromptCloseButton" type="button" class="delivery-config-icon-button" onclick="closeDeliveryConfigPrompt()" aria-label="关闭新手提示">×</button>
           </div>
 
-          <button type="button" class="delivery-config-open-button" onclick="openDeliveryConfigPanel()" aria-controls="deliveryConfigPanel">
+          <button id="deliveryConfigOpenButton" type="button" class="delivery-config-open-button" onclick="openDeliveryConfigPanel()" aria-controls="deliveryConfigPanel" aria-expanded="true">
             <i class="bi bi-box-arrow-in-down" aria-hidden="true"></i>
             打开交付配置
           </button>
@@ -1100,7 +1100,7 @@
                 <p class="delivery-config-eyebrow">商品自动交付</p>
                 <h3 id="deliveryConfigTitle">交付配置</h3>
               </div>
-              <button type="button" class="delivery-config-toggle" onclick="toggleDeliveryConfigPanel()" aria-expanded="true" aria-controls="deliveryConfigPanelBody">
+              <button id="deliveryConfigToggleButton" type="button" class="delivery-config-toggle" onclick="toggleDeliveryConfigPanel()" aria-expanded="true" aria-controls="deliveryConfigPanelBody">
                 收起配置
                 <i class="bi bi-chevron-up" aria-hidden="true"></i>
               </button>
@@ -1113,7 +1113,10 @@
                     <h4 id="deliveryDefaultsTitle">常用默认内容</h4>
                     <p>默认内容保存到本机，可随时填入当前商品。</p>
                   </div>
-                  <button type="button" class="delivery-config-secondary-button">填入当前商品</button>
+                  <div class="delivery-config-actions">
+                    <button id="deliveryDefaultSaveButton" type="button" class="delivery-config-secondary-button">保存到本机</button>
+                    <button id="deliveryDefaultApplyButton" type="button" class="delivery-config-secondary-button">填入当前商品</button>
+                  </div>
                 </div>
                 <label for="defaultDeliveryContent">默认交付内容</label>
                 <textarea id="defaultDeliveryContent" rows="4" placeholder="例如：下载地址、提取码或使用说明"></textarea>
@@ -1138,8 +1141,8 @@
 
                 <div class="delivery-config-method-card" data-delivery-method="fixed_link">
                   <h5>固定内容/网盘链接</h5>
-                  <label for="fixedDeliveryContent">交付内容</label>
-                  <textarea id="fixedDeliveryContent" name="fixed_content" rows="4" placeholder="填写交付说明或网盘链接"></textarea>
+                  <label for="fixedLinkInput">固定链接</label>
+                  <input id="fixedLinkInput" name="fixed_content" type="url" placeholder="https://example.com/download">
                   <p class="delivery-config-help">网盘链接仅支持以 HTTP:// 或 HTTPS:// 开头的链接。</p>
                 </div>
 
@@ -1147,9 +1150,10 @@
                   <h5>导入卡密</h5>
                   <label for="cardImportInput">粘贴卡密</label>
                   <textarea id="cardImportInput" name="secrets" rows="5" placeholder="每行一条卡密"></textarea>
-                  <label for="cardImportFile">从文件导入</label>
-                  <input id="cardImportFile" type="file" accept=".txt,.csv,text/plain,text/csv">
+                  <label for="cardImportFileInput">从文件导入</label>
+                  <input id="cardImportFileInput" type="file" accept=".txt,.csv,text/plain,text/csv">
                   <p class="delivery-config-help">支持 TXT/CSV 文件，导入前请确认每行只包含一条卡密。</p>
+                  <button id="cardImportButton" type="button" class="delivery-config-primary-button">导入卡密</button>
                 </div>
 
                 <div id="cardInventorySummary" class="delivery-config-inventory" aria-labelledby="inventorySummaryTitle">
@@ -1169,12 +1173,12 @@
                   </dl>
                 </div>
 
-                <div class="delivery-config-shortage" role="status">
-                  <strong>库存不足，还需要 X 个</strong>
+                <div id="deliveryInventoryShortage" class="delivery-config-shortage" role="status" hidden>
+                  <strong id="deliveryInventoryShortageText">库存不足，还需要 X 个</strong>
                   <p>本单会暂停，不会少发一部分；补足后系统将重试。</p>
                   <div class="delivery-config-actions">
                     <button id="cardReplenishButton" type="button" class="delivery-config-primary-button">去补充库存</button>
-                    <button type="button" class="delivery-config-secondary-button">继续处理</button>
+                    <button id="cardContinueButton" type="button" class="delivery-config-secondary-button">继续处理</button>
                   </div>
                 </div>
 
@@ -1182,16 +1186,16 @@
                   <h5>自动生成卡密</h5>
                   <div class="delivery-config-form-grid">
                     <div>
-                      <label for="cardStockCeiling">库存上限</label>
-                      <input id="cardStockCeiling" name="stock_ceiling" data-key="stock_ceiling" type="number" min="1">
+                      <label for="inventoryStockCeiling">库存上限</label>
+                      <input id="inventoryStockCeiling" name="stock_ceiling" data-key="stock_ceiling" type="number" min="1">
                     </div>
                     <div>
-                      <label for="cardLowStockThreshold">低库存预警线</label>
-                      <input id="cardLowStockThreshold" name="low_stock_threshold" data-key="low_stock_threshold" type="number" min="0">
+                      <label for="inventoryLowStockThreshold">低库存预警线</label>
+                      <input id="inventoryLowStockThreshold" name="low_stock_threshold" data-key="low_stock_threshold" type="number" min="0">
                     </div>
                     <div class="delivery-config-checkbox-field">
-                      <input id="cardAutoReplenish" name="auto_replenish" data-key="auto_replenish" type="checkbox">
-                      <label for="cardAutoReplenish">自动补充</label>
+                      <input id="inventoryAutoReplenish" name="auto_replenish" data-key="auto_replenish" type="checkbox">
+                      <label for="inventoryAutoReplenish">自动补充</label>
                     </div>
                     <div>
                       <label for="cardGenerateQuantity">生成数量（或补到上限）</label>
@@ -1215,16 +1219,13 @@
                     </div>
                   </div>
                   <p class="delivery-config-help">批次仅作为本机备注，不会发送到服务器。</p>
-                  <button type="submit" class="delivery-config-primary-button">生成卡密</button>
+                  <button id="cardGenerateButton" type="submit" class="delivery-config-primary-button">生成卡密</button>
                 </form>
 
                 <div class="delivery-config-method-card">
                   <h5>脱敏预览</h5>
                   <p class="delivery-config-help">仅显示首尾少量字符，避免泄露卡密。</p>
-                  <ul class="delivery-config-preview" aria-label="脱敏卡密预览">
-                    <li>ABCD••••••7X9Q</li>
-                    <li>SALE••••••2K8M</li>
-                  </ul>
+                  <ul id="inventoryPreviewList" class="delivery-config-preview" aria-label="脱敏卡密预览"></ul>
                 </div>
 
                 <form class="delivery-config-method-card" data-delivery-method="provider_api">
@@ -1239,12 +1240,12 @@
                       <input id="providerToken" name="token" type="password" autocomplete="new-password">
                     </div>
                     <div>
-                      <label for="providerTimeout">超时时间</label>
-                      <input id="providerTimeout" name="timeout_seconds" type="number" min="1">
+                      <label for="providerTimeoutSeconds">超时时间</label>
+                      <input id="providerTimeoutSeconds" name="timeout_seconds" type="number" min="1" value="10">
                     </div>
                     <div>
-                      <label for="providerRetries">重试次数</label>
-                      <input id="providerRetries" name="max_retries" type="number" min="0">
+                      <label for="providerMaxRetries">重试次数</label>
+                      <input id="providerMaxRetries" name="max_retries" type="number" min="0" value="2">
                     </div>
                     <div>
                       <label for="providerResponseField">响应内容字段</label>
@@ -1267,14 +1268,14 @@
                         <textarea id="providerFieldMapping" name="field_mapping" rows="4" placeholder='{"content":"data.code"}'></textarea>
                       </div>
                     </div>
-                    <p class="delivery-config-json-error" role="alert">高级设置 JSON 格式错误</p>
+                    <p id="deliveryJsonError" class="delivery-config-json-error" role="alert" hidden>高级设置 JSON 格式错误</p>
                   </details>
                 </form>
 
-                <div class="delivery-config-status" aria-live="polite" aria-atomic="true">尚未保存交付配置。</div>
+                <div id="deliveryConfigStatus" class="delivery-config-status" aria-live="polite" aria-atomic="true">尚未保存交付配置。</div>
                 <div class="delivery-config-actions delivery-config-save-actions">
-                  <button type="button" class="delivery-config-primary-button">保存当前商品配置</button>
-                  <button type="button" class="delivery-config-secondary-button">取消</button>
+                  <button id="deliveryConfigSaveButton" type="button" class="delivery-config-primary-button">保存当前商品配置</button>
+                  <button id="deliveryConfigDeleteButton" type="button" class="delivery-config-secondary-button">删除配置</button>
                 </div>
               </section>
             </div>

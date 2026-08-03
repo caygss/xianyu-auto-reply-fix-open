@@ -633,6 +633,26 @@ class DBManager:
             )
             ''')
 
+            # 闲鱼商品 ID 与内部交付卡券 ID 的持久绑定。
+            # 旧数据库通过 IF NOT EXISTS 安全迁移，不把交付密钥写入 cards 明文字段。
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS item_delivery_bindings (
+                user_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                card_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, account_id, item_id),
+                FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+            )
+            ''')
+            self._execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_item_delivery_bindings_card_id "
+                "ON item_delivery_bindings(card_id)",
+            )
+
             # 检查并添加 multi_quantity_delivery 列（用于多数量发货功能）
             try:
                 self._execute_sql(cursor, "SELECT multi_quantity_delivery FROM item_info LIMIT 1")
@@ -4870,6 +4890,104 @@ Cookie数量: {cookie_count}
             return False
 
     # ==================== 卡券管理方法 ====================
+
+    def get_or_create_item_delivery_card(
+        self,
+        user_id: int,
+        account_id: str,
+        item_id: str,
+        item_title: str = None,
+    ) -> Dict[str, Any]:
+        """幂等获取商品绑定的内部交付卡券。"""
+        cleaned_account_id = str(account_id or '').strip()
+        cleaned_item_id = str(item_id or '').strip()
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("用户 ID 无效")
+        if not cleaned_account_id or not cleaned_item_id:
+            raise ValueError("账号 ID 和商品 ID 不能为空")
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(cursor, "BEGIN IMMEDIATE")
+                self._execute_sql(
+                    cursor,
+                    "SELECT item_title FROM item_info WHERE cookie_id = ? AND item_id = ?",
+                    (cleaned_account_id, cleaned_item_id),
+                )
+                item_row = cursor.fetchone()
+                if not item_row:
+                    self.conn.rollback()
+                    raise LookupError("商品不存在")
+
+                self._execute_sql(
+                    cursor,
+                    """
+                    SELECT b.card_id
+                    FROM item_delivery_bindings b
+                    INNER JOIN cards c ON c.id = b.card_id AND c.user_id = b.user_id
+                    WHERE b.user_id = ? AND b.account_id = ? AND b.item_id = ?
+                    """,
+                    (user_id, cleaned_account_id, cleaned_item_id),
+                )
+                binding = cursor.fetchone()
+                if binding:
+                    self.conn.commit()
+                    return {"card_id": int(binding[0]), "created": False}
+
+                display_title = str(item_title or item_row[0] or cleaned_item_id).strip()
+                display_title = display_title[:80] or cleaned_item_id[:80]
+                self._execute_sql(
+                    cursor,
+                    """
+                    INSERT INTO cards (
+                        name, type, description, enabled, user_id,
+                        api_config, text_content, data_content
+                    ) VALUES (?, 'text', ?, 1, ?, NULL, NULL, NULL)
+                    """,
+                    (
+                        f"商品交付：{display_title}",
+                        "[system:item-delivery-binding] 交付配置内部记录",
+                        user_id,
+                    ),
+                )
+                card_id = int(cursor.lastrowid)
+                try:
+                    self._execute_sql(
+                        cursor,
+                        """
+                        INSERT INTO item_delivery_bindings (
+                            user_id, account_id, item_id, card_id
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (user_id, cleaned_account_id, cleaned_item_id, card_id),
+                    )
+                except sqlite3.IntegrityError:
+                    self._execute_sql(cursor, "DELETE FROM cards WHERE id = ?", (card_id,))
+                    self._execute_sql(
+                        cursor,
+                        """
+                        SELECT card_id FROM item_delivery_bindings
+                        WHERE user_id = ? AND account_id = ? AND item_id = ?
+                        """,
+                        (user_id, cleaned_account_id, cleaned_item_id),
+                    )
+                    binding = cursor.fetchone()
+                    if not binding:
+                        raise
+                    self.conn.commit()
+                    return {"card_id": int(binding[0]), "created": False}
+
+                self.conn.commit()
+                return {"card_id": card_id, "created": True}
+            except (LookupError, ValueError):
+                if self.conn.in_transaction:
+                    self.conn.rollback()
+                raise
+            except Exception:
+                if self.conn.in_transaction:
+                    self.conn.rollback()
+                raise
 
     def create_card(self, name: str, card_type: str, api_config=None,
                    text_content: str = None, data_content: str = None, image_url: str = None,
