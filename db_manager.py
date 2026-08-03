@@ -1548,32 +1548,73 @@ Cookie数量: {cookie_count}
 
     def _update_cards_table_constraints(self, cursor):
         """更新cards表的CHECK约束以支持image和yifan_api类型"""
+        probe_savepoint = "cards_yifan_api_constraint_probe"
+
+        def rollback_probe():
+            try:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {probe_savepoint}")
+                cursor.execute(f"RELEASE SAVEPOINT {probe_savepoint}")
+            except sqlite3.DatabaseError as cleanup_error:
+                raise _CardsTableMigrationError(
+                    "无法安全清理cards表约束探测"
+                ) from cleanup_error
+
         try:
-            cards_schema = cursor.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cards'"
+            cursor.execute(f"SAVEPOINT {probe_savepoint}")
+        except sqlite3.DatabaseError as savepoint_error:
+            raise _CardsTableMigrationError(
+                "无法安全探测cards表约束：创建SAVEPOINT失败"
+            ) from savepoint_error
+
+        try:
+            probe_user = cursor.execute(
+                "SELECT id FROM users ORDER BY id LIMIT 1"
             ).fetchone()
-        except sqlite3.DatabaseError as schema_error:
+            if probe_user:
+                probe_user_id = probe_user[0]
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO users (username, email, password_hash)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        "__cards_constraint_probe_user__",
+                        "__cards_constraint_probe_user__@localhost.invalid",
+                        "__cards_constraint_probe_password_hash__",
+                    ),
+                )
+                probe_user_id = cursor.lastrowid
+        except Exception as user_probe_error:
+            rollback_probe()
             raise _CardsTableMigrationError(
-                "无法安全检查cards表约束：读取建表SQL失败"
-            ) from schema_error
+                "无法安全探测cards表约束：准备探测用户失败"
+            ) from user_probe_error
 
-        if (
-            not cards_schema
-            or not isinstance(cards_schema[0], str)
-            or not cards_schema[0].strip()
-        ):
-            raise _CardsTableMigrationError(
-                "无法安全检查cards表约束：缺少有效的建表SQL"
+        try:
+            cursor.execute(
+                "INSERT INTO cards (name, type, user_id) VALUES (?, ?, ?)",
+                ("__cards_yifan_api_constraint_probe__", "yifan_api", probe_user_id),
             )
-
-        check_constraints = re.findall(
-            r"\bCHECK\s*\((.*?)\)",
-            cards_schema[0],
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if not check_constraints or any(
-            "yifan_api" in constraint.lower() for constraint in check_constraints
-        ):
+        except sqlite3.IntegrityError as probe_error:
+            rollback_probe()
+            is_check_constraint = (
+                getattr(probe_error, "sqlite_errorcode", None)
+                == sqlite3.SQLITE_CONSTRAINT_CHECK
+                and getattr(probe_error, "sqlite_errorname", None)
+                == "SQLITE_CONSTRAINT_CHECK"
+            )
+            if not is_check_constraint:
+                raise _CardsTableMigrationError(
+                    "无法安全探测cards表约束：插入探测卡券失败"
+                ) from probe_error
+        except Exception as probe_error:
+            rollback_probe()
+            raise _CardsTableMigrationError(
+                "无法安全探测cards表约束：插入探测卡券失败"
+            ) from probe_error
+        else:
+            rollback_probe()
             logger.info("cards表约束检查通过，支持yifan_api类型")
             return
 
@@ -1627,6 +1668,9 @@ Cookie数量: {cookie_count}
 
             cursor.execute("DROP TABLE cards")
             cursor.execute("ALTER TABLE cards_new RENAME TO cards")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cards_user_id ON cards(user_id)"
+            )
 
             foreign_key_violations = cursor.execute(
                 "PRAGMA foreign_key_check"

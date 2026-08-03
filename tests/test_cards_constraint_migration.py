@@ -34,7 +34,13 @@ def _make_current_cards_database_without_user_one(tmp_path):
     return db_path, cards_rootpage
 
 
-def _make_legacy_cards_database(tmp_path, *, invalid_user=False):
+def _make_legacy_cards_database(
+    tmp_path,
+    *,
+    invalid_user=False,
+    type_constraint="type IN ('api', 'text', 'data', 'image')",
+    required_probe_guard=False,
+):
     db_path = tmp_path / "legacy-cards.sqlite3"
     manager = DBManager(str(db_path))
     manager.close()
@@ -42,12 +48,14 @@ def _make_legacy_cards_database(tmp_path, *, invalid_user=False):
     connection = sqlite3.connect(str(db_path))
     connection.execute("PRAGMA foreign_keys = OFF")
     connection.execute("DROP TABLE cards")
+    probe_guard_column = "probe_guard TEXT NOT NULL," if required_probe_guard else ""
     connection.execute(
-        """
+        f"""
         CREATE TABLE cards (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            type TEXT NOT NULL CHECK (type IN ('api', 'text', 'data', 'image')),
+            type TEXT NOT NULL CHECK ({type_constraint}),
+            {probe_guard_column}
             api_config TEXT,
             text_content TEXT,
             data_content TEXT,
@@ -67,26 +75,39 @@ def _make_legacy_cards_database(tmp_path, *, invalid_user=False):
         )
         """
     )
+    connection.execute("CREATE INDEX idx_cards_user_id ON cards(user_id)")
     card_user_id = 999 if invalid_user else 1
+    card_columns = [
+        "id",
+        "name",
+        "type",
+        "description",
+        "is_multi_spec",
+        "spec_name",
+        "spec_value",
+        "spec_name_2",
+        "spec_value_2",
+        "user_id",
+    ]
+    card_values = [
+        41,
+        "历史绑定卡券",
+        "text",
+        f"{ITEM_DELIVERY_BINDING_MARKER} legacy",
+        1,
+        "color",
+        "red",
+        "size",
+        "small",
+        card_user_id,
+    ]
+    if required_probe_guard:
+        card_columns.append("probe_guard")
+        card_values.append("existing")
     connection.execute(
-        """
-        INSERT INTO cards (
-            id, name, type, description, is_multi_spec, spec_name, spec_value,
-            spec_name_2, spec_value_2, user_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            41,
-            "历史绑定卡券",
-            "text",
-            f"{ITEM_DELIVERY_BINDING_MARKER} legacy",
-            1,
-            "color",
-            "red",
-            "size",
-            "small",
-            card_user_id,
-        ),
+        f"INSERT INTO cards ({', '.join(card_columns)}) "
+        f"VALUES ({', '.join('?' for _ in card_values)})",
+        card_values,
     )
     connection.execute(
         """
@@ -159,8 +180,58 @@ def test_legacy_cards_constraint_migration_preserves_specs_and_references(tmp_pa
         assert manager.conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cards_new'"
         ).fetchone() is None
+        assert manager.conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'index' AND name = 'idx_cards_user_id'"
+        ).fetchone() == ("idx_cards_user_id",)
     finally:
         manager.close()
+
+
+def test_misleading_yifan_api_check_is_migrated_instead_of_skipped(tmp_path):
+    db_path = _make_legacy_cards_database(
+        tmp_path,
+        type_constraint="type <> 'yifan_api'",
+    )
+
+    manager = DBManager(str(db_path))
+    try:
+        manager.conn.execute(
+            "INSERT INTO cards (name, type, user_id) VALUES (?, ?, ?)",
+            ("真实探测卡券", "yifan_api", 1),
+        )
+        assert manager.conn.execute(
+            "SELECT type FROM cards WHERE name = ?",
+            ("真实探测卡券",),
+        ).fetchone() == ("yifan_api",)
+    finally:
+        manager.close()
+
+
+def test_non_check_probe_error_fails_safely_without_rebuilding(tmp_path):
+    db_path = _make_legacy_cards_database(
+        tmp_path,
+        type_constraint="type IN ('api', 'yifan_api', 'text', 'data', 'image')",
+        required_probe_guard=True,
+    )
+
+    with pytest.raises(RuntimeError, match="无法安全探测cards表约束"):
+        DBManager(str(db_path))
+
+    connection = sqlite3.connect(str(db_path))
+    try:
+        assert connection.execute(
+            "SELECT probe_guard FROM cards WHERE id = 41"
+        ).fetchone() == ("existing",)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cards_new'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'index' AND name = 'idx_cards_user_id'"
+        ).fetchone() == ("idx_cards_user_id",)
+    finally:
+        connection.close()
 
 
 def test_cards_constraint_migration_failure_rolls_back_without_temp_table(tmp_path):
