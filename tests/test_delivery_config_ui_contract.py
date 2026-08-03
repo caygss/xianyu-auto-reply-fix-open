@@ -16,6 +16,7 @@ REQUIRED_IDS = {
     "defaultDeliveryContent",
     "cardInventorySummary",
     "cardImportInput",
+    "cardGeneratorBatch",
     "cardGenerateForm",
     "cardReplenishButton",
     "deliveryConfigStatus",
@@ -232,6 +233,77 @@ def test_delivery_payloads_match_backend_contract_and_inventory_settings_are_sco
     assert "quantity" not in settings_source
 
 
+def test_generation_batch_note_is_saved_locally_per_item_and_never_sent():
+    assert "deliveryCardBatchNotes" in APP
+
+    batch_handlers = re.search(
+        r"function\s+saveDeliveryCardBatchNote[\s\S]*?"
+        r"(?=\n(?:async\s+)?function\s|\Z)",
+        APP,
+    )
+    assert batch_handlers
+    batch_source = batch_handlers.group(0)
+    assert "cardGeneratorBatch" in batch_source
+    assert "localStorage.setItem" in batch_source
+    assert "accountId" in APP
+    assert "itemId" in APP
+    assert "cardId" in APP
+
+    restore = re.search(
+        r"function\s+restoreDeliveryCardBatchNote[\s\S]*?"
+        r"(?=\n(?:async\s+)?function\s|\Z)",
+        APP,
+    )
+    assert restore
+    assert "cardGeneratorBatch" in restore.group(0)
+    assert "localStorage.getItem" in APP
+    assert re.search(
+        r"cardGeneratorBatch['\"]\)\?\.addEventListener\(['\"]input['\"]"
+        r"\s*,\s*saveDeliveryCardBatchNote\)",
+        APP,
+    )
+
+    for function_name in (
+        "buildInventorySettingsPayload",
+        "saveInventorySettings",
+        "generateCardInventory",
+    ):
+        function_match = re.search(
+            rf"(?:async\s+)?function\s+{function_name}[\s\S]*?"
+            r"(?=\n(?:async\s+)?function\s|\Z)",
+            APP,
+        )
+        assert function_match
+        assert "batch" not in function_match.group(0).lower()
+
+
+def test_replenish_button_dispatches_by_delivery_method():
+    assert re.search(
+        r'<button[^>]*id=["\']cardReplenishButton["\'][^>]*'
+        r'onclick=["\']handleCardReplenish\(\)["\']',
+        INDEX,
+    )
+    handler = re.search(
+        r"function\s+handleCardReplenish[\s\S]*?"
+        r"(?=\n(?:async\s+)?function\s|\Z)",
+        APP,
+    )
+    assert handler
+    source = handler.group(0)
+    assert "deliveryMethodSelect" in source
+    assert re.search(
+        r"mode\s*===\s*['\"]imported_card['\"][\s\S]*?"
+        r"cardImportInput[\s\S]*?focus\(\)[\s\S]*?return",
+        source,
+    )
+    assert "粘贴" in source or "导入" in source
+    assert re.search(
+        r"mode\s*===\s*['\"]generated_card['\"][\s\S]*?generateCardInventory\(",
+        source,
+    )
+    assert source.count("generateCardInventory(") == 1
+
+
 def test_masked_preview_uses_textcontent_and_controls_have_handlers():
     preview_match = re.search(
         r"function\s+renderInventoryPreview[\s\S]*?(?=\n(?:async\s+)?function\s|\Z)",
@@ -247,7 +319,6 @@ def test_masked_preview_uses_textcontent_and_controls_have_handlers():
         "deliveryConfigSaveButton",
         "deliveryConfigDeleteButton",
         "cardImportButton",
-        "cardReplenishButton",
         "cardContinueButton",
         "cardImportFileInput",
         "deliveryMethodSelect",

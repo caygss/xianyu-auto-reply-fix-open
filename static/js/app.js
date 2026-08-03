@@ -12853,6 +12853,7 @@ async function checkRepublishNow(templateId) {
 
 const DELIVERY_UI_STATE_KEY = 'deliveryConfigUiState';
 const DELIVERY_DEFAULT_CONTENT_KEY = 'deliveryDefaultContent';
+const DELIVERY_CARD_BATCH_NOTES_KEY = 'deliveryCardBatchNotes';
 let deliveryConfigContext = null;
 
 function readDeliveryConfigUiState() {
@@ -12865,6 +12866,35 @@ function readDeliveryConfigUiState() {
 
 function writeDeliveryConfigUiState(nextState) {
     localStorage.setItem(DELIVERY_UI_STATE_KEY, JSON.stringify(nextState));
+}
+
+function deliveryCardBatchNoteKey(context = deliveryConfigContext) {
+    if (!context) return '';
+    return JSON.stringify([context.accountId, context.itemId, context.cardId]);
+}
+
+function readDeliveryCardBatchNotes() {
+    try {
+        return JSON.parse(localStorage.getItem(DELIVERY_CARD_BATCH_NOTES_KEY) || '{}');
+    } catch (error) {
+        return {};
+    }
+}
+
+function restoreDeliveryCardBatchNote() {
+    const input = document.getElementById('cardGeneratorBatch');
+    const key = deliveryCardBatchNoteKey();
+    if (input) input.value = key ? (readDeliveryCardBatchNotes()[key] || '') : '';
+}
+
+function saveDeliveryCardBatchNote() {
+    const input = document.getElementById('cardGeneratorBatch');
+    const key = deliveryCardBatchNoteKey();
+    if (!input || !key) return;
+    const notes = readDeliveryCardBatchNotes();
+    notes[key] = input.value;
+    localStorage.setItem(DELIVERY_CARD_BATCH_NOTES_KEY, JSON.stringify(notes));
+    setDeliveryConfigStatus('批次备注已保存到本机', 'success');
 }
 
 function syncDeliveryConfigPanelState(collapsed) {
@@ -13062,6 +13092,7 @@ async function openDeliveryConfigForItem(accountId, itemId, itemTitle) {
         );
         const cardId = resolved.card_id;
         deliveryConfigContext = { accountId: normalizedAccountId, itemId: normalizedItemId, itemTitle: String(itemTitle || ''), cardId };
+        restoreDeliveryCardBatchNote();
         openDeliveryConfigPanel();
         document.getElementById('deliveryConfigPanel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
         const paths = deliveryCardPaths(cardId, normalizedAccountId);
@@ -13271,6 +13302,20 @@ async function generateCardInventory() {
     }
 }
 
+function handleCardReplenish() {
+    const mode = document.getElementById('deliveryMethodSelect')?.value;
+    if (mode === 'imported_card') {
+        updateDeliveryMethodSections();
+        const input = document.getElementById('cardImportInput');
+        input?.focus();
+        setDeliveryConfigStatus('请粘贴卡密或选择文件导入后补充库存');
+        return;
+    }
+    if (mode === 'generated_card') {
+        void generateCardInventory();
+    }
+}
+
 async function continueDeliveryProcessing() {
     setDeliveryConfigBusy(true);
     try {
@@ -13305,9 +13350,9 @@ function initDeliveryConfigUi() {
     document.getElementById('deliveryConfigSaveButton')?.addEventListener('click', saveCurrentDeliveryConfig);
     document.getElementById('deliveryConfigDeleteButton')?.addEventListener('click', deleteCurrentDeliveryConfig);
     document.getElementById('cardImportButton')?.addEventListener('click', importCardInventory);
-    document.getElementById('cardReplenishButton')?.addEventListener('click', generateCardInventory);
     document.getElementById('cardContinueButton')?.addEventListener('click', continueDeliveryProcessing);
     document.getElementById('cardImportFileInput')?.addEventListener('change', readCardImportFile);
+    document.getElementById('cardGeneratorBatch')?.addEventListener('input', saveDeliveryCardBatchNote);
     document.getElementById('deliveryMethodSelect')?.addEventListener('change', updateDeliveryMethodSections);
     document.getElementById('cardGenerateForm')?.addEventListener('submit', event => {
         event.preventDefault();

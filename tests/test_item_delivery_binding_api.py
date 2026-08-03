@@ -107,6 +107,26 @@ def test_first_create_and_repeat_return_one_user_isolated_internal_card(binding_
     assert card[5:] == (None, None, None)
 
 
+def test_internal_delivery_card_is_hidden_from_lists_but_available_by_id(binding_state):
+    visible_card_id = binding_state.create_card(
+        name="普通卡券",
+        card_type="text",
+        description="用户备注恰好包含 item-delivery-binding 文字",
+        user_id=OWNER["user_id"],
+    )
+    binding = _call_endpoint()
+
+    listed_ids = {
+        card["id"] for card in binding_state.get_all_cards(OWNER["user_id"])
+    }
+
+    assert visible_card_id in listed_ids
+    assert binding["card_id"] not in listed_ids
+    assert binding_state.get_card_by_id(
+        binding["card_id"], OWNER["user_id"]
+    )["id"] == binding["card_id"]
+
+
 def test_concurrent_get_or_create_produces_one_binding_and_one_card(binding_state):
     def create_once():
         return binding_state.get_or_create_item_delivery_card(

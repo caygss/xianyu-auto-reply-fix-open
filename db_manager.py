@@ -17,6 +17,8 @@ from urllib.parse import parse_qs, urlparse
 from cryptography.fernet import Fernet, InvalidToken
 from loguru import logger
 
+ITEM_DELIVERY_BINDING_MARKER = "[system:item-delivery-binding]"
+
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
     
@@ -4947,7 +4949,7 @@ Cookie数量: {cookie_count}
                     """,
                     (
                         f"商品交付：{display_title}",
-                        "[system:item-delivery-binding] 交付配置内部记录",
+                        f"{ITEM_DELIVERY_BINDING_MARKER} 交付配置内部记录",
                         user_id,
                     ),
                 )
@@ -5070,16 +5072,29 @@ Cookie数量: {cookie_count}
                            spec_name, spec_value, spec_name_2, spec_value_2, created_at, updated_at
                     FROM cards
                     WHERE user_id = ?
+                      AND (
+                          description IS NULL
+                          OR substr(description, 1, ?) != ?
+                      )
                     ORDER BY created_at DESC
-                    ''', (user_id,))
+                    ''', (
+                        user_id,
+                        len(ITEM_DELIVERY_BINDING_MARKER),
+                        ITEM_DELIVERY_BINDING_MARKER,
+                    ))
                 else:
                     cursor.execute('''
                     SELECT id, name, type, api_config, text_content, data_content, image_url,
                            description, enabled, delay_seconds, is_multi_spec,
                            spec_name, spec_value, spec_name_2, spec_value_2, created_at, updated_at
                     FROM cards
+                    WHERE description IS NULL
+                       OR substr(description, 1, ?) != ?
                     ORDER BY created_at DESC
-                    ''')
+                    ''', (
+                        len(ITEM_DELIVERY_BINDING_MARKER),
+                        ITEM_DELIVERY_BINDING_MARKER,
+                    ))
 
                 cards = []
                 for row in cursor.fetchall():
