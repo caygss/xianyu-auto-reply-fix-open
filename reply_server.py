@@ -10377,6 +10377,7 @@ def debug_keywords_table_info(current_user: Dict[str, Any] = Depends(get_current
     try:
         import sqlite3
         conn = sqlite3.connect(db_manager.db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
         cursor = conn.cursor()
 
         # 获取表结构信息
@@ -13204,6 +13205,7 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
 
             # 验证数据库文件完整性
             conn = sqlite3.connect(temp_file_path)
+            conn.execute("PRAGMA foreign_keys = ON")
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
             tables = cursor.fetchall()
