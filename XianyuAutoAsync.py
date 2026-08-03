@@ -50,6 +50,7 @@ MANUAL_VERIFICATION_CONTEXTS = {
 
 DELIVERY_BATCH_MAX_UNITS = 10
 DELIVERY_BATCH_MAX_CHARS = 1200
+_ITEM_DELIVERY_BINDING_UNSET = object()
 PROTECTED_SESSION_COOKIE_FIELDS = (
     'unb',
     'sgcookie',
@@ -4908,6 +4909,14 @@ class XianyuLive:
                 )
                 return True
 
+            order_quantity, preparation_plan = (
+                self._build_known_order_auto_delivery_preparation_plan(
+                    item_id,
+                    order,
+                    legacy_unit_indexes=[1],
+                )
+            )
+            preparation = preparation_plan[0]
             delivery_result = await self._auto_delivery(
                 item_id,
                 "待获取商品信息",
@@ -4915,6 +4924,9 @@ class XianyuLive:
                 buyer_id,
                 '',
                 include_meta=True,
+                delivery_unit_index=preparation['unit_index'],
+                quantity=preparation['quantity'],
+                order_line_id=preparation['order_line_id'],
             )
             if isinstance(delivery_result, dict):
                 delivery_content = delivery_result.get('content')
@@ -4998,7 +5010,7 @@ class XianyuLive:
                 self._sync_order_delivery_progress(
                     order_id=order_id,
                     cookie_id=self.cookie_id,
-                    expected_quantity=int(order.get('quantity') or 1),
+                    expected_quantity=order_quantity,
                     context=f"{source} 自动发货成功",
                 )
                 self._activate_delivery_lock(lock_key, delay_minutes=10)
@@ -5778,9 +5790,26 @@ class XianyuLive:
                     logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ✅ 简化消息自动发货补完成收尾成功')
                     return
                 
-                # 调用自动发货方法获取发货内容
+                # 调用自动发货方法获取发货内容；绑定商品使用缓存订单整单数量，
+                # legacy 入口继续保持单次准备。
+                from db_manager import db_manager
+                cached_order = db_manager.get_order_by_id(order_id) or {}
+                _, preparation_plan = self._build_known_order_auto_delivery_preparation_plan(
+                    item_id,
+                    cached_order,
+                    legacy_unit_indexes=[1],
+                )
+                preparation = preparation_plan[0]
                 delivery_result = await self._auto_delivery(
-                    item_id, item_title, order_id, user_id, chat_id, include_meta=True
+                    item_id,
+                    item_title,
+                    order_id,
+                    user_id,
+                    chat_id,
+                    include_meta=True,
+                    delivery_unit_index=preparation['unit_index'],
+                    quantity=preparation['quantity'],
+                    order_line_id=preparation['order_line_id'],
                 )
                 if isinstance(delivery_result, dict):
                     delivery_content = delivery_result.get('content')
@@ -6295,44 +6324,17 @@ class XianyuLive:
 
                     logger.info(f"【{self.cookie_id}】准备自动发货: item_id={item_id}, item_title={item_title}")
 
-                    # 检查是否需要多数量发货
-                    from db_manager import db_manager
-                    quantity_to_send = 1  # 默认发送1个
-
-                    # 检查商品是否开启了多数量发货
-                    multi_quantity_delivery = db_manager.get_item_multi_quantity_delivery_status(self.cookie_id, item_id)
-
-                    if multi_quantity_delivery and order_id:
-                        logger.info(f"商品 {item_id} 开启了多数量发货，获取订单详情...")
-                        try:
-                            # 使用现有方法获取订单详情
-                            order_detail = await self.fetch_order_detail_info(order_id, item_id, send_user_id)
-                            if order_detail and order_detail.get('quantity'):
-                                try:
-                                    order_quantity = int(order_detail['quantity'])
-                                    if order_quantity > 1:
-                                        quantity_to_send = order_quantity
-                                        logger.info(f"从订单详情获取数量: {order_quantity}，将发送 {quantity_to_send} 个卡券")
-                                    else:
-                                        logger.info(f"订单数量为 {order_quantity}，发送单个卡券")
-                                except (ValueError, TypeError):
-                                    logger.warning(f"订单数量格式无效: {order_detail.get('quantity')}，发送单个卡券")
-                            else:
-                                logger.info(f"未获取到订单数量信息，发送单个卡券")
-                        except Exception as e:
-                            logger.error(f"获取订单详情失败: {self._safe_str(e)}，发送单个卡券")
-                    elif not multi_quantity_delivery:
-                        logger.info(f"商品 {item_id} 未开启多数量发货，发送单个卡券")
-                    else:
-                        logger.info(f"无订单ID，发送单个卡券")
+                    quantity_to_send, preparation_plan = await (
+                        self._build_order_auto_delivery_preparation_plan(
+                            item_id,
+                            order_id,
+                            send_user_id,
+                        )
+                    )
 
                     successful_send_count = 0
                     last_delivery_error = None
                     prepared_units = []
-                    preparation_plan = self._build_auto_delivery_preparation_plan(
-                        item_id,
-                        quantity_to_send,
-                    )
 
                     for preparation in preparation_plan:
                         unit_index = preparation['unit_index']
@@ -11931,14 +11933,27 @@ class XianyuLive:
             normalized_item_id,
         )
 
-    def _build_auto_delivery_preparation_plan(self, item_id: str, quantity):
-        """Plan one whole-order preparation for bindings, or legacy per-unit calls."""
+    @staticmethod
+    def _normalize_auto_delivery_quantity(quantity) -> int:
         try:
-            normalized_quantity = max(1, int(quantity or 1))
+            return max(1, int(quantity or 1))
         except (TypeError, ValueError):
-            normalized_quantity = 1
+            return 1
 
-        binding = self._get_bound_item_delivery(item_id)
+    def _build_auto_delivery_preparation_plan(
+        self,
+        item_id: str,
+        quantity,
+        *,
+        legacy_unit_indexes=None,
+        item_delivery_binding=_ITEM_DELIVERY_BINDING_UNSET,
+    ):
+        """Plan one whole-order preparation for bindings, or legacy per-unit calls."""
+        normalized_quantity = self._normalize_auto_delivery_quantity(quantity)
+
+        binding = item_delivery_binding
+        if binding is _ITEM_DELIVERY_BINDING_UNSET:
+            binding = self._get_bound_item_delivery(item_id)
         if binding:
             return [{
                 "unit_index": 1,
@@ -11947,6 +11962,18 @@ class XianyuLive:
                 "configured": True,
                 "card_id": binding.get("card_id"),
             }]
+
+        if legacy_unit_indexes is None:
+            normalized_unit_indexes = list(range(1, normalized_quantity + 1))
+        else:
+            normalized_unit_indexes = []
+            for value in legacy_unit_indexes:
+                try:
+                    unit_index = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if unit_index > 0:
+                    normalized_unit_indexes.append(unit_index)
         return [
             {
                 "unit_index": unit_index,
@@ -11955,8 +11982,62 @@ class XianyuLive:
                 "configured": False,
                 "card_id": None,
             }
-            for unit_index in range(1, normalized_quantity + 1)
+            for unit_index in normalized_unit_indexes
         ]
+
+    async def _build_order_auto_delivery_preparation_plan(
+        self,
+        item_id: str,
+        order_id: str,
+        buyer_id: str,
+    ):
+        """Resolve main-entry quantity while preserving the legacy quantity switch."""
+        from db_manager import db_manager
+
+        binding = self._get_bound_item_delivery(item_id)
+        legacy_multi_enabled = db_manager.get_item_multi_quantity_delivery_status(
+            self.cookie_id,
+            item_id,
+        )
+        quantity = 1
+        should_read_order_quantity = bool(order_id and (binding or legacy_multi_enabled))
+        if should_read_order_quantity:
+            try:
+                order_detail = await self.fetch_order_detail_info(
+                    order_id,
+                    item_id,
+                    buyer_id,
+                )
+                quantity = self._normalize_auto_delivery_quantity(
+                    order_detail.get('quantity') if isinstance(order_detail, dict) else None
+                )
+            except Exception as quantity_error:
+                logger.error(
+                    f"获取订单数量失败: order_id={order_id}, item_id={item_id}, "
+                    f"error={self._safe_str(quantity_error)}，安全回退为1"
+                )
+
+        preparation_plan = self._build_auto_delivery_preparation_plan(
+            item_id,
+            quantity,
+            item_delivery_binding=binding,
+        )
+        return quantity, preparation_plan
+
+    def _build_known_order_auto_delivery_preparation_plan(
+        self,
+        item_id: str,
+        order: dict,
+        *,
+        legacy_unit_indexes,
+    ):
+        """Build a plan when an entry already owns an order quantity."""
+        quantity = self._normalize_auto_delivery_quantity((order or {}).get('quantity'))
+        return quantity, self._build_auto_delivery_preparation_plan(
+            item_id,
+            quantity,
+            legacy_unit_indexes=legacy_unit_indexes,
+        )
 
     @staticmethod
     def _delivery_result_to_rule_meta(delivery_result: dict):

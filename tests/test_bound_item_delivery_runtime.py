@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections import defaultdict
 
 import pytest
 
@@ -654,3 +655,275 @@ def test_configured_result_metadata_is_preserved_without_config_secret_or_log_to
     assert "contents" not in meta
     visible_reason = live._format_delivery_log_reason("发货准备完成", meta)
     assert "internal-claim-token" not in visible_reason
+
+
+def test_main_preparation_reads_bound_quantity_when_legacy_toggle_is_false(runtime, monkeypatch):
+    live, manager = runtime
+    card_id = create_binding(manager)
+    fetch_calls = []
+
+    async def fetch_quantity_three(*args, **kwargs):
+        fetch_calls.append((args, kwargs))
+        return {"quantity": "3"}
+
+    monkeypatch.setattr(live, "fetch_order_detail_info", fetch_quantity_three)
+    monkeypatch.setattr(
+        manager,
+        "get_item_multi_quantity_delivery_status",
+        lambda *args, **kwargs: False,
+    )
+
+    quantity, plan = asyncio.run(
+        live._build_order_auto_delivery_preparation_plan(
+            ITEM_ID,
+            "order-main-bound",
+            "buyer-1",
+        )
+    )
+
+    assert len(fetch_calls) == 1
+    assert quantity == 3
+    assert plan == [
+        {
+            "unit_index": 1,
+            "quantity": 3,
+            "order_line_id": ITEM_ID,
+            "configured": True,
+            "card_id": card_id,
+        }
+    ]
+
+    async def fetch_invalid_quantity(*args, **kwargs):
+        return {"quantity": "invalid"}
+
+    monkeypatch.setattr(live, "fetch_order_detail_info", fetch_invalid_quantity)
+    invalid_quantity, invalid_plan = asyncio.run(
+        live._build_order_auto_delivery_preparation_plan(
+            ITEM_ID,
+            "order-main-invalid",
+            "buyer-1",
+        )
+    )
+    assert invalid_quantity == 1
+    assert invalid_plan[0]["quantity"] == 1
+
+    with manager.lock:
+        manager.conn.execute(
+            "DELETE FROM item_delivery_bindings WHERE item_id = ?",
+            (ITEM_ID,),
+        )
+        manager.conn.commit()
+
+    async def fail_if_legacy_fetches(*args, **kwargs):
+        raise AssertionError("legacy 开关为 false 时不得读取订单多数量")
+
+    monkeypatch.setattr(live, "fetch_order_detail_info", fail_if_legacy_fetches)
+    quantity, plan = asyncio.run(
+        live._build_order_auto_delivery_preparation_plan(
+            ITEM_ID,
+            "order-main-legacy",
+            "buyer-1",
+        )
+    )
+
+    assert quantity == 1
+    assert len(plan) == 1
+    assert plan[0]["configured"] is False
+    assert plan[0]["quantity"] == 1
+
+
+def test_manual_entry_prepares_bound_whole_order_once_and_legacy_remaining_units(
+    runtime,
+    monkeypatch,
+):
+    import cookie_manager
+    import reply_server
+
+    live, manager = runtime
+    create_binding(manager)
+    remaining = {"indexes": [1, 2, 3]}
+    auto_delivery_calls = []
+    prepared_batches = []
+    order = {
+        "order_id": "order-manual",
+        "cookie_id": ACCOUNT_ID,
+        "item_id": ITEM_ID,
+        "buyer_id": "buyer-1",
+        "buyer_nick": "买家",
+        "quantity": "3",
+        "sid": "",
+    }
+
+    monkeypatch.setattr(manager, "get_order_by_id", lambda order_id: dict(order))
+    monkeypatch.setattr(
+        manager,
+        "get_cookie_details",
+        lambda cookie_id: {"id": cookie_id, "user_id": USER_ID},
+    )
+    monkeypatch.setattr(
+        manager,
+        "get_item_info",
+        lambda cookie_id, item_id: {"item_title": "绑定商品"},
+    )
+    monkeypatch.setattr(manager, "create_delivery_log", lambda **kwargs: True)
+    monkeypatch.setattr(reply_server, "db_manager", manager)
+    monkeypatch.setattr(
+        reply_server.blacklist_service,
+        "is_buyer_blacklisted",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(reply_server, "publish_order_update_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reply_server, "log_with_user", lambda *args, **kwargs: None)
+
+    class RunningManager:
+        @staticmethod
+        def get_xianyu_instance(cookie_id):
+            return live
+
+    monkeypatch.setattr(cookie_manager, "manager", RunningManager())
+    live.ws = None
+    monkeypatch.setattr(
+        live,
+        "_summarize_delivery_progress",
+        lambda order_id, expected_quantity: {
+            "pending_finalize_unit_indexes": [],
+            "remaining_unit_indexes": list(remaining["indexes"]),
+            "aggregate_status": "pending",
+        },
+    )
+    monkeypatch.setattr(
+        live,
+        "_sync_order_delivery_progress",
+        lambda **kwargs: {
+            "aggregate_status": "pending",
+            "finalized_count": 0,
+            "remaining_count": len(remaining["indexes"]),
+        },
+    )
+
+    def capture_prepared_units(prepared_units, total_units):
+        prepared_batches.append((list(prepared_units), total_units))
+        return []
+
+    monkeypatch.setattr(live, "_build_delivery_send_groups", capture_prepared_units)
+
+    async def record_auto_delivery(*args, **kwargs):
+        auto_delivery_calls.append((args, kwargs))
+        return {
+            "success": True,
+            "configured": kwargs.get("order_line_id") is not None,
+            "content": "prepared-content",
+            "delivery_steps": [{"type": "text", "content": "prepared-content"}],
+            "card_id": 7,
+            "card_type": "data",
+            "mode": "imported_card",
+            "quantity": kwargs.get("quantity"),
+            "order_id": kwargs.get("order_id"),
+            "order_line_id": kwargs.get("order_line_id"),
+            "idempotency_key": "canonical-key",
+            "reservation_id": "reservation-manual",
+            "claim_token": "claim-manual",
+            "orchestration_status": "sending",
+            "content_count": kwargs.get("quantity"),
+            "orchestration_meta": {"content_count": kwargs.get("quantity")},
+        }
+
+    monkeypatch.setattr(live, "_auto_delivery", record_auto_delivery)
+
+    asyncio.run(
+        reply_server.manual_deliver_order(
+            "order-manual",
+            current_user={"user_id": USER_ID, "username": "owner"},
+        )
+    )
+
+    assert len(auto_delivery_calls) == 1
+    assert auto_delivery_calls[0][1]["quantity"] == 3
+    assert auto_delivery_calls[0][1]["order_line_id"] == ITEM_ID
+    bound_rule_meta = prepared_batches[0][0][0]["rule_meta"]
+    assert bound_rule_meta["configured"] is True
+    assert bound_rule_meta["quantity"] == 3
+    assert bound_rule_meta["order_line_id"] == ITEM_ID
+    assert bound_rule_meta["claim_token"] == "claim-manual"
+    assert bound_rule_meta["orchestration_status"] == "sending"
+
+    with manager.lock:
+        manager.conn.execute(
+            "DELETE FROM item_delivery_bindings WHERE item_id = ?",
+            (ITEM_ID,),
+        )
+        manager.conn.commit()
+    remaining["indexes"] = [2, 3]
+    auto_delivery_calls.clear()
+    prepared_batches.clear()
+
+    asyncio.run(
+        reply_server.manual_deliver_order(
+            "order-manual",
+            current_user={"user_id": USER_ID, "username": "owner"},
+        )
+    )
+
+    assert len(auto_delivery_calls) == 2
+    assert [call[1]["delivery_unit_index"] for call in auto_delivery_calls] == [2, 3]
+
+
+def test_recovered_entry_passes_bound_order_quantity_and_preserves_legacy_single_call(
+    runtime,
+    monkeypatch,
+):
+    live, manager = runtime
+    create_binding(manager)
+    auto_delivery_calls = []
+    live._order_locks = defaultdict(asyncio.Lock)
+    live._lock_usage_times = {}
+    monkeypatch.setattr(live, "can_auto_delivery", lambda order_id: True)
+    monkeypatch.setattr(live, "is_lock_held", lambda lock_key: False)
+    monkeypatch.setattr(live, "_get_pending_delivery_finalization_meta", lambda *args: None)
+    monkeypatch.setattr(live, "_record_delivery_log", lambda **kwargs: None)
+
+    async def record_auto_delivery(*args, **kwargs):
+        auto_delivery_calls.append((args, kwargs))
+        return {
+            "success": False,
+            "content": None,
+            "delivery_steps": [],
+            "error": "测试停止在准备阶段",
+        }
+
+    monkeypatch.setattr(live, "_auto_delivery", record_auto_delivery)
+    order = {"quantity": "3"}
+
+    asyncio.run(
+        live._send_recovered_delivery_without_sid(
+            order,
+            order_id="order-recovered-bound",
+            item_id=ITEM_ID,
+            buyer_id="buyer-1",
+            source="test-recovery",
+        )
+    )
+
+    assert len(auto_delivery_calls) == 1
+    assert auto_delivery_calls[0][1]["quantity"] == 3
+    assert auto_delivery_calls[0][1]["order_line_id"] == ITEM_ID
+
+    with manager.lock:
+        manager.conn.execute(
+            "DELETE FROM item_delivery_bindings WHERE item_id = ?",
+            (ITEM_ID,),
+        )
+        manager.conn.commit()
+    auto_delivery_calls.clear()
+
+    asyncio.run(
+        live._send_recovered_delivery_without_sid(
+            order,
+            order_id="order-recovered-legacy",
+            item_id=ITEM_ID,
+            buyer_id="buyer-1",
+            source="test-recovery",
+        )
+    )
+
+    assert len(auto_delivery_calls) == 1

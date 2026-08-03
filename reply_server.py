@@ -15669,20 +15669,29 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 return reason_text
             return f"{reason_text} [{', '.join(context_parts)}]"
 
-        for unit_index in remaining_unit_indexes:
+        preparation_plan = xianyu_instance._build_auto_delivery_preparation_plan(
+            item_id,
+            expected_quantity,
+            legacy_unit_indexes=remaining_unit_indexes,
+        )
+        for preparation in preparation_plan:
+            unit_index = preparation['unit_index']
             delivery_result = await xianyu_instance._auto_delivery(
                 item_id=item_id,
                 item_title=item_title,
                 order_id=order_id,
                 send_user_id=buyer_id,
                 include_meta=True,
-                delivery_unit_index=unit_index
+                delivery_unit_index=unit_index,
+                quantity=preparation['quantity'],
+                order_line_id=preparation['order_line_id'],
             )
 
             if isinstance(delivery_result, dict):
                 delivery_content = delivery_result.get('content')
                 delivery_steps = delivery_result.get('delivery_steps') or []
                 delivery_success = bool(delivery_result.get('success') and delivery_content)
+                delivery_meta = xianyu_instance._delivery_result_to_rule_meta(delivery_result)
                 rule_id = delivery_result.get('rule_id')
                 rule_keyword = delivery_result.get('rule_keyword')
                 card_type = delivery_result.get('card_type')
@@ -15700,6 +15709,9 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 delivery_content = delivery_result
                 delivery_steps = []
                 delivery_success = bool(delivery_content)
+                delivery_meta = xianyu_instance._delivery_result_to_rule_meta({
+                    'success': delivery_success,
+                })
                 rule_id = None
                 rule_keyword = None
                 card_type = None
@@ -15713,6 +15725,8 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 data_reservation_id = None
                 data_reservation_status = None
                 failure_reason = None
+
+            delivery_meta['delivery_unit_index'] = unit_index
 
             if delivery_success:
                 if not delivery_steps:
@@ -15745,22 +15759,7 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                     'unit_index': unit_index,
                     'delivery_steps': delivery_steps,
                     'card_type': card_type,
-                    'rule_meta': {
-                        'success': True,
-                        'rule_id': rule_id,
-                        'rule_keyword': rule_keyword,
-                        'card_id': card_id,
-                        'card_type': card_type,
-                        'match_mode': match_mode,
-                        'order_spec_mode': order_spec_mode,
-                        'rule_spec_mode': rule_spec_mode,
-                        'item_config_mode': item_config_mode,
-                        'data_card_pending_consume': data_card_pending_consume,
-                        'data_line': data_line,
-                        'data_reservation_id': data_reservation_id,
-                        'data_reservation_status': data_reservation_status,
-                        'delivery_unit_index': unit_index,
-                    }
+                    'rule_meta': delivery_meta,
                 })
             else:
                 fail_reason = failure_reason or f"第 {unit_index} 个发货单元未匹配到发货规则，请检查卡券和发货规则配置"
