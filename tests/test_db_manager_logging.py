@@ -6,6 +6,7 @@ from db_manager import DBManager
 def test_get_item_info_logs_only_identifiers_and_field_summary(tmp_path, monkeypatch):
     manager = DBManager(str(tmp_path / "xianyu.sqlite3"))
     secret_link = "https://pan.example/s/private-token"
+    assert manager.save_cookie("cookie-1", "cookie-value", user_id=1)
     assert manager.save_item_info(
         "cookie-1",
         "item-1",

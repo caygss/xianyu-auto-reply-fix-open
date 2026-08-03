@@ -50,6 +50,7 @@ def main():
             )
         elif operation == "migration":
             manager.set_system_setting("registration_enabled", "true")
+            manager.save_cookie("cookie-contract", "cookie-value", user_id=1)
             manager.save_item_info(
                 "cookie-contract",
                 "item-contract",

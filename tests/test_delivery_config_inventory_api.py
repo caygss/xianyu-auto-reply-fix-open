@@ -19,16 +19,36 @@ CARD = {"id": 7, "name": "测试商品", "type": "text", "user_id": 1}
 @pytest.fixture()
 def api_state(tmp_path, monkeypatch):
     manager = DBManager(str(tmp_path / "task5.sqlite3"))
+    with manager.lock:
+        manager.conn.execute(
+            """
+            INSERT INTO cards (id, name, type, description, user_id)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (CARD["id"], CARD["name"], CARD["type"], "普通卡券", CARD["user_id"]),
+        )
+        manager.conn.execute(
+            "INSERT OR IGNORE INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
+            ("cookie-a", "cookie-a-value", USER["user_id"]),
+        )
+        manager.conn.execute(
+            "INSERT OR IGNORE INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
+            ("cookie-b", "cookie-b-value", USER["user_id"]),
+        )
+        manager.conn.execute(
+            "INSERT OR IGNORE INTO item_info (cookie_id, item_id, item_title) VALUES (?, ?, ?)",
+            ("cookie-a", "item-100", "测试商品"),
+        )
+        manager.conn.commit()
     monkeypatch.setattr(reply_server, "db_manager", manager)
     monkeypatch.setattr(
         manager,
         "get_all_cookies",
-        lambda user_id=None: {"cookie-a": "masked-cookie"} if user_id == 1 else {},
-    )
-    monkeypatch.setattr(
-        manager,
-        "get_card_by_id",
-        lambda card_id, user_id=None: CARD if int(card_id) == 7 and user_id == 1 else None,
+        lambda user_id=None: (
+            {"cookie-a": "masked-cookie", "cookie-b": "masked-cookie"}
+            if user_id == 1
+            else {}
+        ),
     )
     yield manager
     manager.close()
@@ -239,6 +259,41 @@ def test_delivery_config_rejects_cross_user_and_cross_account_scope(api_state):
             card_id=99,
         )
     assert other_card.value.status_code == 403
+
+
+@pytest.mark.parametrize("api_kind", ["config", "inventory"])
+def test_internal_delivery_card_requires_its_bound_account(api_state, api_kind):
+    internal = api_state.get_or_create_item_delivery_card(
+        USER["user_id"], "cookie-a", "item-100", "测试商品"
+    )
+
+    def call(account_id):
+        if api_kind == "config":
+            return reply_server.put_delivery_config(
+                internal["card_id"],
+                account_id,
+                _delivery_request("imported_card", {"source": "local"}),
+                USER,
+            )
+        return reply_server.get_card_inventory(internal["card_id"], account_id, USER)
+
+    with pytest.raises(HTTPException) as wrong_account:
+        call("cookie-b")
+    assert wrong_account.value.status_code == 403
+
+    assert call("cookie-a")
+
+
+def test_ordinary_card_keeps_cross_account_task5_behavior(api_state):
+    saved = reply_server.put_delivery_config(
+        CARD["id"],
+        "cookie-b",
+        _delivery_request("imported_card", {"source": "local"}),
+        USER,
+    )
+
+    assert saved["card_id"] == CARD["id"]
+    assert saved["account_id"] == "cookie-b"
 
 
 def test_inventory_api_delegates_settings_import_generate_summary_and_masked_preview(

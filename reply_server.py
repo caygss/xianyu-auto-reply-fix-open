@@ -1339,6 +1339,13 @@ def _task5_scope(card_id: int, account_id: str, current_user: Dict[str, Any]):
     card = db_manager.get_card_by_id(cleaned_card_id, current_user["user_id"])
     if not card:
         raise HTTPException(status_code=403, detail="无权限操作该商品")
+    internal_binding = db_manager.get_item_delivery_binding_for_card(
+        current_user["user_id"], cleaned_card_id
+    )
+    if internal_binding and not db_manager.get_item_delivery_binding_for_card(
+        current_user["user_id"], cleaned_card_id, cleaned_account_id
+    ):
+        raise HTTPException(status_code=403, detail="无权限操作该商品的交付配置")
     return current_user["user_id"], cleaned_card_id, cleaned_account_id
 
 
@@ -10495,6 +10502,12 @@ def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = De
         from db_manager import db_manager
         user_id = current_user['user_id']
 
+        if db_manager.get_item_delivery_binding_for_card(user_id, card_id):
+            raise HTTPException(
+                status_code=409,
+                detail="商品交付绑定卡券由系统管理，不能通过普通卡券接口修改或删除",
+            )
+
         # 调试日志：记录接收到的多规格数据
         is_multi_spec = card_data.get('is_multi_spec')
         logger.info(f"[DEBUG] 更新卡券 {card_id} - is_multi_spec: {is_multi_spec}")
@@ -10556,6 +10569,12 @@ async def update_card_with_image(
     try:
         logger.info(f"接收到带图片的卡券更新请求: card_id={card_id}, name={name}, type={type}")
         user_id = current_user['user_id']
+        from db_manager import db_manager
+        if db_manager.get_item_delivery_binding_for_card(user_id, card_id):
+            raise HTTPException(
+                status_code=409,
+                detail="商品交付绑定卡券由系统管理，不能通过普通卡券接口修改或删除",
+            )
 
         # 验证图片文件
         if not image.content_type or not image.content_type.startswith('image/'):
@@ -10580,7 +10599,6 @@ async def update_card_with_image(
         logger.info(f"图片保存成功: {image_url}")
 
         # 更新卡券
-        from db_manager import db_manager
         success = db_manager.update_card(
             card_id=card_id,
             name=name,
@@ -10794,6 +10812,11 @@ def delete_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current
     try:
         from db_manager import db_manager
         user_id = current_user['user_id']
+        if db_manager.get_item_delivery_binding_for_card(user_id, card_id):
+            raise HTTPException(
+                status_code=409,
+                detail="商品交付绑定卡券由系统管理，不能通过普通卡券接口修改或删除",
+            )
         success = db_manager.delete_card(card_id, user_id)
         if success:
             return {"message": "卡券删除成功"}
