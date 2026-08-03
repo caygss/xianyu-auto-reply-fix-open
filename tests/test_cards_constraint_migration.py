@@ -2,7 +2,84 @@ import sqlite3
 
 import pytest
 
-from db_manager import DBManager, ITEM_DELIVERY_BINDING_MARKER
+import db_manager
+from db_manager import (
+    DBManager,
+    ITEM_DELIVERY_BINDING_MARKER,
+    _CardsTableMigrationError,
+)
+
+
+def _inject_cards_migration_connection_fault(monkeypatch, fault):
+    real_connect = sqlite3.connect
+
+    class FaultInjectingCursor:
+        def __init__(self, cursor, connection):
+            self._cursor = cursor
+            self._connection = connection
+
+        def execute(self, sql, *args, **kwargs):
+            result = self._cursor.execute(sql, *args, **kwargs)
+            normalized_sql = " ".join(sql.split()).upper()
+            if normalized_sql == (
+                "RELEASE SAVEPOINT CARDS_YIFAN_API_CONSTRAINT_PROBE"
+            ):
+                self._connection.fail_next_migration_commit = True
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+    class FaultInjectingConnection:
+        def __init__(self, connection):
+            self._connection = connection
+            self.fail_next_migration_commit = False
+            self.foreign_keys_on_count = 0
+            self.foreign_keys_read_count = 0
+
+        def cursor(self, *args, **kwargs):
+            return FaultInjectingCursor(
+                self._connection.cursor(*args, **kwargs),
+                self,
+            )
+
+        def commit(self):
+            if fault == "pre_migration_commit" and self.fail_next_migration_commit:
+                self.fail_next_migration_commit = False
+                raise sqlite3.DatabaseError(
+                    "injected pre-migration commit failure"
+                )
+            return self._connection.commit()
+
+        def execute(self, sql, *args, **kwargs):
+            normalized_sql = " ".join(sql.split()).upper()
+            if normalized_sql == "PRAGMA FOREIGN_KEYS = ON":
+                self.foreign_keys_on_count += 1
+                if (
+                    fault == "restore_foreign_keys"
+                    and self.foreign_keys_on_count == 2
+                ):
+                    raise sqlite3.DatabaseError(
+                        "injected foreign-key restore failure"
+                    )
+            elif normalized_sql == "PRAGMA FOREIGN_KEYS":
+                self.foreign_keys_read_count += 1
+                if (
+                    fault == "verify_restored_foreign_keys"
+                    and self.foreign_keys_read_count == 2
+                ):
+                    raise sqlite3.DatabaseError(
+                        "injected foreign-key verification failure"
+                    )
+            return self._connection.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    def connect_with_fault(*args, **kwargs):
+        return FaultInjectingConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", connect_with_fault)
 
 
 def _make_current_cards_database_without_user_one(tmp_path):
@@ -264,3 +341,76 @@ def test_cards_constraint_migration_failure_rolls_back_without_temp_table(tmp_pa
         ).fetchone() is None
     finally:
         connection.close()
+
+
+def test_pre_migration_commit_database_error_aborts_initialization(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = _make_legacy_cards_database(tmp_path)
+    _inject_cards_migration_connection_fault(monkeypatch, "pre_migration_commit")
+
+    with pytest.raises(
+        _CardsTableMigrationError,
+        match="提交cards表迁移前的事务失败",
+    ) as exc_info:
+        DBManager(str(db_path))
+
+    assert isinstance(exc_info.value.__cause__, sqlite3.DatabaseError)
+    assert "injected pre-migration commit failure" in str(exc_info.value.__cause__)
+
+
+@pytest.mark.parametrize(
+    ("fault", "injected_message"),
+    [
+        ("restore_foreign_keys", "injected foreign-key restore failure"),
+        (
+            "verify_restored_foreign_keys",
+            "injected foreign-key verification failure",
+        ),
+    ],
+)
+def test_foreign_key_restore_database_error_aborts_initialization(
+    tmp_path,
+    monkeypatch,
+    fault,
+    injected_message,
+):
+    db_path = _make_legacy_cards_database(tmp_path)
+    _inject_cards_migration_connection_fault(monkeypatch, fault)
+
+    with pytest.raises(
+        _CardsTableMigrationError,
+        match="cards表迁移后恢复外键约束失败",
+    ) as exc_info:
+        DBManager(str(db_path))
+
+    assert isinstance(exc_info.value.__cause__, sqlite3.DatabaseError)
+    assert injected_message in str(exc_info.value.__cause__)
+
+
+def test_rebuild_and_restore_failures_abort_and_log_restore_failure(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = _make_legacy_cards_database(tmp_path, invalid_user=True)
+    _inject_cards_migration_connection_fault(monkeypatch, "restore_foreign_keys")
+    error_messages = []
+    monkeypatch.setattr(
+        db_manager.logger,
+        "error",
+        lambda message: error_messages.append(str(message)),
+    )
+
+    with pytest.raises(
+        _CardsTableMigrationError,
+        match="cards表约束迁移失败",
+    ) as exc_info:
+        DBManager(str(db_path))
+
+    assert isinstance(exc_info.value.__cause__, sqlite3.IntegrityError)
+    assert any(
+        "cards表迁移后恢复外键约束失败" in message
+        and "injected foreign-key restore failure" in message
+        for message in error_messages
+    )

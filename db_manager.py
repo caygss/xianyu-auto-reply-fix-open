@@ -1624,10 +1624,28 @@ Cookie数量: {cookie_count}
         # Commit earlier migrations first, disable enforcement outside a
         # transaction, and rebuild cards atomically so DROP TABLE does not
         # cascade-delete rows in tables that reference cards.
-        self.conn.commit()
         try:
-            self.conn.execute("PRAGMA foreign_keys = OFF")
-            if self.conn.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+            self.conn.commit()
+        except sqlite3.DatabaseError as commit_error:
+            raise _CardsTableMigrationError(
+                "提交cards表迁移前的事务失败"
+            ) from commit_error
+
+        rebuild_error = None
+        rollback_error = None
+        restore_error = None
+        try:
+            try:
+                self.conn.execute("PRAGMA foreign_keys = OFF")
+                foreign_keys_state = self.conn.execute(
+                    "PRAGMA foreign_keys"
+                ).fetchone()
+            except sqlite3.DatabaseError as foreign_keys_error:
+                raise _CardsTableMigrationError(
+                    "cards表迁移前关闭或验证外键约束失败"
+                ) from foreign_keys_error
+
+            if not foreign_keys_state or foreign_keys_state[0] != 0:
                 raise RuntimeError("无法在cards表迁移前关闭外键约束")
 
             cursor.execute("BEGIN IMMEDIATE")
@@ -1683,20 +1701,58 @@ Cookie数量: {cookie_count}
 
             self.conn.commit()
             logger.info("cards表约束更新完成，现在支持image类型")
-        except Exception as rebuild_error:
-            self.conn.rollback()
+        except Exception as error:
+            rebuild_error = error
+            try:
+                self.conn.rollback()
+            except sqlite3.DatabaseError as error:
+                rollback_error = error
+        finally:
+            if self.conn.in_transaction:
+                try:
+                    self.conn.rollback()
+                except sqlite3.DatabaseError as error:
+                    if rollback_error is None:
+                        rollback_error = error
+
+            try:
+                self.conn.execute("PRAGMA foreign_keys = ON")
+                foreign_keys_state = self.conn.execute(
+                    "PRAGMA foreign_keys"
+                ).fetchone()
+            except sqlite3.DatabaseError as error:
+                restore_error = error
+            else:
+                if not foreign_keys_state or foreign_keys_state[0] != 1:
+                    restore_error = _CardsTableMigrationError(
+                        "cards表迁移后无法恢复外键约束"
+                    )
+
+        if rollback_error is not None:
+            logger.error(f"清理cards表迁移事务失败: {rollback_error}")
+
+        if restore_error is not None:
+            logger.error(f"cards表迁移后恢复外键约束失败: {restore_error}")
+
+        if rebuild_error is not None:
             logger.error(f"重建cards表失败: {rebuild_error}")
+            if isinstance(rebuild_error, _CardsTableMigrationError):
+                raise rebuild_error
             raise _CardsTableMigrationError(
                 "cards表约束迁移失败，已回滚"
             ) from rebuild_error
-        finally:
-            if self.conn.in_transaction:
-                self.conn.rollback()
-            self.conn.execute("PRAGMA foreign_keys = ON")
-            if self.conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
-                raise _CardsTableMigrationError(
-                    "cards表迁移后无法恢复外键约束"
-                )
+
+        if rollback_error is not None:
+            raise _CardsTableMigrationError(
+                "cards表约束迁移清理失败"
+            ) from rollback_error
+
+        if restore_error is not None:
+            if isinstance(restore_error, _CardsTableMigrationError):
+                raise restore_error
+            raise _CardsTableMigrationError(
+                "cards表迁移后恢复外键约束失败"
+            ) from restore_error
 
     def _migrate_notification_templates(self, cursor):
         """迁移notification_templates表以支持新的模板类型"""
