@@ -6329,9 +6329,13 @@ class XianyuLive:
                     successful_send_count = 0
                     last_delivery_error = None
                     prepared_units = []
+                    preparation_plan = self._build_auto_delivery_preparation_plan(
+                        item_id,
+                        quantity_to_send,
+                    )
 
-                    for i in range(quantity_to_send):
-                        unit_index = i + 1
+                    for preparation in preparation_plan:
+                        unit_index = preparation['unit_index']
                         rule_meta = {}
                         try:
                             pending_finalize_meta = self._get_pending_delivery_finalization_meta(order_id, unit_index)
@@ -6406,30 +6410,16 @@ class XianyuLive:
                                 chat_id,
                                 send_user_name,
                                 include_meta=True,
-                                delivery_unit_index=unit_index
+                                delivery_unit_index=unit_index,
+                                quantity=preparation['quantity'],
+                                order_line_id=preparation['order_line_id'],
                             )
 
                             if isinstance(delivery_result, dict):
                                 delivery_content = delivery_result.get('content')
                                 delivery_error = delivery_result.get('error')
                                 delivery_steps = delivery_result.get('delivery_steps') or []
-                                rule_meta = {
-                                    'success': True,
-                                    'rule_id': delivery_result.get('rule_id'),
-                                    'rule_keyword': delivery_result.get('rule_keyword'),
-                                    'card_type': delivery_result.get('card_type'),
-                                    'match_mode': delivery_result.get('match_mode'),
-                                    'order_spec_mode': delivery_result.get('order_spec_mode'),
-                                    'rule_spec_mode': delivery_result.get('rule_spec_mode'),
-                                    'item_config_mode': delivery_result.get('item_config_mode'),
-                                    'card_id': delivery_result.get('card_id'),
-                                    'card_description': delivery_result.get('card_description'),
-                                    'data_card_pending_consume': delivery_result.get('data_card_pending_consume'),
-                                    'data_line': delivery_result.get('data_line'),
-                                    'data_reservation_id': delivery_result.get('data_reservation_id'),
-                                    'data_reservation_status': delivery_result.get('data_reservation_status'),
-                                    'delivery_unit_index': delivery_result.get('delivery_unit_index')
-                                }
+                                rule_meta = self._delivery_result_to_rule_meta(delivery_result)
                             else:
                                 delivery_content = delivery_result
                                 delivery_error = None
@@ -11930,10 +11920,216 @@ class XianyuLive:
             request, sender
         )
 
+    def _get_bound_item_delivery(self, item_id: str):
+        """Return the validated internal delivery binding for this runtime scope."""
+        normalized_item_id = str(item_id or "").strip()
+        if not normalized_item_id:
+            return None
+        return db_manager.get_item_delivery_binding(
+            getattr(self, "user_id", None),
+            self.cookie_id,
+            normalized_item_id,
+        )
+
+    def _build_auto_delivery_preparation_plan(self, item_id: str, quantity):
+        """Plan one whole-order preparation for bindings, or legacy per-unit calls."""
+        try:
+            normalized_quantity = max(1, int(quantity or 1))
+        except (TypeError, ValueError):
+            normalized_quantity = 1
+
+        binding = self._get_bound_item_delivery(item_id)
+        if binding:
+            return [{
+                "unit_index": 1,
+                "quantity": normalized_quantity,
+                "order_line_id": str(item_id or "").strip() or "default",
+                "configured": True,
+                "card_id": binding.get("card_id"),
+            }]
+        return [
+            {
+                "unit_index": unit_index,
+                "quantity": 1,
+                "order_line_id": None,
+                "configured": False,
+                "card_id": None,
+            }
+            for unit_index in range(1, normalized_quantity + 1)
+        ]
+
+    @staticmethod
+    def _delivery_result_to_rule_meta(delivery_result: dict):
+        """Keep only delivery-finalization metadata; never persist config or contents."""
+        result = delivery_result or {}
+        return {
+            'success': bool(result.get('success')),
+            'configured': bool(result.get('configured')),
+            'rule_id': result.get('rule_id'),
+            'rule_keyword': result.get('rule_keyword'),
+            'card_type': result.get('card_type'),
+            'match_mode': result.get('match_mode'),
+            'order_spec_mode': result.get('order_spec_mode'),
+            'rule_spec_mode': result.get('rule_spec_mode'),
+            'item_config_mode': result.get('item_config_mode'),
+            'card_id': result.get('card_id'),
+            'card_description': result.get('card_description'),
+            'data_card_pending_consume': result.get('data_card_pending_consume'),
+            'data_line': result.get('data_line'),
+            'data_reservation_id': result.get('data_reservation_id'),
+            'data_reservation_status': result.get('data_reservation_status'),
+            'delivery_unit_index': result.get('delivery_unit_index'),
+            'mode': result.get('mode'),
+            'quantity': result.get('quantity'),
+            'order_id': result.get('order_id'),
+            'order_line_id': result.get('order_line_id'),
+            'idempotency_key': result.get('idempotency_key'),
+            'reservation_id': result.get('reservation_id'),
+            'claim_token': result.get('claim_token'),
+            'orchestration_status': result.get('orchestration_status'),
+            'content_count': result.get('content_count'),
+            'orchestration_meta': result.get('orchestration_meta') or {},
+        }
+
+    def _prepare_bound_item_delivery(
+        self,
+        *,
+        binding: dict,
+        order_id: str,
+        buyer_id: str,
+        item_id: str,
+        quantity=1,
+        order_line_id: str = None,
+        provider_transport=None,
+    ):
+        """Prepare one whole bound order through the authoritative orchestrator."""
+        from card_inventory_service import CardInventoryService
+        from delivery_adapter_service import DeliveryDispatcher
+        from delivery_config_service import DeliveryConfigService
+        from delivery_orchestration_service import (
+            DeliveryOrchestrationRequest,
+            DeliveryOrchestrationService,
+        )
+
+        card_id = binding["card_id"]
+        config_service = DeliveryConfigService(db_manager)
+        delivery_config = config_service.get_for_delivery(
+            getattr(self, "user_id", None),
+            card_id,
+            self.cookie_id,
+        )
+        inventory = CardInventoryService(db_manager)
+        dispatcher = DeliveryDispatcher(
+            config_service,
+            inventory,
+            transport=provider_transport,
+        )
+        request = DeliveryOrchestrationRequest(
+            user_id=getattr(self, "user_id", None),
+            card_id=card_id,
+            account_id=self.cookie_id,
+            order_id=order_id,
+            order_line_id=order_line_id,
+            quantity=quantity,
+            delivery_config=delivery_config,
+            item_id=item_id,
+            context={
+                "buyer_id": buyer_id,
+                "order_id": order_id,
+                "item_id": item_id,
+                "account_id": self.cookie_id,
+                "card_id": card_id,
+            },
+        )
+        return DeliveryOrchestrationService(
+            db_manager,
+            inventory,
+            dispatcher,
+        ).prepare(request)
+
+    def _bound_delivery_result(self, prepared: dict, *, include_meta: bool):
+        """Adapt orchestration prepare output to the legacy auto-delivery contract."""
+        prepared = dict(prepared or {})
+        status = str(prepared.get("status") or "failed")
+        mode = str(prepared.get("mode") or "")
+        contents = [
+            str(value)
+            for value in (prepared.get("contents") or [])
+            if str(value).strip()
+        ]
+        claimed = bool(prepared.get("claimed"))
+        success = status == "sending" and claimed and bool(contents)
+
+        if success:
+            error = None
+        elif prepared.get("error"):
+            error = str(prepared["error"])
+        elif status == "in_progress":
+            error = "该订单发货正在处理中，已阻止重复准备"
+        elif status == "sent":
+            error = "该订单已经发货完成，已阻止重复发送"
+        elif status == "paused":
+            error = "该订单发货已暂停，请检查库存或配置"
+        else:
+            error = "该订单发货准备失败，已阻止自动发送"
+
+        content = None
+        delivery_steps = []
+        if success:
+            content = contents[0] if len(contents) == 1 else "\n".join(contents)
+            delivery_steps = [
+                {"type": "text", "content": value}
+                for value in contents
+            ]
+
+        if not include_meta:
+            return content if success else None
+
+        orchestration_meta = prepared.get("meta") or {}
+        return {
+            "success": success,
+            "configured": True,
+            "content": content,
+            "contents": contents if success else [],
+            "delivery_steps": delivery_steps,
+            "error": error,
+            "error_code": prepared.get("error_code"),
+            "status": status,
+            "orchestration_status": status,
+            "card_id": prepared.get("card_id"),
+            "card_type": "data" if mode in {"imported_card", "generated_card"} else "text",
+            "mode": mode,
+            "quantity": prepared.get("quantity"),
+            "order_id": prepared.get("order_id"),
+            "order_line_id": prepared.get("order_line_id"),
+            "idempotency_key": prepared.get("idempotency_key"),
+            "reservation_id": prepared.get("reservation_id"),
+            "claim_token": prepared.get("claim_token") if success else None,
+            "claimed": claimed if success else False,
+            "content_count": orchestration_meta.get("content_count", len(contents)),
+            "orchestration_meta": {
+                "content_count": orchestration_meta.get("content_count", len(contents)),
+                "state": prepared.get("state"),
+            },
+            "rule_id": None,
+            "rule_keyword": None,
+            "match_mode": "item_delivery_binding",
+            "order_spec_mode": "bound_item",
+            "rule_spec_mode": None,
+            "item_config_mode": "bound_item",
+            "card_description": "",
+            "data_card_pending_consume": False,
+            "data_line": None,
+            "data_reservation_id": None,
+            "data_reservation_status": None,
+            "delivery_unit_index": 1,
+        }
+
     async def _auto_delivery(self, item_id: str, item_title: str = None, order_id: str = None, send_user_id: str = None,
                              chat_id: str = None, send_user_name: str = None, include_meta: bool = False,
                              data_preview_index: int = 0, delivery_unit_index: int = 1,
-                             delivery_reservation_id: str = None):
+                             delivery_reservation_id: str = None, quantity=1,
+                             order_line_id: str = None):
         """自动发货功能 - 匹配规则并准备发货内容，不直接提交副作用。"""
         try:
             matched_rule_context = None
@@ -11986,6 +12182,45 @@ class XianyuLive:
             from db_manager import db_manager
 
             logger.info(f"开始自动发货检查: 商品ID={item_id}")
+
+            bound_delivery = self._get_bound_item_delivery(item_id)
+            if bound_delivery:
+                logger.info(
+                    f"商品命中内部交付绑定，按整单编排准备: item_id={item_id}, "
+                    f"card_id={bound_delivery.get('card_id')}, order_id={order_id}"
+                )
+                try:
+                    prepared = self._prepare_bound_item_delivery(
+                        binding=bound_delivery,
+                        order_id=order_id,
+                        buyer_id=send_user_id,
+                        item_id=item_id,
+                        quantity=quantity,
+                        order_line_id=order_line_id,
+                    )
+                except Exception as bound_error:
+                    error_code = getattr(bound_error, "code", "delivery_prepare_failed")
+                    error_message = str(bound_error).strip() or "绑定商品发货准备失败"
+                    logger.error(
+                        f"绑定商品发货准备失败: item_id={item_id}, order_id={order_id}, "
+                        f"error_code={error_code}, error={error_message}"
+                    )
+                    prepared = {
+                        "status": "failed",
+                        "user_id": getattr(self, "user_id", None),
+                        "card_id": bound_delivery.get("card_id"),
+                        "account_id": self.cookie_id,
+                        "order_id": order_id,
+                        "order_line_id": str(order_line_id or item_id or "default"),
+                        "quantity": quantity,
+                        "mode": None,
+                        "idempotency_key": None,
+                        "reservation_id": None,
+                        "error_code": error_code,
+                        "error": f"绑定商品发货准备失败：{error_message}",
+                        "meta": {},
+                    }
+                return self._bound_delivery_result(prepared, include_meta=include_meta)
 
             # 获取商品详细信息
             item_info = None
