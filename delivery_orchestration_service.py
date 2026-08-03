@@ -4,6 +4,7 @@ import inspect
 import json
 import re
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping
@@ -387,14 +388,15 @@ class DeliveryOrchestrationService:
         if reclaim_stale:
             conditions += (
                 " OR (status = 'sending' AND (claim_token IS NULL OR claimed_at IS NULL "
-                "OR datetime(claimed_at) <= datetime('now', ?)))"
+                "OR julianday(claimed_at) <= julianday('now', ?)))"
             )
             condition_params.append(f"-{self.claim_lease_seconds} seconds")
         with self.db.lock:
             cursor = self.db.conn.execute(
                 f"""
                 UPDATE delivery_orchestration_states
-                SET status = 'sending', claim_token = ?, claimed_at = CURRENT_TIMESTAMP,
+                SET status = 'sending', claim_token = ?,
+                    claimed_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
                     last_error_code = NULL, last_error = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND ({conditions})
@@ -418,7 +420,10 @@ class DeliveryOrchestrationService:
         claim_sql = (
             "claim_token = NULL, claimed_at = NULL"
             if clear_claim
-            else "claim_token = claim_token, claimed_at = CURRENT_TIMESTAMP"
+            else (
+                "claim_token = claim_token, "
+                "claimed_at = strftime('%Y-%m-%d %H:%M:%f', 'now')"
+            )
         )
         with self.db.lock:
             cursor = self.db.conn.execute(
@@ -440,6 +445,20 @@ class DeliveryOrchestrationService:
                     state_id,
                     claim_token,
                 ),
+            )
+            self.db.conn.commit()
+        return cursor.rowcount == 1
+
+    def _renew_claim(self, state_id: int, claim_token: str):
+        with self.db.lock:
+            cursor = self.db.conn.execute(
+                """
+                UPDATE delivery_orchestration_states
+                SET claimed_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'sending' AND claim_token = ?
+                """,
+                (state_id, claim_token),
             )
             self.db.conn.commit()
         return cursor.rowcount == 1
@@ -614,13 +633,35 @@ class DeliveryOrchestrationService:
             )
         return self._result(self._get_state(normalized))
 
-    def _sender_result(self, sender: Callable, contents, request):
-        result = sender(contents, request)
-        if inspect.isawaitable(result):
-            raise DeliveryOrchestrationError("async_sender_required", "异步发送器请使用异步编排入口")
-        if result is False:
-            raise DeliveryOrchestrationError("send_failed", "交付消息发送失败", "sender")
-        return result
+    def _sender_result(self, sender: Callable, contents, request, claim_token=None):
+        stop_heartbeat = threading.Event()
+        heartbeat = None
+        if claim_token:
+            state = self._get_state(request)
+            if not state:
+                raise DeliveryOrchestrationError(
+                    "claim_state_missing", "交付 claim 状态不存在", "concurrency"
+                )
+            interval = max(0.1, min(self.claim_lease_seconds / 3.0, 30.0))
+
+            def renew_while_sending():
+                while not stop_heartbeat.wait(interval):
+                    if not self._renew_claim(state["id"], claim_token):
+                        return
+
+            heartbeat = threading.Thread(target=renew_while_sending, daemon=True)
+            heartbeat.start()
+        try:
+            result = sender(contents, request)
+            if inspect.isawaitable(result):
+                raise DeliveryOrchestrationError("async_sender_required", "异步发送器请使用异步编排入口")
+            if result is False:
+                raise DeliveryOrchestrationError("send_failed", "交付消息发送失败", "sender")
+            return result
+        finally:
+            stop_heartbeat.set()
+            if heartbeat:
+                heartbeat.join(timeout=1)
 
     def orchestrate(self, request: DeliveryOrchestrationRequest, sender: Callable):
         normalized = self._normalize_request(request)
@@ -628,7 +669,12 @@ class DeliveryOrchestrationService:
         if not prepared.get("claimed"):
             return prepared
         try:
-            self._sender_result(sender, prepared.get("contents") or [], normalized)
+            self._sender_result(
+                sender,
+                prepared.get("contents") or [],
+                normalized,
+                prepared["claim_token"],
+            )
         except Exception as exc:
             try:
                 return self.mark_failed(normalized, prepared["claim_token"], exc)
@@ -656,7 +702,12 @@ class DeliveryOrchestrationService:
         if not prepared.get("claimed"):
             return prepared
         try:
-            self._sender_result(sender, prepared.get("contents") or [], normalized)
+            self._sender_result(
+                sender,
+                prepared.get("contents") or [],
+                normalized,
+                prepared["claim_token"],
+            )
         except Exception as exc:
             try:
                 return self.mark_failed(normalized, prepared["claim_token"], exc)

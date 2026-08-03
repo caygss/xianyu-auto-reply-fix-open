@@ -1,6 +1,7 @@
 from test_delivery_quantity_contract import Sender, make_request, services
 
 import threading
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import pytest
 
@@ -349,3 +350,31 @@ def test_expired_claim_token_cannot_overwrite_reclaimed_sender(services):
     assert current[0] == "sending"
     assert current[1] != stale_token
     assert recovered["status"] == "sent"
+
+
+def test_active_sender_renews_claim_lease_and_cannot_be_reclaimed(services):
+    service, _, _, _ = services
+    service.claim_lease_seconds = 1
+    request = make_request(1, order_line_id="line-heartbeat")
+    sender_started = threading.Event()
+    release_sender = threading.Event()
+
+    def slow_sender(contents, normalized_request):
+        sender_started.set()
+        assert release_sender.wait(5)
+        return True
+
+    second_sender = Sender()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first_future = executor.submit(service.orchestrate, request, slow_sender)
+        assert sender_started.wait(5)
+        time.sleep(1.25)
+
+        second = service.retry(request, second_sender)
+
+        release_sender.set()
+        first = first_future.result(timeout=5)
+
+    assert second["status"] == "in_progress"
+    assert second_sender.calls == []
+    assert first["status"] == "sent"

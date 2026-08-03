@@ -651,3 +651,64 @@ def test_provider_adapter_overrides_untrusted_quantity_and_idempotency_key(servi
 
     assert transport.calls[0]["json_body"]["quantity"] == 3
     assert transport.calls[0]["json_body"]["idempotency_key"] == "scope-key"
+
+
+def test_provider_adapter_uses_only_mapped_trusted_delivery_fields(services):
+    _, configs, inventory = services
+    configs.save(
+        1,
+        7,
+        "account-a",
+        "provider_api",
+        {
+            "endpoint": "https://provider.test/issue",
+            "token": "t",
+            "request_body": {"quantity": 99, "idempotency_key": "template-key"},
+            "field_mapping": {
+                "quantity": "count",
+                "idempotency_key": "requestId",
+            },
+        },
+    )
+    transport = FakeTransport(
+        [ProviderResponse(200, {}, b'{"content":"provider-content"}')]
+    )
+
+    DeliveryDispatcher(configs, inventory, transport=transport).prepare(
+        request(
+            quantity=3,
+            idempotency_key="scope-key",
+            context={"quantity": 88, "idempotency_key": "context-key"},
+        )
+    )
+
+    body = transport.calls[0]["json_body"]
+    assert body["count"] == 3
+    assert body["requestId"] == "scope-key"
+    assert "quantity" not in body
+    assert "idempotency_key" not in body
+
+
+def test_provider_adapter_rejects_trusted_field_mapping_collision(services):
+    _, configs, inventory = services
+    configs.save(
+        1,
+        7,
+        "account-a",
+        "provider_api",
+        {
+            "endpoint": "https://provider.test/issue",
+            "token": "t",
+            "field_mapping": {
+                "quantity": "deliveryValue",
+                "idempotency_key": "deliveryValue",
+            },
+        },
+    )
+
+    with pytest.raises(DeliveryDispatchError) as error:
+        DeliveryDispatcher(configs, inventory, transport=FakeTransport()).prepare(
+            request(quantity=3, idempotency_key="scope-key")
+        )
+
+    assert error.value.code == "provider_field_mapping_conflict"

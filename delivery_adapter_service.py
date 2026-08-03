@@ -155,10 +155,24 @@ class ProviderApiAdapter:
                     f"Provider 请求字段缺少：{source}",
                     "provider_request",
                 )
+        trusted_fields = {}
         if request.quantity != 1 or request.idempotency_key:
-            payload["quantity"] = request.quantity
+            trusted_fields["quantity"] = request.quantity
         if request.idempotency_key:
-            payload["idempotency_key"] = request.idempotency_key
+            trusted_fields["idempotency_key"] = request.idempotency_key
+        trusted_targets = [mapping.get(source, source) for source in trusted_fields]
+        if len(trusted_targets) != len(set(trusted_targets)):
+            raise DeliveryDispatchError(
+                "provider_field_mapping_conflict",
+                "Provider 数量与幂等键不能映射到同一个字段",
+                "provider_request",
+            )
+        mapping_targets = set(mapping.values())
+        for source, value in trusted_fields.items():
+            target = mapping.get(source, source)
+            if target != source and source not in mapping_targets:
+                payload.pop(source, None)
+            payload[target] = value
         return payload
 
     @staticmethod
