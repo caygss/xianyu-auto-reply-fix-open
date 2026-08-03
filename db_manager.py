@@ -773,6 +773,11 @@ class DBManager:
                 cursor.execute(
                     "ALTER TABLE delivery_orchestration_states ADD COLUMN claimed_at TIMESTAMP"
                 )
+            if "terminal_claim_token" not in orchestration_columns:
+                cursor.execute(
+                    "ALTER TABLE delivery_orchestration_states "
+                    "ADD COLUMN terminal_claim_token TEXT"
+                )
             self._execute_sql(
                 cursor,
                 "CREATE INDEX IF NOT EXISTS idx_delivery_orchestration_states_order_line "
@@ -6121,20 +6126,58 @@ Cookie数量: {cookie_count}
                 unit_index = 1
             state_by_unit[unit_index] = state
 
+        def _metadata_integer(value):
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.strip().isdigit():
+                return int(value.strip())
+            return None
+
+        sent_batch_anchor_by_unit = {}
+        for unit_index, state in list(state_by_unit.items()):
+            status = state.get('status')
+            delivery_meta = state.get('delivery_meta') or {}
+            if (
+                status not in {'sent', 'finalized'}
+                or not isinstance(delivery_meta, dict)
+                or delivery_meta.get('configured') is not True
+            ):
+                continue
+            anchor = _metadata_integer(delivery_meta.get('delivery_unit_index'))
+            quantity = _metadata_integer(delivery_meta.get('quantity'))
+            if anchor != unit_index or quantity is None:
+                continue
+            if quantity < 1 or anchor < 1 or anchor + quantity - 1 > expected:
+                quantity = 1
+            if quantity == 1:
+                continue
+            for covered_unit_index in range(anchor, anchor + quantity):
+                state_by_unit[covered_unit_index] = state
+                if status == 'sent':
+                    sent_batch_anchor_by_unit[covered_unit_index] = anchor
+
         finalized_unit_indexes = []
         pending_finalize_unit_indexes = []
         remaining_unit_indexes = []
+        pending_finalize_count = 0
 
         for unit_index in range(1, expected + 1):
             status = (state_by_unit.get(unit_index) or {}).get('status')
             if status == 'finalized':
                 finalized_unit_indexes.append(unit_index)
             elif status == 'sent':
-                pending_finalize_unit_indexes.append(unit_index)
+                pending_finalize_count += 1
+                actionable_unit_index = sent_batch_anchor_by_unit.get(
+                    unit_index, unit_index
+                )
+                if actionable_unit_index not in pending_finalize_unit_indexes:
+                    pending_finalize_unit_indexes.append(actionable_unit_index)
             else:
                 remaining_unit_indexes.append(unit_index)
 
-        if pending_finalize_unit_indexes:
+        if pending_finalize_count:
             aggregate_status = 'partial_pending_finalize'
         elif len(finalized_unit_indexes) >= expected:
             aggregate_status = 'shipped'
@@ -6148,7 +6191,7 @@ Cookie数量: {cookie_count}
             'expected_quantity': expected,
             'state_count': len(states),
             'finalized_count': len(finalized_unit_indexes),
-            'pending_finalize_count': len(pending_finalize_unit_indexes),
+            'pending_finalize_count': pending_finalize_count,
             'remaining_count': len(remaining_unit_indexes),
             'finalized_unit_indexes': finalized_unit_indexes,
             'pending_finalize_unit_indexes': pending_finalize_unit_indexes,

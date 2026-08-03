@@ -23,6 +23,7 @@ def test_delivery_orchestration_state_table_has_scoped_unique_key(tmp_path):
             "reservation_id",
             "claim_token",
             "claimed_at",
+            "terminal_claim_token",
         } <= names
 
         indexes = manager.conn.execute(
@@ -70,7 +71,9 @@ def test_existing_orchestration_table_adds_claim_lease_columns(tmp_path):
         columns = manager.conn.execute(
             "PRAGMA table_info(delivery_orchestration_states)"
         ).fetchall()
-        assert {"claim_token", "claimed_at"} <= {row[1] for row in columns}
+        assert {"claim_token", "claimed_at", "terminal_claim_token"} <= {
+            row[1] for row in columns
+        }
     finally:
         manager.close()
 

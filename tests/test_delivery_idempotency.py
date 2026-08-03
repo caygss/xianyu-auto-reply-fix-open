@@ -319,6 +319,225 @@ def test_external_prepare_can_mark_sent_with_current_claim(services):
     assert "contents" not in sent
 
 
+def test_prepare_retry_fresh_request_matches_prepare(services):
+    service, _, dispatcher, _ = services
+    request = make_request(1, order_line_id="line-fresh-retry")
+
+    prepared = service.prepare_retry(request)
+
+    assert prepared["status"] == "sending"
+    assert prepared["claimed"] is True
+    assert prepared["contents"] == ["https://example.test/download"]
+    assert len(dispatcher.requests) == 1
+
+
+def test_prepare_retry_returns_sent_without_preparing_again(services):
+    service, _, dispatcher, _ = services
+    request = make_request(1, order_line_id="line-sent-retry")
+    prepared = service.prepare(request)
+    service.mark_sent(request, prepared["_orchestration_private"]["claim_token"])
+
+    repeated = service.prepare_retry(request)
+
+    assert repeated["status"] == "sent"
+    assert "claimed" not in repeated
+    assert "contents" not in repeated
+    assert len(dispatcher.requests) == 1
+
+
+def test_prepare_retry_reclaims_paused_request_when_inventory_is_available(services):
+    service, inventory, _, manager = services
+    inventory.import_items(7, 1, "account-a", ["a"])
+    request = make_request(
+        2,
+        order_line_id="line-paused-retry",
+        mode="imported_card",
+    )
+    paused = service.prepare(request)
+    inventory.import_items(7, 1, "account-a", ["b"])
+
+    prepared = service.prepare_retry(request)
+
+    assert paused["status"] == "paused"
+    assert prepared["status"] == "sending"
+    assert prepared["claimed"] is True
+    assert prepared["contents"] == ["a", "b"]
+    assert manager.conn.execute(
+        "SELECT COUNT(*) FROM card_inventory_reservations"
+    ).fetchone()[0] == 1
+
+
+def test_mark_sent_is_idempotent_with_exact_terminal_claim_token(services):
+    service, _, _, _ = services
+    request = make_request(1, order_line_id="line-sent-idempotent")
+    prepared = service.prepare(request)
+    token = prepared["_orchestration_private"]["claim_token"]
+
+    first = service.mark_sent(request, token)
+    repeated = service.mark_sent(request, token)
+
+    assert first["status"] == repeated["status"] == "sent"
+
+
+def test_mark_sent_terminal_idempotency_requires_exact_claim_token(services):
+    service, _, _, _ = services
+    request = make_request(1, order_line_id="line-sent-exact-token")
+    prepared = service.prepare(request)
+    token = prepared["_orchestration_private"]["claim_token"]
+    service.mark_sent(request, token)
+
+    with pytest.raises(DeliveryOrchestrationError) as error:
+        service.mark_sent(request, "wrong-token")
+
+    assert error.value.code == "claim_token_mismatch"
+
+
+def test_mark_sent_recovers_when_authoritative_sent_state_retains_token(services):
+    service, _, _, manager = services
+    request = make_request(1, order_line_id="line-sent-retained-token")
+    prepared = service.prepare(request)
+    token = prepared["_orchestration_private"]["claim_token"]
+    manager.conn.execute(
+        """
+        UPDATE delivery_orchestration_states
+        SET status = 'sent'
+        WHERE order_line_id = ?
+        """,
+        ("line-sent-retained-token",),
+    )
+    manager.conn.commit()
+
+    recovered = service.mark_sent(request, token)
+
+    assert recovered["status"] == "sent"
+
+
+def test_mark_sent_rereads_authoritative_state_after_lost_transition(
+    monkeypatch,
+    services,
+):
+    service, _, _, manager = services
+    request = make_request(1, order_line_id="line-sent-transition-race")
+    prepared = service.prepare(request)
+    token = prepared["_orchestration_private"]["claim_token"]
+
+    def lose_to_concurrent_sent(*args, **kwargs):
+        manager.conn.execute(
+            """
+            UPDATE delivery_orchestration_states
+            SET status = 'sent'
+            WHERE order_line_id = ?
+            """,
+            ("line-sent-transition-race",),
+        )
+        manager.conn.commit()
+        return False
+
+    monkeypatch.setattr(service, "_transition_claim", lose_to_concurrent_sent)
+
+    recovered = service.mark_sent(request, token)
+
+    assert recovered["status"] == "sent"
+
+
+def test_mark_failed_is_idempotent_and_preserves_reservation(services):
+    service, inventory, _, manager = services
+    inventory.import_items(7, 1, "account-a", ["a"])
+    request = make_request(
+        1,
+        order_line_id="line-failed-idempotent",
+        mode="imported_card",
+    )
+    prepared = service.prepare(request)
+    token = prepared["_orchestration_private"]["claim_token"]
+
+    first = service.mark_failed(request, token, RuntimeError("send failed"))
+    repeated = service.mark_failed(request, token, RuntimeError("send failed again"))
+
+    assert first["status"] == repeated["status"] == "failed"
+    assert repeated["reservation_id"] == prepared["reservation_id"]
+    assert manager.conn.execute(
+        "SELECT COUNT(*) FROM card_inventory_reservations"
+    ).fetchone()[0] == 1
+
+
+def test_reclaimed_failure_rejects_previous_terminal_claim_token(services):
+    service, _, _, _ = services
+    request = make_request(1, order_line_id="line-failed-stale-terminal-token")
+    first = service.prepare(request)
+    stale_token = first["_orchestration_private"]["claim_token"]
+    service.mark_failed(request, stale_token, RuntimeError("first failure"))
+
+    retried = service.prepare_retry(request)
+    current_token = retried["_orchestration_private"]["claim_token"]
+    service.mark_failed(request, current_token, RuntimeError("second failure"))
+
+    with pytest.raises(DeliveryOrchestrationError) as error:
+        service.mark_failed(request, stale_token, RuntimeError("late failure"))
+
+    assert current_token != stale_token
+    assert error.value.code == "claim_token_mismatch"
+
+
+def test_mark_failed_rereads_authoritative_state_after_lost_transition(
+    monkeypatch,
+    services,
+):
+    service, _, _, manager = services
+    request = make_request(1, order_line_id="line-failed-transition-race")
+    prepared = service.prepare(request)
+    token = prepared["_orchestration_private"]["claim_token"]
+
+    def lose_to_concurrent_failure(*args, **kwargs):
+        manager.conn.execute(
+            """
+            UPDATE delivery_orchestration_states
+            SET status = 'failed'
+            WHERE order_line_id = ?
+            """,
+            ("line-failed-transition-race",),
+        )
+        manager.conn.commit()
+        return False
+
+    monkeypatch.setattr(service, "_transition_claim", lose_to_concurrent_failure)
+
+    recovered = service.mark_failed(request, token, RuntimeError("send failed"))
+
+    assert recovered["status"] == "failed"
+
+
+def test_renew_claim_only_renews_current_sending_token(services):
+    service, _, _, manager = services
+    service.claim_lease_seconds = 1
+    request = make_request(1, order_line_id="line-renew-claim")
+    prepared = service.prepare(request)
+    token = prepared["_orchestration_private"]["claim_token"]
+    manager.conn.execute(
+        """
+        UPDATE delivery_orchestration_states
+        SET claimed_at = datetime('now', '-10 minutes')
+        WHERE order_line_id = ?
+        """,
+        ("line-renew-claim",),
+    )
+    manager.conn.commit()
+
+    assert service.renew_claim(request, "wrong-token") is False
+    assert service.renew_claim(request, token) is True
+    renewed_at = manager.conn.execute(
+        """
+        SELECT claimed_at FROM delivery_orchestration_states
+        WHERE order_line_id = ?
+        """,
+        ("line-renew-claim",),
+    ).fetchone()[0]
+    service.mark_failed(request, token, RuntimeError("send failed"))
+
+    assert renewed_at > "2000-01-01"
+    assert service.renew_claim(request, token) is False
+
+
 def test_external_prepare_can_mark_failed_with_current_claim(services):
     service, _, _, _ = services
     request = make_request(1, order_line_id="line-failed")
@@ -391,6 +610,47 @@ def test_retry_reclaims_stale_sending_and_reuses_reservation(services):
         "SELECT COUNT(*) FROM card_inventory_reservations"
     ).fetchone()[0] == 1
     assert inventory.get_inventory_summary(7, 1, "account-a")["sent"] == 2
+
+
+def test_prepare_retry_reclaims_stale_claim_without_allowing_old_token(services):
+    service, inventory, _, manager = services
+    service.claim_lease_seconds = 1
+    inventory.import_items(7, 1, "account-a", ["a", "b"])
+    request = make_request(
+        2,
+        order_line_id="line-stale-prepare-retry",
+        mode="imported_card",
+    )
+    prepared = service.prepare(request)
+    stale_token = prepared["_orchestration_private"]["claim_token"]
+    manager.conn.execute(
+        """
+        UPDATE delivery_orchestration_states
+        SET claimed_at = datetime('now', '-10 minutes')
+        WHERE order_line_id = ?
+        """,
+        ("line-stale-prepare-retry",),
+    )
+    manager.conn.commit()
+
+    reclaimed = service.prepare_retry(request)
+    current_token = reclaimed["_orchestration_private"]["claim_token"]
+
+    assert reclaimed["status"] == "sending"
+    assert current_token != stale_token
+    assert reclaimed["reservation_id"] == prepared["reservation_id"]
+    assert reclaimed["contents"] == prepared["contents"]
+    assert manager.conn.execute(
+        "SELECT COUNT(*) FROM card_inventory_reservations"
+    ).fetchone()[0] == 1
+    assert inventory.get_inventory_summary(7, 1, "account-a")["sent"] == 2
+    with pytest.raises(DeliveryOrchestrationError) as sent_error:
+        service.mark_sent(request, stale_token)
+    with pytest.raises(DeliveryOrchestrationError) as failed_error:
+        service.mark_failed(request, stale_token, RuntimeError("late failure"))
+    assert sent_error.value.code == "claim_token_mismatch"
+    assert failed_error.value.code == "claim_token_mismatch"
+    assert service.mark_sent(request, current_token)["status"] == "sent"
 
 
 def test_expired_claim_token_cannot_overwrite_reclaimed_sender(services):

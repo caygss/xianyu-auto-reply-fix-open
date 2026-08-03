@@ -164,6 +164,7 @@ class DeliveryOrchestrationService:
             "quantity", "mode", "idempotency_key", "reservation_id", "status",
             "result_meta", "last_error_code", "last_error", "created_at",
             "updated_at", "sent_at", "claim_token", "claimed_at",
+            "terminal_claim_token",
         )
         state = dict(zip(columns, row))
         try:
@@ -179,7 +180,8 @@ class DeliveryOrchestrationService:
                 SELECT id, user_id, card_id, account_id, order_id, order_line_id,
                        quantity, mode, idempotency_key, reservation_id, status,
                        result_meta, last_error_code, last_error, created_at,
-                       updated_at, sent_at, claim_token, claimed_at
+                       updated_at, sent_at, claim_token, claimed_at,
+                       terminal_claim_token
                 FROM delivery_orchestration_states
                 WHERE user_id = ? AND card_id = ? AND account_id = ?
                   AND order_id = ? AND order_line_id = ?
@@ -204,7 +206,8 @@ class DeliveryOrchestrationService:
                     SELECT id, user_id, card_id, account_id, order_id, order_line_id,
                            quantity, mode, idempotency_key, reservation_id, status,
                            result_meta, last_error_code, last_error, created_at,
-                           updated_at, sent_at, claim_token, claimed_at
+                           updated_at, sent_at, claim_token, claimed_at,
+                           terminal_claim_token
                     FROM delivery_orchestration_states
                     WHERE user_id = ? AND account_id = ?
                       AND order_id = ? AND order_line_id = ?
@@ -289,7 +292,8 @@ class DeliveryOrchestrationService:
                     SELECT id, user_id, card_id, account_id, order_id, order_line_id,
                            quantity, mode, idempotency_key, reservation_id, status,
                            result_meta, last_error_code, last_error, created_at,
-                           updated_at, sent_at, claim_token, claimed_at
+                           updated_at, sent_at, claim_token, claimed_at,
+                           terminal_claim_token
                     FROM delivery_orchestration_states
                     WHERE user_id = ? AND card_id = ? AND account_id = ?
                       AND order_id = ? AND order_line_id = ?
@@ -308,7 +312,8 @@ class DeliveryOrchestrationService:
                         SELECT id, user_id, card_id, account_id, order_id, order_line_id,
                                quantity, mode, idempotency_key, reservation_id, status,
                                result_meta, last_error_code, last_error, created_at,
-                               updated_at, sent_at, claim_token, claimed_at
+                               updated_at, sent_at, claim_token, claimed_at,
+                               terminal_claim_token
                         FROM delivery_orchestration_states
                         WHERE idempotency_key = ?
                         """,
@@ -327,7 +332,8 @@ class DeliveryOrchestrationService:
                     SELECT id, user_id, card_id, account_id, order_id, order_line_id,
                            quantity, mode, idempotency_key, reservation_id, status,
                            result_meta, last_error_code, last_error, created_at,
-                           updated_at, sent_at, claim_token, claimed_at
+                           updated_at, sent_at, claim_token, claimed_at,
+                           terminal_claim_token
                     FROM delivery_orchestration_states
                     WHERE user_id = ? AND card_id = ? AND account_id = ?
                       AND order_id = ? AND order_line_id = ?
@@ -464,6 +470,7 @@ class DeliveryOrchestrationService:
                 UPDATE delivery_orchestration_states
                 SET status = 'sending', claim_token = ?,
                     claimed_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+                    terminal_claim_token = NULL,
                     last_error_code = NULL, last_error = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND ({conditions})
@@ -475,7 +482,8 @@ class DeliveryOrchestrationService:
 
     def _transition_claim(self, state_id: int, claim_token: str, *, status: str,
                           reservation_id=_UNSET, result_meta=None,
-                          error_code=None, error=None, clear_claim=False):
+                          error_code=None, error=None, clear_claim=False,
+                          record_terminal_claim=False):
         if status not in DELIVERY_STATES:
             raise DeliveryOrchestrationError("invalid_state_transition", "交付状态无效")
         reservation_sql = "reservation_id = reservation_id"
@@ -485,7 +493,15 @@ class DeliveryOrchestrationService:
             reservation_params = (reservation_id,)
         meta_json = json.dumps(result_meta or {}, ensure_ascii=False, separators=(",", ":"))
         claim_sql = (
-            "claim_token = NULL, claimed_at = NULL"
+            (
+                "terminal_claim_token = claim_token, "
+                "claim_token = NULL, claimed_at = NULL"
+                if record_terminal_claim
+                else (
+                    "terminal_claim_token = NULL, "
+                    "claim_token = NULL, claimed_at = NULL"
+                )
+            )
             if clear_claim
             else (
                 "claim_token = claim_token, "
@@ -645,11 +661,23 @@ class DeliveryOrchestrationService:
     def prepare(self, request: DeliveryOrchestrationRequest):
         return self._prepare(request)
 
+    def prepare_retry(self, request: DeliveryOrchestrationRequest):
+        return self._prepare(request, allow_retry=True)
+
     def mark_sent(self, request: DeliveryOrchestrationRequest, claim_token: str):
         normalized = self._normalize_request(request)
         state = self._get_state(normalized)
         token = str(claim_token or "").strip()
-        if not state or not token or not self._transition_claim(
+        if (
+            state
+            and state["status"] == "sent"
+            and token
+            and (
+                state.get("terminal_claim_token") or state.get("claim_token")
+            ) == token
+        ):
+            return self._result(state)
+        transitioned = bool(state and token) and self._transition_claim(
             state["id"],
             token,
             status="sent",
@@ -657,13 +685,22 @@ class DeliveryOrchestrationService:
             error_code=None,
             error=None,
             clear_claim=True,
+            record_terminal_claim=True,
+        )
+        current = self._get_state(normalized)
+        if transitioned or (
+            current
+            and current["status"] == "sent"
+            and (
+                current.get("terminal_claim_token") or current.get("claim_token")
+            ) == token
         ):
-            raise DeliveryOrchestrationError(
-                "claim_token_mismatch",
-                "交付 claim 已失效或不属于当前调用",
-                "concurrency",
-            )
-        return self._result(self._get_state(normalized))
+            return self._result(current)
+        raise DeliveryOrchestrationError(
+            "claim_token_mismatch",
+            "交付 claim 已失效或不属于当前调用",
+            "concurrency",
+        )
 
     def mark_failed(self, request: DeliveryOrchestrationRequest, claim_token: str,
                     error=None, *, error_code=None, technical_category="sender",
@@ -671,6 +708,15 @@ class DeliveryOrchestrationService:
         normalized = self._normalize_request(request)
         state = self._get_state(normalized)
         token = str(claim_token or "").strip()
+        if (
+            state
+            and state["status"] == "failed"
+            and token
+            and (
+                state.get("terminal_claim_token") or state.get("claim_token")
+            ) == token
+        ):
+            return self._result(state)
         if isinstance(error, Exception):
             code, message, category, error_details = self._error_info(
                 error, technical_category
@@ -684,7 +730,7 @@ class DeliveryOrchestrationService:
             code = str(error_code)
         if details:
             error_details.update(dict(details))
-        if not state or not token or not self._transition_claim(
+        transitioned = bool(state and token) and self._transition_claim(
             state["id"],
             token,
             status="failed",
@@ -692,13 +738,30 @@ class DeliveryOrchestrationService:
             error_code=code,
             error=message,
             clear_claim=True,
+            record_terminal_claim=True,
+        )
+        current = self._get_state(normalized)
+        if transitioned or (
+            current
+            and current["status"] == "failed"
+            and (
+                current.get("terminal_claim_token") or current.get("claim_token")
+            ) == token
         ):
-            raise DeliveryOrchestrationError(
-                "claim_token_mismatch",
-                "交付 claim 已失效或不属于当前调用",
-                "concurrency",
-            )
-        return self._result(self._get_state(normalized))
+            return self._result(current)
+        raise DeliveryOrchestrationError(
+            "claim_token_mismatch",
+            "交付 claim 已失效或不属于当前调用",
+            "concurrency",
+        )
+
+    def renew_claim(self, request: DeliveryOrchestrationRequest, claim_token: str):
+        normalized = self._normalize_request(request)
+        state = self._get_state(normalized)
+        token = str(claim_token or "").strip()
+        if not state or not token:
+            return False
+        return self._renew_claim(state["id"], token)
 
     def _sender_result(self, sender: Callable, contents, request, claim_token=None):
         stop_heartbeat = threading.Event()

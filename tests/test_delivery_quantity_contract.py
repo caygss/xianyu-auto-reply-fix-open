@@ -188,3 +188,29 @@ def test_prepare_failure_keeps_reservation_and_retry_reuses_it(services):
     assert manager.conn.execute(
         "SELECT COUNT(*) FROM card_inventory_reservations"
     ).fetchone()[0] == 1
+
+
+def test_prepare_retry_reuses_failed_reservation_and_allocated_cards(services):
+    service, inventory, dispatcher, manager = services
+    inventory.import_items(7, 1, "account-a", ["a", "b"])
+    request = make_request(
+        2,
+        order_line_id="line-prepare-retry",
+        mode="imported_card",
+    )
+    prepared = service.prepare(request)
+    claim_token = prepared["_orchestration_private"]["claim_token"]
+    failed = service.mark_failed(request, claim_token, RuntimeError("send failed"))
+
+    retried = service.prepare_retry(request)
+
+    assert failed["status"] == "failed"
+    assert retried["status"] == "sending"
+    assert retried["claimed"] is True
+    assert retried["contents"] == prepared["contents"]
+    assert retried["reservation_id"] == prepared["reservation_id"]
+    assert len(dispatcher.requests) == 2
+    assert manager.conn.execute(
+        "SELECT COUNT(*) FROM card_inventory_reservations"
+    ).fetchone()[0] == 1
+    assert inventory.get_inventory_summary(7, 1, "account-a")["sent"] == 2
