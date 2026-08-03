@@ -226,6 +226,44 @@ class DeliveryOrchestrationService:
                         )
                     self.db.conn.commit()
                     return self._row_to_state(row)
+                expected_binding = request.context.get(
+                    "expected_binding_snapshot",
+                    _UNSET,
+                )
+                if expected_binding is not _UNSET:
+                    binding_row = cursor.execute(
+                        """
+                        SELECT b.user_id, b.account_id, b.item_id, b.card_id,
+                               c.description
+                        FROM item_delivery_bindings b
+                        INNER JOIN cards c
+                            ON c.id = b.card_id AND c.user_id = b.user_id
+                        WHERE b.user_id = ? AND b.account_id = ?
+                          AND b.item_id = ?
+                        LIMIT 1
+                        """,
+                        (
+                            request.user_id,
+                            request.account_id,
+                            request.item_id,
+                        ),
+                    ).fetchone()
+                    current_binding = None
+                    if binding_row and self.db._is_item_delivery_binding_description(
+                        binding_row[4]
+                    ):
+                        current_binding = {
+                            "user_id": int(binding_row[0]),
+                            "account_id": str(binding_row[1]),
+                            "item_id": str(binding_row[2]),
+                            "card_id": int(binding_row[3]),
+                        }
+                    if current_binding != expected_binding:
+                        raise DeliveryOrchestrationError(
+                            "binding_changed",
+                            "商品交付绑定已变化，请稍后重试",
+                            "concurrency",
+                        )
                 cursor.execute(
                     """
                     INSERT INTO delivery_orchestration_states(

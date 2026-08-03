@@ -1059,6 +1059,83 @@ def test_preparation_binding_snapshot_fails_closed_when_binding_changes(
         ).fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("mutation", ["deleted", "rebound"])
+def test_bound_prepare_binding_change_before_service_insert_creates_no_state_or_reservation(
+    runtime,
+    monkeypatch,
+    mutation,
+):
+    live, manager = runtime
+    original_card_id = create_binding(manager)
+    DeliveryConfigService(manager).save(
+        USER_ID,
+        original_card_id,
+        ACCOUNT_ID,
+        "imported_card",
+        {"source": "atomic-binding-test"},
+    )
+    inventory = CardInventoryService(manager)
+    inventory.save_settings(
+        original_card_id,
+        USER_ID,
+        ACCOUNT_ID,
+        stock_ceiling=1,
+    )
+    inventory.import_items(
+        original_card_id,
+        USER_ID,
+        ACCOUNT_ID,
+        ["must-not-be-reserved"],
+    )
+    plan = live._build_auto_delivery_preparation_plan(ITEM_ID, 1)
+    real_prepare = live._prepare_bound_item_delivery
+    replacement_card_ids = []
+
+    def mutate_after_caller_precheck(**kwargs):
+        with manager.lock:
+            manager.conn.execute(
+                "DELETE FROM item_delivery_bindings WHERE item_id = ?",
+                (ITEM_ID,),
+            )
+            manager.conn.commit()
+        if mutation == "rebound":
+            replacement_card_ids.append(create_binding(manager))
+        return real_prepare(**kwargs)
+
+    monkeypatch.setattr(
+        live,
+        "_prepare_bound_item_delivery",
+        mutate_after_caller_precheck,
+    )
+
+    result = asyncio.run(
+        live._auto_delivery(
+            ITEM_ID,
+            "绑定商品",
+            f"order-atomic-binding-{mutation}",
+            "buyer-1",
+            include_meta=True,
+            quantity=plan[0]["quantity"],
+            order_line_id=plan[0]["order_line_id"],
+            binding_snapshot=plan[0]["binding_snapshot"],
+        )
+    )
+
+    if mutation == "rebound":
+        assert replacement_card_ids and replacement_card_ids[0] != original_card_id
+    else:
+        assert replacement_card_ids == []
+    assert result["success"] is False
+    assert result["error_code"] == "binding_changed"
+    with manager.lock:
+        assert manager.conn.execute(
+            "SELECT COUNT(*) FROM delivery_orchestration_states"
+        ).fetchone()[0] == 0
+        assert manager.conn.execute(
+            "SELECT COUNT(*) FROM card_inventory_reservations"
+        ).fetchone()[0] == 0
+
+
 def test_bound_provider_prepare_does_not_block_event_loop(runtime, monkeypatch):
     live, manager = runtime
     card_id = create_binding(manager)
@@ -1408,3 +1485,118 @@ def test_compensation_disposition_is_skipped_without_failure_log(
     assert result is expected_result
     assert logs
     assert {entry["status"] for entry in logs} == {"skipped"}
+
+
+@pytest.mark.parametrize("entry", ["simple", "compensation"])
+def test_real_delivery_entries_persist_only_sanitized_finalization_meta(
+    runtime,
+    monkeypatch,
+    entry,
+):
+    live, manager = runtime
+    create_binding(manager)
+    live._order_locks = defaultdict(asyncio.Lock)
+    live._lock_usage_times = {}
+    order_id = f"order-sanitized-{entry}"
+    raw_result = {
+        "success": True,
+        "configured": True,
+        "content": "raw-content-secret",
+        "contents": ["raw-content-secret"],
+        "delivery_steps": [{"type": "text", "content": "raw-step-secret"}],
+        "config": {"token": "provider-config-secret"},
+        "provider_secret": "provider-secret",
+        "card_id": 99,
+        "mode": "fixed_link",
+        "quantity": 1,
+        "order_id": order_id,
+        "order_line_id": ITEM_ID,
+        "idempotency_key": "sanitized-key",
+        "orchestration_status": "sending",
+        "content_count": 1,
+        "orchestration_meta": {"content_count": 1, "state": None},
+        "delivery_unit_index": 1,
+        "_orchestration_private": {
+            "claim_token": "approved-claim-token",
+            "provider_secret": "private-provider-secret",
+        },
+    }
+    finalized_meta = []
+
+    monkeypatch.setattr(live, "can_auto_delivery", lambda value: True)
+    monkeypatch.setattr(live, "is_lock_held", lambda value: False)
+    monkeypatch.setattr(live, "_get_pending_delivery_finalization_meta", lambda *args: None)
+    monkeypatch.setattr(
+        manager,
+        "get_order_by_id",
+        lambda value: {"order_id": value, "quantity": "1"},
+    )
+
+    async def return_raw_result(*args, **kwargs):
+        return dict(raw_result)
+
+    async def finalize_without_network(**kwargs):
+        finalized_meta.append(dict(kwargs["delivery_meta"]))
+        return {"success": True}
+
+    async def ignore_async(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(live, "_auto_delivery", return_raw_result)
+    monkeypatch.setattr(live, "_finalize_delivery_after_send", finalize_without_network)
+    monkeypatch.setattr(live, "_mark_data_reservation_sent_if_needed", lambda meta: True)
+    monkeypatch.setattr(live, "_sync_order_delivery_progress", lambda **kwargs: None)
+    monkeypatch.setattr(live, "_activate_delivery_lock", lambda *args, **kwargs: None)
+    monkeypatch.setattr(live, "_record_delivery_log", lambda **kwargs: None)
+    monkeypatch.setattr(live, "send_delivery_failure_notification", ignore_async)
+
+    if entry == "simple":
+        async def owned_item(*args, **kwargs):
+            return True
+
+        monkeypatch.setattr(live, "_ensure_item_owned_by_current_account", owned_item)
+        monkeypatch.setattr(
+            live,
+            "_check_buyer_blacklist_for_action",
+            lambda **kwargs: False,
+        )
+        monkeypatch.setattr(live, "_send_delivery_steps", ignore_async)
+        asyncio.run(
+            live._handle_simple_message_auto_delivery(
+                object(),
+                order_id,
+                ITEM_ID,
+                "buyer-1",
+                "chat-1",
+                "now",
+                "message-1",
+            )
+        )
+    else:
+        monkeypatch.setattr(live, "send_delivery_steps_once", ignore_async)
+        assert asyncio.run(
+            live._send_recovered_delivery_without_sid(
+                {"quantity": "1"},
+                order_id=order_id,
+                item_id=ITEM_ID,
+                buyer_id="buyer-1",
+                source="test-sanitized-compensation",
+            )
+        ) is True
+
+    stored_meta = manager.get_delivery_finalization_state(order_id, 1)["delivery_meta"]
+    expected_meta = live._delivery_result_to_finalization_meta(raw_result)
+
+    assert stored_meta == expected_meta
+    assert finalized_meta == [expected_meta]
+    assert set(stored_meta["_orchestration_private"]) == {"claim_token"}
+    assert stored_meta["_orchestration_private"]["claim_token"] == "approved-claim-token"
+    assert "claim_token" not in stored_meta
+    for forbidden_key in (
+        "content",
+        "contents",
+        "delivery_steps",
+        "config",
+        "provider_secret",
+    ):
+        assert forbidden_key not in stored_meta

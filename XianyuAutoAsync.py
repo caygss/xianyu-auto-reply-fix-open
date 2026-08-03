@@ -4933,7 +4933,9 @@ class XianyuLive:
                 delivery_content = delivery_result.get('content')
                 delivery_steps = delivery_result.get('delivery_steps') or []
                 delivery_error = delivery_result.get('error')
-                delivery_meta = delivery_result
+                delivery_meta = self._delivery_result_to_finalization_meta(
+                    delivery_result
+                )
             else:
                 delivery_content = delivery_result
                 delivery_steps = []
@@ -4941,7 +4943,11 @@ class XianyuLive:
                 delivery_meta = {}
 
             if not delivery_content:
-                disposition = delivery_meta.get('disposition') if isinstance(delivery_meta, dict) else None
+                disposition = (
+                    delivery_result.get('disposition')
+                    if isinstance(delivery_result, dict)
+                    else None
+                )
                 if disposition in {'noop_sent', 'defer_in_progress'}:
                     self._record_delivery_log(
                         order_id=order_id,
@@ -5859,9 +5865,9 @@ class XianyuLive:
                             log_prefix=f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 自动发货'
                         )
 
-                        if not self._mark_data_reservation_sent_if_needed(delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta):
+                        if not self._mark_data_reservation_sent_if_needed(delivery_rule_meta):
                             self._release_data_reservation_if_needed(
-                                delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
+                                delivery_rule_meta,
                                 error='发送成功后标记预占已发送失败'
                             )
                             raise Exception('批量数据预占标记已发送失败')
@@ -5870,13 +5876,13 @@ class XianyuLive:
                             order_id=order_id,
                             item_id=item_id,
                             buyer_id=user_id,
-                            delivery_meta=delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
+                            delivery_meta=delivery_rule_meta,
                             channel='auto',
                             status='sent'
                         )
 
                         finalize_result = await self._finalize_delivery_after_send(
-                            delivery_meta=delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
+                            delivery_meta=delivery_rule_meta,
                             order_id=order_id,
                             item_id=item_id
                         )
@@ -5887,7 +5893,7 @@ class XianyuLive:
                                     order_id=order_id,
                                     item_id=item_id,
                                     buyer_id=user_id,
-                                    delivery_meta=delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
+                                    delivery_meta=delivery_rule_meta,
                                     confirm_error=finalize_error,
                                     expected_quantity=1,
                                     context="自动发货发送成功后平台确认失败"
@@ -5897,7 +5903,7 @@ class XianyuLive:
                                     order_id=order_id,
                                     item_id=item_id,
                                     buyer_id=user_id,
-                                    delivery_meta=delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
+                                    delivery_meta=delivery_rule_meta,
                                     channel='auto',
                                     status='sent',
                                     last_error=finalize_error
@@ -5925,7 +5931,7 @@ class XianyuLive:
                             order_id=order_id,
                             item_id=item_id,
                             buyer_id=user_id,
-                            delivery_meta=delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
+                            delivery_meta=delivery_rule_meta,
                             channel='auto',
                             status='finalized'
                         )
@@ -6012,7 +6018,7 @@ class XianyuLive:
 
         except Exception as e:
             self._release_data_reservation_if_needed(
-                delivery_result if 'delivery_result' in locals() and isinstance(delivery_result, dict) else delivery_rule_meta if 'delivery_rule_meta' in locals() else None,
+                delivery_rule_meta if 'delivery_rule_meta' in locals() else None,
                 error=f'自动发货发送失败: {self._safe_str(e)}'
             )
             self._record_delivery_log(
@@ -12205,6 +12211,7 @@ class XianyuLive:
         self,
         *,
         binding: dict,
+        expected_binding_snapshot: dict,
         order_id: str,
         buyer_id: str,
         item_id: str,
@@ -12249,6 +12256,7 @@ class XianyuLive:
                 "item_id": item_id,
                 "account_id": self.cookie_id,
                 "card_id": card_id,
+                "expected_binding_snapshot": expected_binding_snapshot,
             },
         )
         return DeliveryOrchestrationService(
@@ -12475,9 +12483,18 @@ class XianyuLive:
                             "meta": {},
                         }
                     else:
+                        expected_binding_snapshot = (
+                            binding_snapshot
+                            if binding_snapshot is not _ITEM_DELIVERY_BINDING_UNSET
+                            else self._item_delivery_binding_snapshot(
+                                item_id,
+                                bound_delivery,
+                            )
+                        )
                         prepared = await asyncio.to_thread(
                             self._prepare_bound_item_delivery,
                             binding=bound_delivery,
+                            expected_binding_snapshot=expected_binding_snapshot,
                             order_id=order_id,
                             buyer_id=send_user_id,
                             item_id=item_id,
