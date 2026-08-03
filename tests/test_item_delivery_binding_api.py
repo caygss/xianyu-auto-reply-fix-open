@@ -156,16 +156,20 @@ def test_binding_queries_require_existing_same_user_marker_card(binding_state):
         "item_id": "item-100",
         "card_id": internal["card_id"],
     }
-    assert get_for_card(OWNER["user_id"], internal["card_id"]) == binding
+    assert get_for_card(internal["card_id"]) == binding
     assert (
         get_for_card(
-            OWNER["user_id"], internal["card_id"], "account-a"
+            internal["card_id"],
+            user_id=OWNER["user_id"],
+            account_id="account-a",
         )
         == binding
     )
     assert (
         get_for_card(
-            OWNER["user_id"], internal["card_id"], "account-b"
+            internal["card_id"],
+            user_id=OWNER["user_id"],
+            account_id="account-b",
         )
         is None
     )
@@ -177,7 +181,7 @@ def test_binding_queries_require_existing_same_user_marker_card(binding_state):
         description=f"用户备注含有 {ITEM_DELIVERY_BINDING_MARKER}",
         user_id=OWNER["user_id"],
     )
-    assert get_for_card(OWNER["user_id"], ordinary_card_id) is None
+    assert get_for_card(ordinary_card_id) is None
 
 
 def test_get_or_create_replaces_cross_user_or_non_marker_binding(binding_state):

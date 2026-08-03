@@ -19,6 +19,11 @@ from loguru import logger
 
 ITEM_DELIVERY_BINDING_MARKER = "[system:item-delivery-binding]"
 
+
+class _CardsTableMigrationError(RuntimeError):
+    """Raised when rebuilding the legacy cards table cannot finish atomically."""
+
+
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
     
@@ -1382,6 +1387,8 @@ Cookie数量: {cookie_count}
                 logger.info("添加chat_messages表的extra_json列...")
                 cursor.execute("ALTER TABLE chat_messages ADD COLUMN extra_json TEXT")
 
+        except _CardsTableMigrationError:
+            raise
         except Exception as e:
             logger.error(f"数据库迁移失败: {e}")
             # 迁移失败不应该阻止程序启动
@@ -1554,11 +1561,20 @@ Cookie数量: {cookie_count}
             if "CHECK constraint failed" in str(e) or "constraint" in str(e).lower():
                 logger.info("检测到旧的CHECK约束，开始更新cards表以支持yifan_api类型...")
 
-                # 重建表以更新约束
+                # PRAGMA foreign_keys cannot be changed inside a transaction.
+                # Commit earlier migrations first, disable enforcement outside a
+                # transaction, and rebuild cards atomically so DROP TABLE does not
+                # cascade-delete rows in tables that reference cards.
+                self.conn.commit()
                 try:
-                    # 1. 创建新表
+                    self.conn.execute("PRAGMA foreign_keys = OFF")
+                    if self.conn.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+                        raise RuntimeError("无法在cards表迁移前关闭外键约束")
+
+                    cursor.execute("BEGIN IMMEDIATE")
+                    cursor.execute("DROP TABLE IF EXISTS cards_new")
                     cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS cards_new (
+                    CREATE TABLE cards_new (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         name TEXT NOT NULL,
                         type TEXT NOT NULL CHECK (type IN ('api', 'yifan_api', 'text', 'data', 'image')),
@@ -1581,7 +1597,6 @@ Cookie数量: {cookie_count}
                     )
                     ''')
 
-                    # 2. 复制数据（双规格字段设为NULL，由后续迁移填充）
                     cursor.execute('''
                     INSERT INTO cards_new (id, name, type, api_config, text_content, data_content, image_url,
                                           description, enabled, delay_seconds, is_multi_spec, spec_name, spec_value,
@@ -1592,21 +1607,34 @@ Cookie数量: {cookie_count}
                     FROM cards
                     ''')
 
-                    # 3. 删除旧表
                     cursor.execute("DROP TABLE cards")
-
-                    # 4. 重命名新表
                     cursor.execute("ALTER TABLE cards_new RENAME TO cards")
 
-                    logger.info("cards表约束更新完成，现在支持image类型")
+                    foreign_key_violations = cursor.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchall()
+                    if foreign_key_violations:
+                        raise sqlite3.IntegrityError(
+                            "cards表迁移后存在外键违规: "
+                            f"{foreign_key_violations[:5]}"
+                        )
 
+                    self.conn.commit()
+                    logger.info("cards表约束更新完成，现在支持image类型")
                 except Exception as rebuild_error:
+                    self.conn.rollback()
                     logger.error(f"重建cards表失败: {rebuild_error}")
-                    # 如果重建失败，尝试回滚
-                    try:
-                        cursor.execute("DROP TABLE IF EXISTS cards_new")
-                    except:
-                        pass
+                    raise _CardsTableMigrationError(
+                        "cards表约束迁移失败，已回滚"
+                    ) from rebuild_error
+                finally:
+                    if self.conn.in_transaction:
+                        self.conn.rollback()
+                    self.conn.execute("PRAGMA foreign_keys = ON")
+                    if self.conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+                        raise _CardsTableMigrationError(
+                            "cards表迁移后无法恢复外键约束"
+                        )
             else:
                 logger.error(f"检查cards表约束时出现未知错误: {e}")
 
@@ -4945,13 +4973,16 @@ Cookie数量: {cookie_count}
 
     def get_item_delivery_binding_for_card(
         self,
-        user_id: int,
         card_id: int,
+        user_id: int = None,
         account_id: str = None,
     ) -> Optional[Dict[str, Any]]:
         """按卡券查询有效内部绑定，可选限制到指定账号。"""
-        where_clause = "b.user_id = ? AND b.card_id = ?"
-        params = [user_id, card_id]
+        where_clause = "b.card_id = ?"
+        params = [card_id]
+        if user_id is not None:
+            where_clause += " AND b.user_id = ?"
+            params.append(user_id)
         if account_id is not None:
             where_clause += " AND b.account_id = ?"
             params.append(str(account_id))
