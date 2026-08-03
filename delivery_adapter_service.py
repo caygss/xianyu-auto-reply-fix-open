@@ -137,9 +137,9 @@ class ProviderApiAdapter:
         payload = copy.deepcopy(config.get("request_body", {}))
         context = dict(request.context or {})
         if request.quantity != 1 or request.idempotency_key:
-            context.setdefault("quantity", request.quantity)
+            context["quantity"] = request.quantity
         if request.idempotency_key:
-            context.setdefault("idempotency_key", request.idempotency_key)
+            context["idempotency_key"] = request.idempotency_key
         mapping = config.get("field_mapping", {})
         if not mapping:
             payload.update(context)
@@ -156,9 +156,9 @@ class ProviderApiAdapter:
                     "provider_request",
                 )
         if request.quantity != 1 or request.idempotency_key:
-            payload.setdefault("quantity", request.quantity)
+            payload["quantity"] = request.quantity
         if request.idempotency_key:
-            payload.setdefault("idempotency_key", request.idempotency_key)
+            payload["idempotency_key"] = request.idempotency_key
         return payload
 
     @staticmethod

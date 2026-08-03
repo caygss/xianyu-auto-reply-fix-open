@@ -109,6 +109,7 @@ def test_insufficient_card_inventory_pauses_whole_order_without_partial_reservat
 
     assert result["status"] == "paused"
     assert result["error_code"] == "insufficient_inventory"
+    assert result["meta"]["shortage"] == 1
     assert inventory.get_inventory_summary(7, 1, "account-a")["available"] == 2
     assert sender.calls == []
     assert manager.conn.execute(

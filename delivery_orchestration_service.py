@@ -502,10 +502,20 @@ class DeliveryOrchestrationService:
                 state = self._get_state(request)
             except CardInventoryError as exc:
                 code, message, _, details = self._error_info(exc, "inventory")
+                available = details.get("available")
+                shortage = (
+                    max(request.quantity - int(available), 0)
+                    if available is not None
+                    else request.quantity
+                )
                 if not self._transition_claim(
                     state["id"], claim_token, status="paused",
                     error_code=code, error=message, clear_claim=True,
-                    result_meta={"available": details.get("available"), "requested": request.quantity},
+                    result_meta={
+                        "available": available,
+                        "requested": request.quantity,
+                        "shortage": shortage,
+                    },
                 ):
                     return self._claim_lost_result(request)
                 return self._result(self._get_state(request))

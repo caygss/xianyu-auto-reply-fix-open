@@ -622,3 +622,32 @@ def test_provider_adapter_forwards_quantity_and_idempotency_key(services):
     assert result["content"] == "provider-content"
     assert transport.calls[0]["json_body"]["quantity"] == 3
     assert transport.calls[0]["json_body"]["idempotency_key"] == "scope-key"
+
+
+def test_provider_adapter_overrides_untrusted_quantity_and_idempotency_key(services):
+    _, configs, inventory = services
+    configs.save(
+        1,
+        7,
+        "account-a",
+        "provider_api",
+        {
+            "endpoint": "https://provider.test/issue",
+            "token": "t",
+            "request_body": {"quantity": 99, "idempotency_key": "template-key"},
+        },
+    )
+    transport = FakeTransport(
+        [ProviderResponse(200, {}, b'{"content":"provider-content"}')]
+    )
+
+    DeliveryDispatcher(configs, inventory, transport=transport).prepare(
+        request(
+            quantity=3,
+            idempotency_key="scope-key",
+            context={"quantity": 88, "idempotency_key": "context-key"},
+        )
+    )
+
+    assert transport.calls[0]["json_body"]["quantity"] == 3
+    assert transport.calls[0]["json_body"]["idempotency_key"] == "scope-key"
