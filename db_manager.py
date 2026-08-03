@@ -1549,94 +1549,110 @@ Cookie数量: {cookie_count}
     def _update_cards_table_constraints(self, cursor):
         """更新cards表的CHECK约束以支持image和yifan_api类型"""
         try:
-            # 尝试插入一个测试的yifan_api类型记录来检查约束
-            cursor.execute('''
-                INSERT INTO cards (name, type, user_id)
-                VALUES ('__test_yifan_constraint__', 'yifan_api', 1)
-            ''')
-            # 如果插入成功，立即删除测试记录
-            cursor.execute("DELETE FROM cards WHERE name = '__test_yifan_constraint__'")
+            cards_schema = cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cards'"
+            ).fetchone()
+        except sqlite3.DatabaseError as schema_error:
+            raise _CardsTableMigrationError(
+                "无法安全检查cards表约束：读取建表SQL失败"
+            ) from schema_error
+
+        if (
+            not cards_schema
+            or not isinstance(cards_schema[0], str)
+            or not cards_schema[0].strip()
+        ):
+            raise _CardsTableMigrationError(
+                "无法安全检查cards表约束：缺少有效的建表SQL"
+            )
+
+        check_constraints = re.findall(
+            r"\bCHECK\s*\((.*?)\)",
+            cards_schema[0],
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not check_constraints or any(
+            "yifan_api" in constraint.lower() for constraint in check_constraints
+        ):
             logger.info("cards表约束检查通过，支持yifan_api类型")
-        except Exception as e:
-            if "CHECK constraint failed" in str(e) or "constraint" in str(e).lower():
-                logger.info("检测到旧的CHECK约束，开始更新cards表以支持yifan_api类型...")
+            return
 
-                # PRAGMA foreign_keys cannot be changed inside a transaction.
-                # Commit earlier migrations first, disable enforcement outside a
-                # transaction, and rebuild cards atomically so DROP TABLE does not
-                # cascade-delete rows in tables that reference cards.
-                self.conn.commit()
-                try:
-                    self.conn.execute("PRAGMA foreign_keys = OFF")
-                    if self.conn.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
-                        raise RuntimeError("无法在cards表迁移前关闭外键约束")
+        logger.info("检测到旧的CHECK约束，开始更新cards表以支持yifan_api类型...")
 
-                    cursor.execute("BEGIN IMMEDIATE")
-                    cursor.execute("DROP TABLE IF EXISTS cards_new")
-                    cursor.execute('''
-                    CREATE TABLE cards_new (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL,
-                        type TEXT NOT NULL CHECK (type IN ('api', 'yifan_api', 'text', 'data', 'image')),
-                        api_config TEXT,
-                        text_content TEXT,
-                        data_content TEXT,
-                        image_url TEXT,
-                        description TEXT,
-                        enabled BOOLEAN DEFAULT TRUE,
-                        delay_seconds INTEGER DEFAULT 0,
-                        is_multi_spec BOOLEAN DEFAULT FALSE,
-                        spec_name TEXT,
-                        spec_value TEXT,
-                        spec_name_2 TEXT,
-                        spec_value_2 TEXT,
-                        user_id INTEGER NOT NULL DEFAULT 1,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (user_id) REFERENCES users (id)
-                    )
-                    ''')
+        # PRAGMA foreign_keys cannot be changed inside a transaction.
+        # Commit earlier migrations first, disable enforcement outside a
+        # transaction, and rebuild cards atomically so DROP TABLE does not
+        # cascade-delete rows in tables that reference cards.
+        self.conn.commit()
+        try:
+            self.conn.execute("PRAGMA foreign_keys = OFF")
+            if self.conn.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+                raise RuntimeError("无法在cards表迁移前关闭外键约束")
 
-                    cursor.execute('''
-                    INSERT INTO cards_new (id, name, type, api_config, text_content, data_content, image_url,
-                                          description, enabled, delay_seconds, is_multi_spec, spec_name, spec_value,
-                                          spec_name_2, spec_value_2, user_id, created_at, updated_at)
-                    SELECT id, name, type, api_config, text_content, data_content, image_url,
-                           description, enabled, delay_seconds, is_multi_spec, spec_name, spec_value,
-                           NULL, NULL, user_id, created_at, updated_at
-                    FROM cards
-                    ''')
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("DROP TABLE IF EXISTS cards_new")
+            cursor.execute('''
+            CREATE TABLE cards_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL CHECK (type IN ('api', 'yifan_api', 'text', 'data', 'image')),
+                api_config TEXT,
+                text_content TEXT,
+                data_content TEXT,
+                image_url TEXT,
+                description TEXT,
+                enabled BOOLEAN DEFAULT TRUE,
+                delay_seconds INTEGER DEFAULT 0,
+                is_multi_spec BOOLEAN DEFAULT FALSE,
+                spec_name TEXT,
+                spec_value TEXT,
+                spec_name_2 TEXT,
+                spec_value_2 TEXT,
+                user_id INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+            ''')
 
-                    cursor.execute("DROP TABLE cards")
-                    cursor.execute("ALTER TABLE cards_new RENAME TO cards")
+            cursor.execute('''
+            INSERT INTO cards_new (id, name, type, api_config, text_content, data_content, image_url,
+                                  description, enabled, delay_seconds, is_multi_spec, spec_name, spec_value,
+                                  spec_name_2, spec_value_2, user_id, created_at, updated_at)
+            SELECT id, name, type, api_config, text_content, data_content, image_url,
+                   description, enabled, delay_seconds, is_multi_spec, spec_name, spec_value,
+                   spec_name_2, spec_value_2, user_id, created_at, updated_at
+            FROM cards
+            ''')
 
-                    foreign_key_violations = cursor.execute(
-                        "PRAGMA foreign_key_check"
-                    ).fetchall()
-                    if foreign_key_violations:
-                        raise sqlite3.IntegrityError(
-                            "cards表迁移后存在外键违规: "
-                            f"{foreign_key_violations[:5]}"
-                        )
+            cursor.execute("DROP TABLE cards")
+            cursor.execute("ALTER TABLE cards_new RENAME TO cards")
 
-                    self.conn.commit()
-                    logger.info("cards表约束更新完成，现在支持image类型")
-                except Exception as rebuild_error:
-                    self.conn.rollback()
-                    logger.error(f"重建cards表失败: {rebuild_error}")
-                    raise _CardsTableMigrationError(
-                        "cards表约束迁移失败，已回滚"
-                    ) from rebuild_error
-                finally:
-                    if self.conn.in_transaction:
-                        self.conn.rollback()
-                    self.conn.execute("PRAGMA foreign_keys = ON")
-                    if self.conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
-                        raise _CardsTableMigrationError(
-                            "cards表迁移后无法恢复外键约束"
-                        )
-            else:
-                logger.error(f"检查cards表约束时出现未知错误: {e}")
+            foreign_key_violations = cursor.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+            if foreign_key_violations:
+                raise sqlite3.IntegrityError(
+                    "cards表迁移后存在外键违规: "
+                    f"{foreign_key_violations[:5]}"
+                )
+
+            self.conn.commit()
+            logger.info("cards表约束更新完成，现在支持image类型")
+        except Exception as rebuild_error:
+            self.conn.rollback()
+            logger.error(f"重建cards表失败: {rebuild_error}")
+            raise _CardsTableMigrationError(
+                "cards表约束迁移失败，已回滚"
+            ) from rebuild_error
+        finally:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            if self.conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+                raise _CardsTableMigrationError(
+                    "cards表迁移后无法恢复外键约束"
+                )
 
     def _migrate_notification_templates(self, cursor):
         """迁移notification_templates表以支持新的模板类型"""

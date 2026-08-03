@@ -5,6 +5,35 @@ import pytest
 from db_manager import DBManager, ITEM_DELIVERY_BINDING_MARKER
 
 
+def _make_current_cards_database_without_user_one(tmp_path):
+    db_path = tmp_path / "current-cards.sqlite3"
+    manager = DBManager(str(db_path))
+    manager.close()
+
+    connection = sqlite3.connect(str(db_path))
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute("UPDATE users SET id = 2 WHERE id = 1")
+    connection.execute(
+        """
+        INSERT INTO cards (
+            id, name, type, is_multi_spec, spec_name, spec_value,
+            spec_name_2, spec_value_2, user_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (51, "current two-spec card", "text", 1, "color", "blue", "size", "large", 2),
+    )
+    cards_rootpage = connection.execute(
+        "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'cards'"
+    ).fetchone()[0]
+    cards_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cards'"
+    ).fetchone()[0]
+    assert "yifan_api" in cards_sql
+    connection.commit()
+    connection.close()
+    return db_path, cards_rootpage
+
+
 def _make_legacy_cards_database(tmp_path, *, invalid_user=False):
     db_path = tmp_path / "legacy-cards.sqlite3"
     manager = DBManager(str(db_path))
@@ -41,14 +70,21 @@ def _make_legacy_cards_database(tmp_path, *, invalid_user=False):
     card_user_id = 999 if invalid_user else 1
     connection.execute(
         """
-        INSERT INTO cards (id, name, type, description, user_id)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO cards (
+            id, name, type, description, is_multi_spec, spec_name, spec_value,
+            spec_name_2, spec_value_2, user_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             41,
             "历史绑定卡券",
             "text",
             f"{ITEM_DELIVERY_BINDING_MARKER} legacy",
+            1,
+            "color",
+            "red",
+            "size",
+            "small",
             card_user_id,
         ),
     )
@@ -79,7 +115,26 @@ def _make_legacy_cards_database(tmp_path, *, invalid_user=False):
     return db_path
 
 
-def test_cards_constraint_migration_preserves_all_card_references(tmp_path):
+def test_current_cards_constraint_without_user_one_is_not_rebuilt(tmp_path):
+    db_path, cards_rootpage = _make_current_cards_database_without_user_one(tmp_path)
+
+    manager = DBManager(str(db_path))
+    try:
+        assert manager.conn.execute(
+            "SELECT id FROM users ORDER BY id"
+        ).fetchall() == [(2,)]
+        assert manager.conn.execute(
+            "SELECT spec_name_2, spec_value_2 FROM cards WHERE id = 51"
+        ).fetchone() == ("size", "large")
+        assert manager.conn.execute(
+            "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'cards'"
+        ).fetchone()[0] == cards_rootpage
+        assert manager.conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        manager.close()
+
+
+def test_legacy_cards_constraint_migration_preserves_specs_and_references(tmp_path):
     db_path = _make_legacy_cards_database(tmp_path)
 
     manager = DBManager(str(db_path))
@@ -96,8 +151,11 @@ def test_cards_constraint_migration_preserves_all_card_references(tmp_path):
             "SELECT card_id FROM data_card_reservations"
         ).fetchone()[0] == 41
         assert manager.conn.execute(
-            "SELECT type FROM cards WHERE id = 41"
-        ).fetchone()[0] == "text"
+            "SELECT type, spec_name_2, spec_value_2 FROM cards WHERE id = 41"
+        ).fetchone() == ("text", "size", "small")
+        assert "yifan_api" in manager.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cards'"
+        ).fetchone()[0]
         assert manager.conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cards_new'"
         ).fetchone() is None
