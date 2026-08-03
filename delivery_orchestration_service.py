@@ -199,6 +199,33 @@ class DeliveryOrchestrationService:
             cursor = self.db.conn.cursor()
             try:
                 cursor.execute("BEGIN IMMEDIATE")
+                row = cursor.execute(
+                    """
+                    SELECT id, user_id, card_id, account_id, order_id, order_line_id,
+                           quantity, mode, idempotency_key, reservation_id, status,
+                           result_meta, last_error_code, last_error, created_at,
+                           updated_at, sent_at, claim_token, claimed_at
+                    FROM delivery_orchestration_states
+                    WHERE user_id = ? AND account_id = ?
+                      AND order_id = ? AND order_line_id = ?
+                    LIMIT 1
+                    """,
+                    (
+                        request.user_id,
+                        request.account_id,
+                        request.order_id,
+                        request.order_line_id,
+                    ),
+                ).fetchone()
+                if row is not None:
+                    if int(row[2]) != request.card_id:
+                        raise DeliveryOrchestrationError(
+                            "idempotency_conflict",
+                            "同一订单行已由其他交付卡处理，请核对绑定",
+                            "concurrency",
+                        )
+                    self.db.conn.commit()
+                    return self._row_to_state(row)
                 cursor.execute(
                     """
                     INSERT INTO delivery_orchestration_states(
@@ -374,7 +401,9 @@ class DeliveryOrchestrationService:
             result["state"] = state["status"]
         if claimed:
             result["claimed"] = True
-            result["claim_token"] = claim_token
+            result["_orchestration_private"] = {
+                "claim_token": claim_token,
+            }
         if contents is not None:
             result["contents"] = list(contents)
         return result
@@ -668,22 +697,23 @@ class DeliveryOrchestrationService:
         prepared = self._prepare(normalized)
         if not prepared.get("claimed"):
             return prepared
+        claim_token = prepared["_orchestration_private"]["claim_token"]
         try:
             self._sender_result(
                 sender,
                 prepared.get("contents") or [],
                 normalized,
-                prepared["claim_token"],
+                claim_token,
             )
         except Exception as exc:
             try:
-                return self.mark_failed(normalized, prepared["claim_token"], exc)
+                return self.mark_failed(normalized, claim_token, exc)
             except DeliveryOrchestrationError as mark_error:
                 if mark_error.code != "claim_token_mismatch":
                     raise
                 return self._claim_lost_result(normalized)
         try:
-            return self.mark_sent(normalized, prepared["claim_token"])
+            return self.mark_sent(normalized, claim_token)
         except DeliveryOrchestrationError as mark_error:
             if mark_error.code != "claim_token_mismatch":
                 raise
@@ -701,22 +731,23 @@ class DeliveryOrchestrationService:
         prepared = self._prepare(normalized, allow_retry=True)
         if not prepared.get("claimed"):
             return prepared
+        claim_token = prepared["_orchestration_private"]["claim_token"]
         try:
             self._sender_result(
                 sender,
                 prepared.get("contents") or [],
                 normalized,
-                prepared["claim_token"],
+                claim_token,
             )
         except Exception as exc:
             try:
-                return self.mark_failed(normalized, prepared["claim_token"], exc)
+                return self.mark_failed(normalized, claim_token, exc)
             except DeliveryOrchestrationError as mark_error:
                 if mark_error.code != "claim_token_mismatch":
                     raise
                 return self._claim_lost_result(normalized)
         try:
-            return self.mark_sent(normalized, prepared["claim_token"])
+            return self.mark_sent(normalized, claim_token)
         except DeliveryOrchestrationError as mark_error:
             if mark_error.code != "claim_token_mismatch":
                 raise

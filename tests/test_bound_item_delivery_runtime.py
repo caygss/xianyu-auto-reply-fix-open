@@ -1,8 +1,10 @@
 import asyncio
 import json
+import time
 from collections import defaultdict
 
 import pytest
+from fastapi import HTTPException
 
 import XianyuAutoAsync as xianyu_module
 import db_manager as db_manager_module
@@ -302,7 +304,7 @@ def test_bound_card_quantity_three_prepares_one_batch_with_three_distinct_cards(
     assert result["order_id"] == "order-three-cards"
     assert result["order_line_id"] == "line-three-cards"
     assert result["reservation_id"]
-    assert result["claim_token"]
+    assert result["_orchestration_private"]["claim_token"]
     assert result["content_count"] == 3
     assert len(result["contents"]) == 3
     assert len(set(result["contents"])) == 3
@@ -414,11 +416,12 @@ def test_repeated_bound_prepare_does_not_reserve_again_or_return_new_claim(runti
 
     assert first["success"] is True
     assert first["status"] == "sending"
-    assert first["claim_token"]
+    assert first["_orchestration_private"]["claim_token"]
     assert len(first["contents"]) == 2
     assert repeated["success"] is False
     assert repeated["status"] == "in_progress"
-    assert repeated["claim_token"] is None
+    assert repeated["disposition"] == "defer_in_progress"
+    assert repeated["_orchestration_private"] == {}
     assert repeated["contents"] == []
     assert repeated["delivery_steps"] == []
     assert "处理中" in repeated["error"]
@@ -450,6 +453,12 @@ def test_multi_quantity_call_plan_prepares_bound_once_and_legacy_per_unit(runtim
             "order_line_id": ITEM_ID,
             "configured": True,
             "card_id": card_id,
+            "binding_snapshot": {
+                "user_id": USER_ID,
+                "account_id": ACCOUNT_ID,
+                "item_id": ITEM_ID,
+                "card_id": card_id,
+            },
         }
     ]
 
@@ -469,6 +478,7 @@ def test_multi_quantity_call_plan_prepares_bound_once_and_legacy_per_unit(runtim
             "order_line_id": None,
             "configured": False,
             "card_id": None,
+            "binding_snapshot": None,
         }
         for unit_index in range(1, 4)
     ]
@@ -519,7 +529,7 @@ def test_bound_invalid_config_fails_closed_without_legacy_lookup(runtime, monkey
     assert result["success"] is False
     assert result["status"] == "failed"
     assert result["error_code"] == "invalid_config"
-    assert "固定链接" in result["error"]
+    assert "交付配置" in result["error"]
     assert result["content"] is None
     assert result["delivery_steps"] == []
 
@@ -559,8 +569,8 @@ def test_bound_provider_failed_state_returns_chinese_blocking_result(runtime, mo
     assert result["success"] is False
     assert result["status"] == "failed"
     assert result["error_code"] == "provider_response_field_missing"
-    assert "交付内容" in result["error"]
-    assert result["claim_token"] is None
+    assert "发货准备失败" in result["error"]
+    assert result["_orchestration_private"] == {}
     assert result["contents"] == []
     with manager.lock:
         state = manager.conn.execute(
@@ -605,15 +615,16 @@ def test_bound_sent_state_blocks_duplicate_content_and_claim(runtime):
 
     assert repeated["success"] is False
     assert repeated["status"] == "sent"
+    assert repeated["disposition"] == "noop_sent"
     assert "已经发货完成" in repeated["error"]
-    assert repeated["claim_token"] is None
+    assert repeated["_orchestration_private"] == {}
     assert repeated["content"] is None
     assert repeated["contents"] == []
     assert repeated["delivery_steps"] == []
 
 
 def test_configured_result_metadata_is_preserved_without_config_secret_or_log_token(runtime):
-    live, _ = runtime
+    live, manager = runtime
     delivery_result = {
         "success": True,
         "configured": True,
@@ -647,7 +658,8 @@ def test_configured_result_metadata_is_preserved_without_config_secret_or_log_to
     assert meta["order_line_id"] == "line-meta"
     assert meta["idempotency_key"] == "canonical-key"
     assert meta["reservation_id"] == "reservation-meta"
-    assert meta["claim_token"] == "internal-claim-token"
+    assert "claim_token" not in meta
+    assert "_orchestration_private" not in meta
     assert meta["orchestration_status"] == "sending"
     assert meta["content_count"] == 3
     assert meta["orchestration_meta"] == {"content_count": 3, "state": None}
@@ -655,6 +667,18 @@ def test_configured_result_metadata_is_preserved_without_config_secret_or_log_to
     assert "contents" not in meta
     visible_reason = live._format_delivery_log_reason("发货准备完成", meta)
     assert "internal-claim-token" not in visible_reason
+    live._record_delivery_log(
+        order_id="order-meta",
+        item_id=ITEM_ID,
+        buyer_id="buyer-1",
+        reason="发货准备完成",
+        rule_meta=delivery_result,
+    )
+    with manager.lock:
+        reason = manager.conn.execute(
+            "SELECT reason FROM delivery_logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+    assert "internal-claim-token" not in reason
 
 
 def test_main_preparation_reads_bound_quantity_when_legacy_toggle_is_false(runtime, monkeypatch):
@@ -690,6 +714,12 @@ def test_main_preparation_reads_bound_quantity_when_legacy_toggle_is_false(runti
             "order_line_id": ITEM_ID,
             "configured": True,
             "card_id": card_id,
+            "binding_snapshot": {
+                "user_id": USER_ID,
+                "account_id": ACCOUNT_ID,
+                "item_id": ITEM_ID,
+                "card_id": card_id,
+            },
         }
     ]
 
@@ -697,6 +727,7 @@ def test_main_preparation_reads_bound_quantity_when_legacy_toggle_is_false(runti
         return {"quantity": "invalid"}
 
     monkeypatch.setattr(live, "fetch_order_detail_info", fetch_invalid_quantity)
+    monkeypatch.setattr(manager, "get_order_by_id", lambda order_id: None)
     invalid_quantity, invalid_plan = asyncio.run(
         live._build_order_auto_delivery_preparation_plan(
             ITEM_ID,
@@ -704,8 +735,30 @@ def test_main_preparation_reads_bound_quantity_when_legacy_toggle_is_false(runti
             "buyer-1",
         )
     )
-    assert invalid_quantity == 1
-    assert invalid_plan[0]["quantity"] == 1
+    assert invalid_quantity is None
+    assert invalid_plan == [
+        {
+            "unit_index": 1,
+            "quantity": None,
+            "order_line_id": ITEM_ID,
+            "configured": True,
+            "card_id": card_id,
+            "binding_snapshot": {
+                "user_id": USER_ID,
+                "account_id": ACCOUNT_ID,
+                "item_id": ITEM_ID,
+                "card_id": card_id,
+            },
+            "preparation_status": "blocked",
+            "retryable": True,
+            "error_code": "quantity_unavailable",
+            "error": "暂时无法确认订单购买数量，请稍后重试",
+        }
+    ]
+    with manager.lock:
+        assert manager.conn.execute(
+            "SELECT COUNT(*) FROM delivery_orchestration_states"
+        ).fetchone()[0] == 0
 
     with manager.lock:
         manager.conn.execute(
@@ -822,7 +875,7 @@ def test_manual_entry_prepares_bound_whole_order_once_and_legacy_remaining_units
             "order_line_id": kwargs.get("order_line_id"),
             "idempotency_key": "canonical-key",
             "reservation_id": "reservation-manual",
-            "claim_token": "claim-manual",
+            "_orchestration_private": {"claim_token": "claim-manual"},
             "orchestration_status": "sending",
             "content_count": kwargs.get("quantity"),
             "orchestration_meta": {"content_count": kwargs.get("quantity")},
@@ -844,8 +897,31 @@ def test_manual_entry_prepares_bound_whole_order_once_and_legacy_remaining_units
     assert bound_rule_meta["configured"] is True
     assert bound_rule_meta["quantity"] == 3
     assert bound_rule_meta["order_line_id"] == ITEM_ID
-    assert bound_rule_meta["claim_token"] == "claim-manual"
+    assert bound_rule_meta["_orchestration_private"]["claim_token"] == "claim-manual"
     assert bound_rule_meta["orchestration_status"] == "sending"
+
+    remaining["indexes"] = [2, 3]
+    auto_delivery_calls.clear()
+    prepared_batches.clear()
+    assert live._get_bound_item_delivery(ITEM_ID) is not None
+    assert live._build_auto_delivery_preparation_plan(
+        ITEM_ID,
+        3,
+        legacy_unit_indexes=[2, 3],
+    )[0]["configured"] is True
+
+    with pytest.raises(HTTPException) as partial_error:
+        asyncio.run(
+            reply_server.manual_deliver_order(
+                "order-manual",
+                current_user={"user_id": USER_ID, "username": "owner"},
+            )
+        )
+
+    assert partial_error.value.status_code == 409
+    assert "存在部分历史发货记录，请先核对" in str(partial_error.value.detail)
+    assert auto_delivery_calls == []
+    assert prepared_batches == []
 
     with manager.lock:
         manager.conn.execute(
@@ -927,3 +1003,408 @@ def test_recovered_entry_passes_bound_order_quantity_and_preserves_legacy_single
     )
 
     assert len(auto_delivery_calls) == 1
+
+
+@pytest.mark.parametrize("mutation", ["deleted", "rebound", "added"])
+def test_preparation_binding_snapshot_fails_closed_when_binding_changes(
+    runtime,
+    monkeypatch,
+    mutation,
+):
+    live, manager = runtime
+    if mutation == "added":
+        plan = live._build_auto_delivery_preparation_plan(ITEM_ID, 1)
+        create_binding(manager)
+    else:
+        original_card_id = create_binding(manager)
+        plan = live._build_auto_delivery_preparation_plan(ITEM_ID, 1)
+        with manager.lock:
+            manager.conn.execute(
+                "DELETE FROM item_delivery_bindings WHERE item_id = ?",
+                (ITEM_ID,),
+            )
+            manager.conn.commit()
+        if mutation == "rebound":
+            replacement_card_id = create_binding(manager)
+            assert replacement_card_id != original_card_id
+
+    monkeypatch.setattr(
+        manager,
+        "get_delivery_rules_by_keyword",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("binding snapshot mismatch must not reach legacy delivery")
+        ),
+    )
+
+    result = asyncio.run(
+        live._auto_delivery(
+            ITEM_ID,
+            "绑定商品",
+            f"order-binding-{mutation}",
+            "buyer-1",
+            include_meta=True,
+            quantity=plan[0]["quantity"],
+            order_line_id=plan[0]["order_line_id"],
+            binding_snapshot=plan[0]["binding_snapshot"],
+        )
+    )
+
+    assert result["success"] is False
+    assert result["disposition"] == "failed"
+    assert result["error_code"] == "binding_changed"
+    assert result["error"] == "商品交付绑定已变化，请稍后重试"
+    with manager.lock:
+        assert manager.conn.execute(
+            "SELECT COUNT(*) FROM delivery_orchestration_states"
+        ).fetchone()[0] == 0
+
+
+def test_bound_provider_prepare_does_not_block_event_loop(runtime, monkeypatch):
+    live, manager = runtime
+    card_id = create_binding(manager)
+    DeliveryConfigService(manager).save(
+        USER_ID,
+        card_id,
+        ACCOUNT_ID,
+        "provider_api",
+        {"endpoint": "https://provider.test/slow"},
+    )
+
+    class SlowTransport(RecordingTransport):
+        def request(self, method, url, headers, json_body, timeout):
+            time.sleep(0.2)
+            return super().request(method, url, headers, json_body, timeout)
+
+    monkeypatch.setattr(
+        delivery_adapter_service,
+        "UrllibJsonTransport",
+        SlowTransport,
+    )
+
+    async def exercise():
+        started = asyncio.get_running_loop().time()
+        delivery_task = asyncio.create_task(
+            live._auto_delivery(
+                ITEM_ID,
+                "绑定商品",
+                "order-slow-provider",
+                "buyer-1",
+                include_meta=True,
+                quantity=1,
+                order_line_id=ITEM_ID,
+            )
+        )
+        await asyncio.sleep(0.02)
+        ticker_latency = asyncio.get_running_loop().time() - started
+        result = await delivery_task
+        return ticker_latency, result
+
+    ticker_latency, result = asyncio.run(exercise())
+
+    assert ticker_latency < 0.1
+    assert result["success"] is True
+
+
+def test_bound_provider_exception_is_sanitized_in_result_state_and_logs(
+    runtime,
+    monkeypatch,
+):
+    live, manager = runtime
+    card_id = create_binding(manager)
+    secrets = [
+        "https://provider.test/private?token=url-secret",
+        "header-secret-token",
+        "response-secret-body",
+        "secret-card-content",
+    ]
+    DeliveryConfigService(manager).save(
+        USER_ID,
+        card_id,
+        ACCOUNT_ID,
+        "provider_api",
+        {
+            "endpoint": secrets[0],
+            "token": secrets[1],
+            "request_body": {"card": secrets[3]},
+        },
+    )
+
+    class SecretFailureTransport:
+        def request(self, method, url, headers, json_body, timeout):
+            raise RuntimeError(" ".join(secrets))
+
+    logged = []
+    monkeypatch.setattr(delivery_adapter_service, "UrllibJsonTransport", SecretFailureTransport)
+    monkeypatch.setattr(xianyu_module.logger, "error", lambda message: logged.append(str(message)))
+
+    result = asyncio.run(
+        live._auto_delivery(
+            ITEM_ID,
+            "绑定商品",
+            "order-provider-secret",
+            "buyer-1",
+            include_meta=True,
+            quantity=1,
+            order_line_id=ITEM_ID,
+        )
+    )
+
+    with manager.lock:
+        stored_error = manager.conn.execute(
+            "SELECT last_error FROM delivery_orchestration_states WHERE order_id = ?",
+            ("order-provider-secret",),
+        ).fetchone()[0]
+    public_text = json.dumps(result, ensure_ascii=False)
+    assert result["error_code"] == "provider_transport_error"
+    assert result["error"] == "绑定商品发货准备失败，请稍后重试"
+    for secret in secrets:
+        assert secret not in public_text
+        assert secret not in stored_error
+        assert all(secret not in entry for entry in logged)
+
+
+def _configure_manual_bound_route(monkeypatch, live, manager, order_id):
+    import cookie_manager
+    import reply_server
+
+    order = {
+        "order_id": order_id,
+        "cookie_id": ACCOUNT_ID,
+        "item_id": ITEM_ID,
+        "buyer_id": "buyer-1",
+        "buyer_nick": "买家",
+        "quantity": "1",
+        "sid": "",
+    }
+    monkeypatch.setattr(manager, "get_order_by_id", lambda value: dict(order))
+    monkeypatch.setattr(
+        manager,
+        "get_cookie_details",
+        lambda cookie_id: {"id": cookie_id, "user_id": USER_ID},
+    )
+    monkeypatch.setattr(
+        manager,
+        "get_item_info",
+        lambda cookie_id, item_id: {"item_title": "绑定商品"},
+    )
+    monkeypatch.setattr(reply_server, "db_manager", manager)
+    monkeypatch.setattr(
+        reply_server.blacklist_service,
+        "is_buyer_blacklisted",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(reply_server, "publish_order_update_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(reply_server, "log_with_user", lambda *args, **kwargs: None)
+
+    class RunningManager:
+        @staticmethod
+        def get_xianyu_instance(cookie_id):
+            return live
+
+    monkeypatch.setattr(cookie_manager, "manager", RunningManager())
+    live.ws = None
+    monkeypatch.setattr(
+        live,
+        "_summarize_delivery_progress",
+        lambda value, expected_quantity: {
+            "pending_finalize_unit_indexes": [],
+            "remaining_unit_indexes": [1],
+            "aggregate_status": "pending",
+        },
+    )
+    monkeypatch.setattr(
+        live,
+        "_sync_order_delivery_progress",
+        lambda **kwargs: {
+            "aggregate_status": "shipped",
+            "finalized_count": 1,
+            "remaining_count": 0,
+            "pending_finalize_count": 0,
+        },
+    )
+    return reply_server
+
+
+def test_manual_bound_route_uses_real_orchestration_and_keeps_claim_private(
+    runtime,
+    monkeypatch,
+):
+    live, manager = runtime
+    card_id = create_binding(manager)
+    DeliveryConfigService(manager).save(
+        USER_ID,
+        card_id,
+        ACCOUNT_ID,
+        "fixed_link",
+        {"url": "https://example.test/manual-real"},
+    )
+    reply_server = _configure_manual_bound_route(
+        monkeypatch,
+        live,
+        manager,
+        "order-manual-real",
+    )
+    sent_steps = []
+
+    async def record_send(buyer_id, item_id, steps):
+        sent_steps.append(list(steps))
+
+    async def finalize_without_network(**kwargs):
+        return {"success": True}
+
+    monkeypatch.setattr(live, "send_delivery_steps_once", record_send)
+    monkeypatch.setattr(live, "_finalize_delivery_after_send", finalize_without_network)
+    monkeypatch.setattr(live, "_mark_data_reservation_sent_if_needed", lambda meta: True)
+
+    response = asyncio.run(
+        reply_server.manual_deliver_order(
+            "order-manual-real",
+            current_user={"user_id": USER_ID, "username": "owner"},
+        )
+    )
+
+    assert sent_steps == [[{"type": "text", "content": "https://example.test/manual-real"}]]
+    with manager.lock:
+        state_count = manager.conn.execute(
+            "SELECT COUNT(*) FROM delivery_orchestration_states"
+        ).fetchone()[0]
+        claim_token = manager.conn.execute(
+            "SELECT claim_token FROM delivery_orchestration_states"
+        ).fetchone()[0]
+        log_reasons = [
+            row[0]
+            for row in manager.conn.execute(
+                "SELECT reason FROM delivery_logs WHERE order_id = ?",
+                ("order-manual-real",),
+            ).fetchall()
+        ]
+    finalization = manager.get_delivery_finalization_state("order-manual-real", 1)
+
+    assert state_count == 1
+    assert claim_token
+    assert finalization["delivery_meta"]["_orchestration_private"]["claim_token"] == claim_token
+    assert claim_token not in json.dumps(response, ensure_ascii=False)
+    assert all(claim_token not in reason for reason in log_reasons)
+
+
+@pytest.mark.parametrize(
+    ("state_status", "expected_disposition"),
+    [("sending", "defer_in_progress"), ("sent", "noop_sent")],
+)
+def test_manual_bound_sent_or_in_progress_is_skipped_without_send_or_failure(
+    runtime,
+    monkeypatch,
+    state_status,
+    expected_disposition,
+):
+    live, manager = runtime
+    card_id = create_binding(manager)
+    DeliveryConfigService(manager).save(
+        USER_ID,
+        card_id,
+        ACCOUNT_ID,
+        "fixed_link",
+        {"url": "https://example.test/manual-repeat"},
+    )
+    reply_server = _configure_manual_bound_route(
+        monkeypatch,
+        live,
+        manager,
+        f"order-manual-{state_status}",
+    )
+    first = asyncio.run(
+        live._auto_delivery(
+            ITEM_ID,
+            "绑定商品",
+            f"order-manual-{state_status}",
+            "buyer-1",
+            include_meta=True,
+            quantity=1,
+            order_line_id=ITEM_ID,
+        )
+    )
+    assert first["disposition"] == "send"
+    if state_status == "sent":
+        with manager.lock:
+            manager.conn.execute(
+                """
+                UPDATE delivery_orchestration_states
+                SET status = 'sent', claim_token = NULL, claimed_at = NULL
+                WHERE order_id = ?
+                """,
+                (f"order-manual-{state_status}",),
+            )
+            manager.conn.commit()
+
+    async def fail_if_sent(*args, **kwargs):
+        raise AssertionError("sent/in_progress disposition must not send")
+
+    monkeypatch.setattr(live, "send_delivery_steps_once", fail_if_sent)
+
+    response = asyncio.run(
+        reply_server.manual_deliver_order(
+            f"order-manual-{state_status}",
+            current_user={"user_id": USER_ID, "username": "owner"},
+        )
+    )
+
+    with manager.lock:
+        logs = manager.conn.execute(
+            "SELECT status, reason FROM delivery_logs WHERE order_id = ?",
+            (f"order-manual-{state_status}",),
+        ).fetchall()
+    assert response["success"] is True
+    assert logs
+    assert {row[0] for row in logs} == {"skipped"}
+    assert expected_disposition in logs[-1][1]
+
+
+@pytest.mark.parametrize(
+    ("disposition", "expected_result"),
+    [("defer_in_progress", False), ("noop_sent", True)],
+)
+def test_compensation_disposition_is_skipped_without_failure_log(
+    runtime,
+    monkeypatch,
+    disposition,
+    expected_result,
+):
+    live, manager = runtime
+    create_binding(manager)
+    live._order_locks = defaultdict(asyncio.Lock)
+    live._lock_usage_times = {}
+    monkeypatch.setattr(live, "can_auto_delivery", lambda order_id: True)
+    monkeypatch.setattr(live, "is_lock_held", lambda lock_key: False)
+    monkeypatch.setattr(live, "_get_pending_delivery_finalization_meta", lambda *args: None)
+    logs = []
+    monkeypatch.setattr(live, "_record_delivery_log", lambda **kwargs: logs.append(kwargs))
+
+    async def disposition_result(*args, **kwargs):
+        return {
+            "success": False,
+            "configured": True,
+            "content": None,
+            "delivery_steps": [],
+            "disposition": disposition,
+            "error": "重复准备已阻止",
+        }
+
+    async def fail_if_sent(*args, **kwargs):
+        raise AssertionError("sent/in_progress compensation must not send")
+
+    monkeypatch.setattr(live, "_auto_delivery", disposition_result)
+    monkeypatch.setattr(live, "send_delivery_steps_once", fail_if_sent)
+
+    result = asyncio.run(
+        live._send_recovered_delivery_without_sid(
+            {"quantity": "1"},
+            order_id=f"order-compensation-{disposition}",
+            item_id=ITEM_ID,
+            buyer_id="buyer-1",
+            source="test-compensation",
+        )
+    )
+
+    assert result is expected_result
+    assert logs
+    assert {entry["status"] for entry in logs} == {"skipped"}

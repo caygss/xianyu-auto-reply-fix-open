@@ -15578,10 +15578,21 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
         item_info = db_manager.get_item_info(cookie_id, item_id)
         item_title = item_info.get('item_title', '') if item_info else ''
 
-        try:
-            expected_quantity = max(1, int(order.get('quantity') or 1))
-        except (TypeError, ValueError):
-            expected_quantity = 1
+        bound_delivery = xianyu_instance._get_bound_item_delivery(item_id)
+        if bound_delivery:
+            expected_quantity = xianyu_instance._normalize_trusted_delivery_quantity(
+                order.get('quantity')
+            )
+            if expected_quantity is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="暂时无法确认订单购买数量，请稍后重试",
+                )
+        else:
+            try:
+                expected_quantity = max(1, int(order.get('quantity') or 1))
+            except (TypeError, ValueError):
+                expected_quantity = 1
 
         progress_summary_before = xianyu_instance._summarize_delivery_progress(order_id, expected_quantity)
         pending_finalize_units = list(progress_summary_before.get('pending_finalize_unit_indexes') or [])
@@ -15674,6 +15685,19 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
             expected_quantity,
             legacy_unit_indexes=remaining_unit_indexes,
         )
+        bound_preparation = preparation_plan[0] if preparation_plan else None
+        if bound_preparation and bound_preparation.get('configured'):
+            full_order_unit_indexes = list(range(1, expected_quantity + 1))
+            if remaining_unit_indexes != full_order_unit_indexes:
+                raise HTTPException(
+                    status_code=409,
+                    detail="存在部分历史发货记录，请先核对",
+                )
+            if bound_preparation.get('preparation_status') == 'blocked':
+                raise HTTPException(
+                    status_code=409,
+                    detail=bound_preparation.get('error') or "发货准备暂时不可用，请稍后重试",
+                )
         for preparation in preparation_plan:
             unit_index = preparation['unit_index']
             delivery_result = await xianyu_instance._auto_delivery(
@@ -15685,13 +15709,17 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 delivery_unit_index=unit_index,
                 quantity=preparation['quantity'],
                 order_line_id=preparation['order_line_id'],
+                binding_snapshot=preparation['binding_snapshot'],
             )
 
             if isinstance(delivery_result, dict):
                 delivery_content = delivery_result.get('content')
                 delivery_steps = delivery_result.get('delivery_steps') or []
                 delivery_success = bool(delivery_result.get('success') and delivery_content)
-                delivery_meta = xianyu_instance._delivery_result_to_rule_meta(delivery_result)
+                delivery_meta = xianyu_instance._delivery_result_to_finalization_meta(
+                    delivery_result
+                )
+                delivery_disposition = delivery_result.get('disposition')
                 rule_id = delivery_result.get('rule_id')
                 rule_keyword = delivery_result.get('rule_keyword')
                 card_type = delivery_result.get('card_type')
@@ -15725,8 +15753,37 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 data_reservation_id = None
                 data_reservation_status = None
                 failure_reason = None
+                delivery_disposition = None
 
             delivery_meta['delivery_unit_index'] = unit_index
+
+            if delivery_disposition in {'noop_sent', 'defer_in_progress'}:
+                db_manager.create_delivery_log(
+                    user_id=user_id,
+                    cookie_id=cookie_id,
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=buyer_id,
+                    buyer_nick=order.get('buyer_nick'),
+                    rule_id=rule_id,
+                    rule_keyword=rule_keyword,
+                    card_type=card_type,
+                    match_mode=match_mode,
+                    channel='manual',
+                    status='skipped',
+                    reason=format_delivery_reason(
+                        f"{delivery_disposition}: {failure_reason or '无需重复准备'}",
+                        order_spec_mode,
+                        rule_spec_mode,
+                        item_config_mode,
+                    ),
+                )
+                unit_results.append({
+                    'unit_index': unit_index,
+                    'status': 'skipped',
+                    'disposition': delivery_disposition,
+                })
+                continue
 
             if delivery_success:
                 if not delivery_steps:
@@ -16012,6 +16069,8 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
 
         return {"success": True, "delivered": delivered, "message": '，'.join(message_parts)}
 
+    except HTTPException:
+        raise
     except Exception as e:
         log_with_user('error', f"手动发货异常: 订单 {order_id} - {str(e)}", current_user)
         import traceback

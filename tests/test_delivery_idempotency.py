@@ -43,6 +43,83 @@ def test_order_line_fallback_matches_item_id_for_idempotency(services):
     ).fetchone()[0] == 1
 
 
+def _request_for_card(request, card_id):
+    return request.__class__(**{**request.__dict__, "card_id": card_id})
+
+
+def test_rebound_card_cannot_create_second_state_for_same_order_line(services):
+    service, inventory, _, manager = services
+    inventory.import_items(7, 1, "account-a", ["card-7"])
+    inventory.import_items(8, 1, "account-a", ["card-8"])
+    first_request = make_request(1, order_line_id="line-rebound", mode="imported_card")
+    rebound_request = _request_for_card(first_request, 8)
+
+    first = service.prepare(first_request)
+
+    with pytest.raises(DeliveryOrchestrationError) as error:
+        service.prepare(rebound_request)
+
+    assert first["status"] == "sending"
+    assert error.value.code == "idempotency_conflict"
+    assert manager.conn.execute(
+        "SELECT COUNT(*) FROM delivery_orchestration_states"
+    ).fetchone()[0] == 1
+    assert manager.conn.execute(
+        "SELECT COUNT(*) FROM card_inventory_reservations"
+    ).fetchone()[0] == 1
+    assert inventory.get_inventory_summary(8, 1, "account-a")["available"] == 1
+
+
+def test_concurrent_rebound_cards_have_one_state_claim_and_reservation(monkeypatch, services):
+    service, inventory, _, manager = services
+    inventory.import_items(7, 1, "account-a", ["card-7"])
+    inventory.import_items(8, 1, "account-a", ["card-8"])
+    first_request = make_request(1, order_line_id="line-concurrent-rebound", mode="imported_card")
+    rebound_request = _request_for_card(first_request, 8)
+
+    original_get_state = service._get_state
+    first_reads = set()
+    coordination_lock = threading.Lock()
+    read_barrier = threading.Barrier(2)
+
+    def coordinated_get_state(request):
+        state = original_get_state(request)
+        thread_id = threading.get_ident()
+        with coordination_lock:
+            first_read = thread_id not in first_reads
+            if first_read:
+                first_reads.add(thread_id)
+        if first_read:
+            read_barrier.wait(timeout=5)
+        return state
+
+    monkeypatch.setattr(service, "_get_state", coordinated_get_state)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(service.prepare, first_request),
+            executor.submit(service.prepare, rebound_request),
+        ]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result(timeout=5))
+            except DeliveryOrchestrationError as error:
+                outcomes.append(error)
+
+    results = [outcome for outcome in outcomes if isinstance(outcome, dict)]
+    errors = [outcome for outcome in outcomes if isinstance(outcome, DeliveryOrchestrationError)]
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert errors[0].code == "idempotency_conflict"
+    assert manager.conn.execute(
+        "SELECT COUNT(*) FROM delivery_orchestration_states"
+    ).fetchone()[0] == 1
+    assert manager.conn.execute(
+        "SELECT COUNT(*) FROM card_inventory_reservations"
+    ).fetchone()[0] == 1
+
+
 def test_same_order_different_line_has_independent_idempotency_scope(services):
     service, _, dispatcher, manager = services
 
@@ -228,10 +305,14 @@ def test_external_prepare_can_mark_sent_with_current_claim(services):
     prepared = service.prepare(request)
 
     assert prepared["status"] == "sending"
-    assert prepared["claim_token"]
+    assert prepared["_orchestration_private"]["claim_token"]
+    assert "claim_token" not in prepared
     assert "claim_token" not in prepared["meta"]
 
-    sent = service.mark_sent(request, prepared["claim_token"])
+    sent = service.mark_sent(
+        request,
+        prepared["_orchestration_private"]["claim_token"],
+    )
 
     assert sent["status"] == "sent"
     assert "claim_token" not in sent
@@ -245,7 +326,7 @@ def test_external_prepare_can_mark_failed_with_current_claim(services):
 
     failed = service.mark_failed(
         request,
-        prepared["claim_token"],
+        prepared["_orchestration_private"]["claim_token"],
         DeliveryOrchestrationError("send_failed", "交付消息发送失败", "sender"),
     )
 
@@ -270,7 +351,10 @@ def test_wrong_claim_token_cannot_mark_terminal_state(services):
         "SELECT status FROM delivery_orchestration_states WHERE order_line_id = ?",
         ("line-token",),
     ).fetchone()[0] == "sending"
-    assert service.mark_sent(request, prepared["claim_token"])["status"] == "sent"
+    assert service.mark_sent(
+        request,
+        prepared["_orchestration_private"]["claim_token"],
+    )["status"] == "sent"
 
 
 def test_retry_reclaims_stale_sending_and_reuses_reservation(services):
@@ -313,7 +397,7 @@ def test_expired_claim_token_cannot_overwrite_reclaimed_sender(services):
     service, _, _, manager = services
     request = make_request(1, order_line_id="line-reclaimed")
     prepared = service.prepare(request)
-    stale_token = prepared["claim_token"]
+    stale_token = prepared["_orchestration_private"]["claim_token"]
     manager.conn.execute(
         """
         UPDATE delivery_orchestration_states

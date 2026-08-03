@@ -4927,6 +4927,7 @@ class XianyuLive:
                 delivery_unit_index=preparation['unit_index'],
                 quantity=preparation['quantity'],
                 order_line_id=preparation['order_line_id'],
+                binding_snapshot=preparation['binding_snapshot'],
             )
             if isinstance(delivery_result, dict):
                 delivery_content = delivery_result.get('content')
@@ -4940,6 +4941,18 @@ class XianyuLive:
                 delivery_meta = {}
 
             if not delivery_content:
+                disposition = delivery_meta.get('disposition') if isinstance(delivery_meta, dict) else None
+                if disposition in {'noop_sent', 'defer_in_progress'}:
+                    self._record_delivery_log(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        status='skipped',
+                        reason=f'{source} {disposition}: {delivery_error or "无需重复准备"}',
+                        channel='auto',
+                        rule_meta=delivery_meta,
+                    )
+                    return disposition == 'noop_sent'
                 self._record_delivery_log(
                     order_id=order_id,
                     item_id=item_id,
@@ -5810,27 +5823,15 @@ class XianyuLive:
                     delivery_unit_index=preparation['unit_index'],
                     quantity=preparation['quantity'],
                     order_line_id=preparation['order_line_id'],
+                    binding_snapshot=preparation['binding_snapshot'],
                 )
                 if isinstance(delivery_result, dict):
                     delivery_content = delivery_result.get('content')
                     delivery_error = delivery_result.get('error')
                     delivery_steps = delivery_result.get('delivery_steps') or []
-                    delivery_rule_meta = {
-                        'rule_id': delivery_result.get('rule_id'),
-                        'rule_keyword': delivery_result.get('rule_keyword'),
-                        'card_type': delivery_result.get('card_type'),
-                        'match_mode': delivery_result.get('match_mode'),
-                        'order_spec_mode': delivery_result.get('order_spec_mode'),
-                        'rule_spec_mode': delivery_result.get('rule_spec_mode'),
-                        'item_config_mode': delivery_result.get('item_config_mode'),
-                        'card_id': delivery_result.get('card_id'),
-                        'card_description': delivery_result.get('card_description'),
-                        'data_card_pending_consume': delivery_result.get('data_card_pending_consume'),
-                        'data_line': delivery_result.get('data_line'),
-                        'data_reservation_id': delivery_result.get('data_reservation_id'),
-                        'data_reservation_status': delivery_result.get('data_reservation_status'),
-                        'delivery_unit_index': delivery_result.get('delivery_unit_index')
-                    }
+                    delivery_rule_meta = self._delivery_result_to_finalization_meta(
+                        delivery_result
+                    )
                 else:
                     delivery_content = delivery_result
                     delivery_error = None
@@ -5970,6 +5971,26 @@ class XianyuLive:
                     
                     logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ✅ 简化消息自动发货完成')
                 else:
+                    disposition = (
+                        delivery_result.get('disposition')
+                        if isinstance(delivery_result, dict)
+                        else None
+                    )
+                    if disposition in {'noop_sent', 'defer_in_progress'}:
+                        self._record_delivery_log(
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=user_id,
+                            status='skipped',
+                            reason=f'{disposition}: {delivery_error or "无需重复准备"}',
+                            channel='auto',
+                            rule_meta=delivery_rule_meta,
+                        )
+                        logger.info(
+                            f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] '
+                            f'自动发货跳过: {disposition}'
+                        )
+                        return
                     logger.warning(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ❌ 未找到匹配的发货规则或获取发货内容失败')
                     self._record_delivery_log(
                         order_id=order_id,
@@ -6335,6 +6356,7 @@ class XianyuLive:
                     successful_send_count = 0
                     last_delivery_error = None
                     prepared_units = []
+                    non_failure_dispositions = []
 
                     for preparation in preparation_plan:
                         unit_index = preparation['unit_index']
@@ -6415,19 +6437,43 @@ class XianyuLive:
                                 delivery_unit_index=unit_index,
                                 quantity=preparation['quantity'],
                                 order_line_id=preparation['order_line_id'],
+                                binding_snapshot=preparation['binding_snapshot'],
                             )
 
                             if isinstance(delivery_result, dict):
                                 delivery_content = delivery_result.get('content')
                                 delivery_error = delivery_result.get('error')
                                 delivery_steps = delivery_result.get('delivery_steps') or []
-                                rule_meta = self._delivery_result_to_rule_meta(delivery_result)
+                                rule_meta = self._delivery_result_to_finalization_meta(
+                                    delivery_result
+                                )
                             else:
                                 delivery_content = delivery_result
                                 delivery_error = None
                                 delivery_steps = []
 
                             if not delivery_content:
+                                disposition = (
+                                    delivery_result.get('disposition')
+                                    if isinstance(delivery_result, dict)
+                                    else None
+                                )
+                                if disposition in {'noop_sent', 'defer_in_progress'}:
+                                    non_failure_dispositions.append(disposition)
+                                    self._record_delivery_log(
+                                        order_id=order_id,
+                                        item_id=item_id,
+                                        buyer_id=send_user_id,
+                                        buyer_nick=send_user_name,
+                                        status='skipped',
+                                        reason=f'{disposition}: {delivery_error or "无需重复准备"}',
+                                        channel='auto',
+                                        rule_meta=rule_meta,
+                                    )
+                                    logger.info(
+                                        f'[{msg_time}] 【自动发货】跳过重复准备: {disposition}'
+                                    )
+                                    continue
                                 failure_reason = delivery_error or f"第 {unit_index}/{quantity_to_send} 个卡券内容获取失败"
                                 last_delivery_error = failure_reason
                                 self._record_delivery_log(
@@ -6697,6 +6743,11 @@ class XianyuLive:
                             await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, notify_message, chat_id, order_id=order_id)
                         else:
                             await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id, order_id=order_id)
+                    elif non_failure_dispositions:
+                        logger.info(
+                            f'[{msg_time}] 【自动发货】订单无需重复发送: '
+                            f'{",".join(non_failure_dispositions)}'
+                        )
                     else:
                         logger.warning(f'[{msg_time}] 【自动发货】未找到匹配的发货规则或获取发货内容失败')
                         self._record_delivery_log(
@@ -11940,6 +11991,45 @@ class XianyuLive:
         except (TypeError, ValueError):
             return 1
 
+    @staticmethod
+    def _normalize_trusted_delivery_quantity(quantity):
+        """Return a bounded positive quantity, or None when the source is untrusted."""
+        from delivery_orchestration_service import (
+            DeliveryOrchestrationError,
+            normalize_quantity,
+        )
+
+        if quantity is None or (isinstance(quantity, str) and not quantity.strip()):
+            return None
+        try:
+            return normalize_quantity(quantity)
+        except DeliveryOrchestrationError:
+            return None
+
+    def _item_delivery_binding_snapshot(self, item_id: str, binding: dict):
+        if not binding:
+            return None
+        return {
+            "user_id": int(binding["user_id"]),
+            "account_id": str(binding["account_id"]),
+            "item_id": str(item_id or binding["item_id"]).strip(),
+            "card_id": int(binding["card_id"]),
+        }
+
+    def _build_bound_quantity_blocked_plan(self, item_id: str, binding: dict):
+        return [{
+            "unit_index": 1,
+            "quantity": None,
+            "order_line_id": str(item_id or "").strip() or "default",
+            "configured": True,
+            "card_id": binding.get("card_id"),
+            "binding_snapshot": self._item_delivery_binding_snapshot(item_id, binding),
+            "preparation_status": "blocked",
+            "retryable": True,
+            "error_code": "quantity_unavailable",
+            "error": "暂时无法确认订单购买数量，请稍后重试",
+        }]
+
     def _build_auto_delivery_preparation_plan(
         self,
         item_id: str,
@@ -11961,6 +12051,7 @@ class XianyuLive:
                 "order_line_id": str(item_id or "").strip() or "default",
                 "configured": True,
                 "card_id": binding.get("card_id"),
+                "binding_snapshot": self._item_delivery_binding_snapshot(item_id, binding),
             }]
 
         if legacy_unit_indexes is None:
@@ -11981,6 +12072,7 @@ class XianyuLive:
                 "order_line_id": None,
                 "configured": False,
                 "card_id": None,
+                "binding_snapshot": None,
             }
             for unit_index in normalized_unit_indexes
         ]
@@ -12002,20 +12094,37 @@ class XianyuLive:
         quantity = 1
         should_read_order_quantity = bool(order_id and (binding or legacy_multi_enabled))
         if should_read_order_quantity:
+            order_detail = None
             try:
                 order_detail = await self.fetch_order_detail_info(
                     order_id,
                     item_id,
                     buyer_id,
                 )
-                quantity = self._normalize_auto_delivery_quantity(
-                    order_detail.get('quantity') if isinstance(order_detail, dict) else None
+            except Exception:
+                logger.warning(
+                    f"获取订单数量失败: order_id={order_id}, item_id={item_id}"
                 )
-            except Exception as quantity_error:
-                logger.error(
-                    f"获取订单数量失败: order_id={order_id}, item_id={item_id}, "
-                    f"error={self._safe_str(quantity_error)}，安全回退为1"
-                )
+
+            raw_quantity = (
+                order_detail.get('quantity')
+                if isinstance(order_detail, dict)
+                else None
+            )
+            if binding:
+                quantity = self._normalize_trusted_delivery_quantity(raw_quantity)
+                if quantity is None:
+                    cached_order = db_manager.get_order_by_id(order_id) or {}
+                    quantity = self._normalize_trusted_delivery_quantity(
+                        cached_order.get('quantity')
+                    )
+                if quantity is None:
+                    return None, self._build_bound_quantity_blocked_plan(
+                        item_id,
+                        binding,
+                    )
+            else:
+                quantity = self._normalize_auto_delivery_quantity(raw_quantity)
 
         preparation_plan = self._build_auto_delivery_preparation_plan(
             item_id,
@@ -12032,11 +12141,20 @@ class XianyuLive:
         legacy_unit_indexes,
     ):
         """Build a plan when an entry already owns an order quantity."""
-        quantity = self._normalize_auto_delivery_quantity((order or {}).get('quantity'))
+        binding = self._get_bound_item_delivery(item_id)
+        if binding:
+            quantity = self._normalize_trusted_delivery_quantity(
+                (order or {}).get('quantity')
+            )
+            if quantity is None:
+                return None, self._build_bound_quantity_blocked_plan(item_id, binding)
+        else:
+            quantity = self._normalize_auto_delivery_quantity((order or {}).get('quantity'))
         return quantity, self._build_auto_delivery_preparation_plan(
             item_id,
             quantity,
             legacy_unit_indexes=legacy_unit_indexes,
+            item_delivery_binding=binding,
         )
 
     @staticmethod
@@ -12066,11 +12184,22 @@ class XianyuLive:
             'order_line_id': result.get('order_line_id'),
             'idempotency_key': result.get('idempotency_key'),
             'reservation_id': result.get('reservation_id'),
-            'claim_token': result.get('claim_token'),
             'orchestration_status': result.get('orchestration_status'),
             'content_count': result.get('content_count'),
             'orchestration_meta': result.get('orchestration_meta') or {},
         }
+
+    @classmethod
+    def _delivery_result_to_finalization_meta(cls, delivery_result: dict):
+        """Preserve private orchestration recovery data only for finalization state."""
+        result = delivery_result or {}
+        meta = cls._delivery_result_to_rule_meta(result)
+        private = result.get('_orchestration_private')
+        if isinstance(private, dict) and private.get('claim_token'):
+            meta['_orchestration_private'] = {
+                'claim_token': str(private['claim_token']),
+            }
+        return meta
 
     def _prepare_bound_item_delivery(
         self,
@@ -12139,20 +12268,38 @@ class XianyuLive:
             if str(value).strip()
         ]
         claimed = bool(prepared.get("claimed"))
+        private = prepared.get("_orchestration_private") or {}
         success = status == "sending" and claimed and bool(contents)
+
+        disposition = {
+            "sending": "send",
+            "sent": "noop_sent",
+            "in_progress": "defer_in_progress",
+            "paused": "blocked_paused",
+            "failed": "failed",
+        }.get(status, "failed")
 
         if success:
             error = None
-        elif prepared.get("error"):
-            error = str(prepared["error"])
         elif status == "in_progress":
             error = "该订单发货正在处理中，已阻止重复准备"
         elif status == "sent":
             error = "该订单已经发货完成，已阻止重复发送"
         elif status == "paused":
-            error = "该订单发货已暂停，请检查库存或配置"
+            error = "该订单发货已暂停，请检查库存或配置后重试"
         else:
-            error = "该订单发货准备失败，已阻止自动发送"
+            error_messages = {
+                "binding_changed": "商品交付绑定已变化，请稍后重试",
+                "quantity_unavailable": "暂时无法确认订单购买数量，请稍后重试",
+                "invalid_quantity": "订单购买数量无效，请核对后重试",
+                "config_not_found": "绑定商品交付配置不存在，请检查后重试",
+                "invalid_config": "绑定商品交付配置无效，请检查后重试",
+                "idempotency_conflict": "订单发货状态冲突，请核对后重试",
+            }
+            error = error_messages.get(
+                prepared.get("error_code"),
+                "绑定商品发货准备失败，请稍后重试",
+            )
 
         content = None
         delivery_steps = []
@@ -12169,12 +12316,14 @@ class XianyuLive:
         orchestration_meta = prepared.get("meta") or {}
         return {
             "success": success,
-            "configured": True,
+            "configured": bool(prepared.get("configured", True)),
+            "disposition": disposition,
             "content": content,
             "contents": contents if success else [],
             "delivery_steps": delivery_steps,
             "error": error,
             "error_code": prepared.get("error_code"),
+            "retryable": bool(prepared.get("retryable")),
             "status": status,
             "orchestration_status": status,
             "card_id": prepared.get("card_id"),
@@ -12185,7 +12334,6 @@ class XianyuLive:
             "order_line_id": prepared.get("order_line_id"),
             "idempotency_key": prepared.get("idempotency_key"),
             "reservation_id": prepared.get("reservation_id"),
-            "claim_token": prepared.get("claim_token") if success else None,
             "claimed": claimed if success else False,
             "content_count": orchestration_meta.get("content_count", len(contents)),
             "orchestration_meta": {
@@ -12204,13 +12352,19 @@ class XianyuLive:
             "data_reservation_id": None,
             "data_reservation_status": None,
             "delivery_unit_index": 1,
+            "_orchestration_private": (
+                {"claim_token": private.get("claim_token")}
+                if success and private.get("claim_token")
+                else {}
+            ),
         }
 
     async def _auto_delivery(self, item_id: str, item_title: str = None, order_id: str = None, send_user_id: str = None,
                              chat_id: str = None, send_user_name: str = None, include_meta: bool = False,
                              data_preview_index: int = 0, delivery_unit_index: int = 1,
                              delivery_reservation_id: str = None, quantity=1,
-                             order_line_id: str = None):
+                             order_line_id: str = None,
+                             binding_snapshot=_ITEM_DELIVERY_BINDING_UNSET):
         """自动发货功能 - 匹配规则并准备发货内容，不直接提交副作用。"""
         try:
             matched_rule_context = None
@@ -12265,29 +12419,80 @@ class XianyuLive:
             logger.info(f"开始自动发货检查: 商品ID={item_id}")
 
             bound_delivery = self._get_bound_item_delivery(item_id)
+            if binding_snapshot is not _ITEM_DELIVERY_BINDING_UNSET:
+                current_snapshot = self._item_delivery_binding_snapshot(
+                    item_id,
+                    bound_delivery,
+                )
+                if current_snapshot != binding_snapshot:
+                    logger.warning(
+                        f"商品交付绑定在计划后发生变化: item_id={item_id}, order_id={order_id}"
+                    )
+                    return self._bound_delivery_result(
+                        {
+                            "status": "failed",
+                            "configured": bool(binding_snapshot),
+                            "card_id": (
+                                binding_snapshot.get("card_id")
+                                if isinstance(binding_snapshot, dict)
+                                else None
+                            ),
+                            "account_id": self.cookie_id,
+                            "order_id": order_id,
+                            "order_line_id": str(order_line_id or item_id or "default"),
+                            "quantity": quantity,
+                            "mode": None,
+                            "idempotency_key": None,
+                            "reservation_id": None,
+                            "error_code": "binding_changed",
+                            "error": "商品交付绑定已变化，请稍后重试",
+                            "meta": {},
+                        },
+                        include_meta=include_meta,
+                    )
             if bound_delivery:
                 logger.info(
                     f"商品命中内部交付绑定，按整单编排准备: item_id={item_id}, "
                     f"card_id={bound_delivery.get('card_id')}, order_id={order_id}"
                 )
                 try:
-                    prepared = self._prepare_bound_item_delivery(
-                        binding=bound_delivery,
-                        order_id=order_id,
-                        buyer_id=send_user_id,
-                        item_id=item_id,
-                        quantity=quantity,
-                        order_line_id=order_line_id,
-                    )
+                    trusted_quantity = self._normalize_trusted_delivery_quantity(quantity)
+                    if trusted_quantity is None:
+                        prepared = {
+                            "status": "failed",
+                            "configured": True,
+                            "card_id": bound_delivery.get("card_id"),
+                            "account_id": self.cookie_id,
+                            "order_id": order_id,
+                            "order_line_id": str(order_line_id or item_id or "default"),
+                            "quantity": None,
+                            "mode": None,
+                            "idempotency_key": None,
+                            "reservation_id": None,
+                            "error_code": "quantity_unavailable",
+                            "error": "暂时无法确认订单购买数量，请稍后重试",
+                            "retryable": True,
+                            "meta": {},
+                        }
+                    else:
+                        prepared = await asyncio.to_thread(
+                            self._prepare_bound_item_delivery,
+                            binding=bound_delivery,
+                            order_id=order_id,
+                            buyer_id=send_user_id,
+                            item_id=item_id,
+                            quantity=trusted_quantity,
+                            order_line_id=order_line_id,
+                        )
                 except Exception as bound_error:
                     error_code = getattr(bound_error, "code", "delivery_prepare_failed")
-                    error_message = str(bound_error).strip() or "绑定商品发货准备失败"
                     logger.error(
                         f"绑定商品发货准备失败: item_id={item_id}, order_id={order_id}, "
-                        f"error_code={error_code}, error={error_message}"
+                        f"error_code={error_code}"
                     )
                     prepared = {
                         "status": "failed",
+                        "configured": True,
                         "user_id": getattr(self, "user_id", None),
                         "card_id": bound_delivery.get("card_id"),
                         "account_id": self.cookie_id,
@@ -12298,7 +12503,7 @@ class XianyuLive:
                         "idempotency_key": None,
                         "reservation_id": None,
                         "error_code": error_code,
-                        "error": f"绑定商品发货准备失败：{error_message}",
+                        "error": "绑定商品发货准备失败，请稍后重试",
                         "meta": {},
                     }
                 return self._bound_delivery_result(prepared, include_meta=include_meta)
