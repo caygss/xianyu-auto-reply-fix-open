@@ -1,0 +1,327 @@
+.delivery-config-shell {
+  --delivery-config-soft-bg: color-mix(in srgb, var(--primary-color) 7%, var(--card-bg));
+  color: var(--text-color);
+}
+
+.delivery-config-shell *,
+.delivery-config-shell *::before,
+.delivery-config-shell *::after {
+  box-sizing: border-box;
+}
+
+.delivery-config-prompt,
+.delivery-config-panel,
+.delivery-config-section,
+.delivery-config-method-card,
+.delivery-config-inventory,
+.delivery-config-shortage {
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+}
+
+.delivery-config-prompt {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+  padding: 16px;
+  background: var(--delivery-config-soft-bg);
+}
+
+.delivery-config-prompt p,
+.delivery-config-section-heading p,
+.delivery-config-help,
+.delivery-config-shortage p {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+}
+
+.delivery-config-open-button,
+.delivery-config-toggle,
+.delivery-config-icon-button,
+.delivery-config-primary-button,
+.delivery-config-secondary-button,
+.delivery-config-shell input,
+.delivery-config-shell select,
+.delivery-config-shell textarea,
+.delivery-config-shell summary {
+  min-height: 44px;
+}
+
+.delivery-config-open-button,
+.delivery-config-toggle,
+.delivery-config-icon-button,
+.delivery-config-primary-button,
+.delivery-config-secondary-button {
+  border-radius: 8px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.delivery-config-open-button,
+.delivery-config-primary-button {
+  border: 1px solid var(--primary-color);
+  background: var(--primary-color);
+  color: #fff;
+}
+
+.delivery-config-open-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 0 16px;
+}
+
+.delivery-config-secondary-button,
+.delivery-config-toggle,
+.delivery-config-icon-button {
+  border: 1px solid var(--input-border);
+  background: var(--card-bg);
+  color: var(--text-color);
+}
+
+.delivery-config-icon-button {
+  flex: 0 0 44px;
+  padding: 0;
+  font-size: 24px;
+  line-height: 1;
+}
+
+.delivery-config-panel {
+  overflow: hidden;
+  background: var(--card-bg);
+  box-shadow: var(--shadow-sm);
+}
+
+.delivery-config-header,
+.delivery-config-section-heading,
+.delivery-config-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.delivery-config-header {
+  padding: 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.delivery-config-eyebrow {
+  margin: 0 0 2px;
+  color: var(--primary-color);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.delivery-config-header h3,
+.delivery-config-section h4,
+.delivery-config-method-card h5,
+.delivery-config-inventory h5 {
+  margin: 0;
+}
+
+.delivery-config-toggle,
+.delivery-config-primary-button,
+.delivery-config-secondary-button {
+  padding: 8px 14px;
+}
+
+.delivery-config-panel-body {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+  padding: 16px;
+}
+
+.delivery-config-section,
+.delivery-config-method-card,
+.delivery-config-inventory,
+.delivery-config-shortage {
+  padding: 16px;
+  background: var(--card-bg);
+}
+
+.delivery-config-section-heading {
+  align-items: flex-start;
+  margin-bottom: 14px;
+}
+
+.delivery-config-section > label,
+.delivery-config-method-card label,
+.delivery-config-form-grid label {
+  display: block;
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+
+.delivery-config-shell input:not([type="checkbox"]),
+.delivery-config-shell select,
+.delivery-config-shell textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--input-border);
+  border-radius: 8px;
+  background: var(--input-bg);
+  color: var(--text-color);
+  font: inherit;
+}
+
+.delivery-config-shell textarea {
+  min-height: 96px;
+  resize: vertical;
+}
+
+.delivery-config-method-card,
+.delivery-config-inventory,
+.delivery-config-shortage {
+  margin-top: 16px;
+}
+
+.delivery-config-form-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.delivery-config-checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+}
+
+.delivery-config-checkbox-field input {
+  width: 20px;
+  height: 20px;
+}
+
+.delivery-config-checkbox-field label {
+  margin: 0;
+}
+
+.delivery-config-inventory dl {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  margin: 0;
+}
+
+.delivery-config-inventory dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--light-color);
+}
+
+.delivery-config-inventory dt,
+.delivery-config-inventory dd {
+  margin: 0;
+}
+
+.delivery-config-shortage {
+  border-color: var(--warning-color);
+  background: color-mix(in srgb, var(--warning-color) 10%, var(--card-bg));
+}
+
+.delivery-config-actions {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  margin-top: 14px;
+}
+
+.delivery-config-preview {
+  margin: 12px 0 0;
+  padding: 12px 12px 12px 32px;
+  border-radius: 8px;
+  background: var(--light-color);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.delivery-config-advanced {
+  margin-top: 16px;
+  border-top: 1px solid var(--border-color);
+  padding-top: 12px;
+}
+
+.delivery-config-advanced summary {
+  display: flex;
+  align-items: center;
+  width: fit-content;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.delivery-config-json-error {
+  margin: 12px 0 0;
+  color: var(--danger-color);
+  font-weight: 600;
+}
+
+.delivery-config-status {
+  margin-top: 16px;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--light-color);
+  color: var(--text-secondary);
+}
+
+.delivery-config-save-actions {
+  justify-content: flex-end;
+}
+
+.delivery-config-shell :focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--primary-color) 65%, transparent);
+  outline-offset: 2px;
+}
+
+[data-theme="dark"] .delivery-config-shell {
+  --delivery-config-soft-bg: color-mix(in srgb, var(--primary-color) 18%, var(--card-bg));
+}
+
+[data-theme="dark"] .delivery-config-shortage {
+  background: color-mix(in srgb, var(--warning-color) 15%, var(--card-bg));
+}
+
+@media (min-width: 900px) {
+  .delivery-config-panel-body {
+    grid-template-columns: minmax(240px, 0.75fr) minmax(0, 2fr);
+  }
+
+  .delivery-config-form-grid,
+  .delivery-config-inventory dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 520px) {
+  .delivery-config-header,
+  .delivery-config-section-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .delivery-config-open-button,
+  .delivery-config-toggle,
+  .delivery-config-primary-button,
+  .delivery-config-secondary-button {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .delivery-config-shell *,
+  .delivery-config-shell *::before,
+  .delivery-config-shell *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
