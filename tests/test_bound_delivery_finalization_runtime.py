@@ -772,7 +772,7 @@ def test_platform_confirm_failure_keeps_orchestration_sent_and_blocks_resend(
     assert repeated["content"] is None
 
 
-def test_shortage_then_restock_retries_whole_configured_order(runtime):
+def test_shortage_then_restock_retries_whole_configured_order(runtime, monkeypatch):
     live, manager = runtime
     card_id = create_binding(manager)
     DeliveryConfigService(manager).save(
@@ -785,33 +785,154 @@ def test_shortage_then_restock_retries_whole_configured_order(runtime):
     inventory = CardInventoryService(manager)
     inventory.save_settings(card_id, USER_ID, ACCOUNT_ID, stock_ceiling=2)
     inventory.import_items(card_id, USER_ID, ACCOUNT_ID, ["restock-a"])
-    call = dict(
+    order_id = "order-shortage-recovery"
+    manager.insert_or_update_order(
+        order_id=order_id,
         item_id=ITEM_ID,
-        item_title="绑定商品",
-        order_id="order-shortage-recovery",
-        send_user_id="buyer-1",
-        include_meta=True,
-        quantity=2,
-        order_line_id=ITEM_ID,
+        buyer_id="buyer-1",
+        quantity="2",
+        order_status="pending_ship",
+        cookie_id=ACCOUNT_ID,
+    )
+    live._order_locks = defaultdict(asyncio.Lock)
+    live._lock_usage_times = {}
+    live.delivery_sent_orders = set()
+    live.last_delivery_time = {}
+    live.order_status_handler = None
+    live.confirmed_orders = {}
+    live.order_confirm_cooldown = 300
+    sent_batches = []
+    confirm_calls = []
+    prepare_results = []
+    mark_sent_quantities = []
+    real_prepare_retry = DeliveryOrchestrationService.prepare_retry
+    real_mark_sent = DeliveryOrchestrationService.mark_sent
+
+    async def owned_item(*args, **kwargs):
+        return True
+
+    async def record_send(websocket, chat_id, user_id, delivery_steps, **kwargs):
+        sent_batches.append([step["content"] for step in delivery_steps])
+
+    async def confirm_once(*args, **kwargs):
+        confirm_calls.append(orchestration_state(manager, order_id)[0])
+        return {"success": True}
+
+    async def ignore_async(*args, **kwargs):
+        return None
+
+    def record_prepare_retry(service, request):
+        result = real_prepare_retry(service, request)
+        prepare_results.append(
+            (
+                request.quantity,
+                result["status"],
+                result.get("reservation_id"),
+                list(result.get("contents") or []),
+            )
+        )
+        return result
+
+    def record_mark_sent(service, request, claim_token):
+        mark_sent_quantities.append(request.quantity)
+        return real_mark_sent(service, request, claim_token)
+
+    monkeypatch.setattr(live, "_ensure_item_owned_by_current_account", owned_item)
+    monkeypatch.setattr(live, "_check_buyer_blacklist_for_action", lambda **kwargs: False)
+    monkeypatch.setattr(live, "can_auto_delivery", lambda value: True)
+    monkeypatch.setattr(live, "is_lock_held", lambda value: False)
+    monkeypatch.setattr(live, "is_auto_confirm_enabled", lambda: True)
+    monkeypatch.setattr(live, "auto_confirm", confirm_once)
+    monkeypatch.setattr(live, "_send_delivery_steps", record_send)
+    monkeypatch.setattr(live, "_activate_delivery_lock", lambda *args, **kwargs: None)
+    monkeypatch.setattr(live, "_record_delivery_log", lambda **kwargs: None)
+    monkeypatch.setattr(live, "send_delivery_failure_notification", ignore_async)
+    monkeypatch.setattr(
+        live,
+        "_notify_republish_after_delivery_finalized",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        DeliveryOrchestrationService,
+        "prepare_retry",
+        record_prepare_retry,
+    )
+    monkeypatch.setattr(
+        DeliveryOrchestrationService,
+        "mark_sent",
+        record_mark_sent,
     )
 
-    shortage = asyncio.run(live._auto_delivery(**call))
-    inventory.import_items(card_id, USER_ID, ACCOUNT_ID, ["restock-b"])
-    retried = asyncio.run(live._auto_delivery(**call))
+    asyncio.run(
+        live._handle_simple_message_auto_delivery(
+            object(),
+            order_id,
+            ITEM_ID,
+            "buyer-1",
+            "chat-1",
+            "now",
+            "message-shortage",
+        )
+    )
 
-    assert shortage["status"] == "paused"
-    assert shortage["reservation_id"] is None
-    assert retried["success"] is True
-    assert retried["contents"] == ["restock-a", "restock-b"]
+    shortage_state = orchestration_state(manager, order_id)
+    shortage_inventory = inventory.get_inventory_summary(card_id, USER_ID, ACCOUNT_ID)
+    with manager.lock:
+        shortage_reservation_count = manager.conn.execute(
+            "SELECT COUNT(*) FROM card_inventory_reservations WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()[0]
+
+    assert shortage_state[0] == "paused"
+    assert shortage_state[3] is None
+    assert shortage_inventory["available"] == 1
+    assert shortage_inventory["sent"] == 0
+    assert shortage_reservation_count == 0
+    assert sent_batches == []
+    assert confirm_calls == []
+
+    inventory.import_items(card_id, USER_ID, ACCOUNT_ID, ["restock-b"])
+    asyncio.run(
+        live._handle_simple_message_auto_delivery(
+            object(),
+            order_id,
+            ITEM_ID,
+            "buyer-1",
+            "chat-1",
+            "now",
+            "message-restocked",
+        )
+    )
+
+    summary = manager.get_delivery_progress_summary(order_id, expected_quantity=2)
+    finalization_states = manager.get_delivery_finalization_states(order_id)
+    final_inventory = inventory.get_inventory_summary(card_id, USER_ID, ACCOUNT_ID)
     with manager.lock:
         state_count = manager.conn.execute(
             "SELECT COUNT(*) FROM delivery_orchestration_states WHERE order_id = ?",
-            ("order-shortage-recovery",),
+            (order_id,),
         ).fetchone()[0]
         reservation_count = manager.conn.execute(
             "SELECT COUNT(*) FROM card_inventory_reservations WHERE order_id = ?",
-            ("order-shortage-recovery",),
+            (order_id,),
         ).fetchone()[0]
+
+    assert prepare_results[0] == (2, "paused", None, [])
+    assert prepare_results[1][0:2] == (2, "sending")
+    assert prepare_results[1][3] == ["restock-a", "restock-b"]
+    assert sent_batches == [["restock-a", "restock-b"]]
+    assert mark_sent_quantities == [2]
+    assert confirm_calls == ["sent"]
+    assert orchestration_state(manager, order_id)[0] == "sent"
+    assert len(finalization_states) == 1
+    assert finalization_states[0]["status"] == "finalized"
+    assert summary["finalized_count"] == 2
+    assert summary["pending_finalize_count"] == 0
+    assert summary["remaining_count"] == 0
+    assert summary["aggregate_status"] == "shipped"
+    assert manager.get_order_by_id(order_id)["order_status"] == "shipped"
+    assert final_inventory["available"] == 0
+    assert final_inventory["sent"] == 2
     assert state_count == 1
     assert reservation_count == 1
 
