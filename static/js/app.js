@@ -12862,6 +12862,7 @@ const deliveryConfigSession =
     DeliveryConfigSession.createDeliveryConfigSessionCoordinator();
 let deliveryConfigContext = null;
 let deliveryLoadUiOwner = null;
+let deliveryWriteUiOwner = null;
 let deliveryConfigReady = false;
 
 function readDeliveryConfigUiState() {
@@ -12958,7 +12959,7 @@ function setDeliveryConfigWriteControlsDisabled(disabled) {
 }
 
 function setDeliveryConfigBusy(busy) {
-    if (!busy && deliveryLoadUiOwner) return false;
+    if (!busy && (deliveryLoadUiOwner || deliveryWriteUiOwner)) return false;
     const panel = document.getElementById('deliveryConfigPanel');
     panel?.setAttribute('aria-busy', String(busy));
     setDeliveryConfigWriteControlsDisabled(busy || !deliveryConfigReady);
@@ -12976,8 +12977,60 @@ function setDeliveryLoadBusy(operation, busy) {
     }
     if (deliveryLoadUiOwner !== operation) return false;
     deliveryLoadUiOwner = null;
+    if (deliveryWriteUiOwner) {
+        panel?.setAttribute('aria-busy', 'true');
+        setDeliveryConfigWriteControlsDisabled(true);
+        return true;
+    }
     panel?.setAttribute('aria-busy', 'false');
     setDeliveryConfigWriteControlsDisabled(!deliveryConfigReady);
+    return true;
+}
+
+function setDeliveryWriteBusy(operation, busy) {
+    const panel = document.getElementById('deliveryConfigPanel');
+    const itemButtons = document.querySelectorAll('[data-delivery-item-index]');
+    const switchBlockedTitle = '当前商品正在处理中，完成后才能切换';
+    if (busy) {
+        if (!deliveryConfigSession.isWriteCurrent(operation)) return false;
+        deliveryWriteUiOwner = operation;
+        panel?.setAttribute('aria-busy', 'true');
+        setDeliveryConfigWriteControlsDisabled(true);
+        itemButtons.forEach(button => {
+            button.disabled = true;
+            button.title = switchBlockedTitle;
+        });
+        return true;
+    }
+    if (deliveryWriteUiOwner !== operation) return false;
+    deliveryWriteUiOwner = null;
+    itemButtons.forEach(button => {
+        button.disabled = false;
+        button.removeAttribute?.('title');
+    });
+    setDeliveryConfigWriteControlsDisabled(!deliveryConfigReady);
+    if (!deliveryLoadUiOwner) panel?.setAttribute('aria-busy', 'false');
+    return true;
+}
+
+function beginDeliveryWrite(kind) {
+    const operation = deliveryConfigSession.beginWrite(kind);
+    if (!operation) {
+        setDeliveryConfigStatus('当前商品尚未加载完成，请稍候', 'error');
+        return null;
+    }
+    setDeliveryWriteBusy(operation, true);
+    return operation;
+}
+
+function finishDeliveryWrite(operation) {
+    if (!deliveryConfigSession.endWrite(operation)) return false;
+    return setDeliveryWriteBusy(operation, false);
+}
+
+function setDeliveryWriteStatus(operation, message, type = 'info') {
+    if (!deliveryConfigSession.isWriteCurrent(operation)) return false;
+    setDeliveryConfigStatus(message, type);
     return true;
 }
 
@@ -13277,68 +13330,73 @@ function requireDeliveryConfigContext() {
     return null;
 }
 
-async function saveInventorySettings() {
-    const context = requireDeliveryConfigContext();
-    if (!context) return null;
+async function saveInventorySettings(context, payload = buildInventorySettingsPayload()) {
     const paths = deliveryCardPaths(context.cardId, context.accountId);
     return deliveryConfigFetch(paths.settings, {
-        method: 'PUT', body: JSON.stringify(buildInventorySettingsPayload())
+        method: 'PUT', body: JSON.stringify(payload)
     });
 }
 
-async function refreshDeliveryInventory() {
-    const context = requireDeliveryConfigContext();
-    if (!context) return;
+async function refreshDeliveryInventory(context, operation) {
     const paths = deliveryCardPaths(context.cardId, context.accountId);
     const [inventoryPayload, previewPayload] = await Promise.all([
         deliveryConfigFetch(paths.inventory),
         deliveryConfigFetch(paths.preview)
     ]);
+    if (!deliveryConfigSession.isWriteCurrent(operation)) return false;
     renderInventorySummary(inventoryPayload?.inventory || {});
     renderInventoryPreview(previewPayload?.items || []);
+    return true;
 }
 
 async function saveCurrentDeliveryConfig() {
-    const context = requireDeliveryConfigContext();
-    if (!context) return;
     const jsonError = document.getElementById('deliveryJsonError');
     if (jsonError) jsonError.hidden = true;
     let payload;
+    let inventoryPayload;
     try {
         payload = buildDeliveryConfigPayload();
+        inventoryPayload = buildInventorySettingsPayload();
     } catch (error) {
         if (jsonError) jsonError.hidden = false;
         setDeliveryConfigStatus('高级设置 JSON 格式错误', 'error');
         return;
     }
-    setDeliveryConfigBusy(true);
-    setDeliveryConfigStatus('正在保存当前商品配置…');
+    const operation = beginDeliveryWrite('save');
+    if (!operation) return;
+    const { context } = operation;
+    setDeliveryWriteStatus(operation, '正在保存当前商品配置…');
     try {
         const paths = deliveryCardPaths(context.cardId, context.accountId);
         await deliveryConfigFetch(paths.config, {
             method: 'PUT', body: JSON.stringify(payload)
         });
-        if (payload.mode === 'imported_card' || payload.mode === 'generated_card') await saveInventorySettings();
-        setDeliveryConfigStatus('当前商品交付配置已保存', 'success');
+        if (!deliveryConfigSession.isWriteCurrent(operation)) return;
+        if (payload.mode === 'imported_card' || payload.mode === 'generated_card') {
+            await saveInventorySettings(context, inventoryPayload);
+        }
+        if (!deliveryConfigSession.isWriteCurrent(operation)) return;
+        setDeliveryWriteStatus(operation, '当前商品交付配置已保存', 'success');
     } catch (error) {
-        setDeliveryConfigStatus(`保存失败：${error.message}`, 'error');
+        setDeliveryWriteStatus(operation, `保存失败：${error.message}`, 'error');
     } finally {
-        setDeliveryConfigBusy(false);
+        finishDeliveryWrite(operation);
     }
 }
 
 async function deleteCurrentDeliveryConfig() {
-    const context = requireDeliveryConfigContext();
-    if (!context) return;
-    setDeliveryConfigBusy(true);
+    const operation = beginDeliveryWrite('delete');
+    if (!operation) return;
+    const { context } = operation;
     try {
         await deliveryConfigFetch(deliveryCardPaths(context.cardId, context.accountId).config, { method: 'DELETE' });
+        if (!deliveryConfigSession.isWriteCurrent(operation)) return;
         applyDeliveryConfig(null);
-        setDeliveryConfigStatus('当前商品交付配置已删除', 'success');
+        setDeliveryWriteStatus(operation, '当前商品交付配置已删除', 'success');
     } catch (error) {
-        setDeliveryConfigStatus(`删除失败：${error.message}`, 'error');
+        setDeliveryWriteStatus(operation, `删除失败：${error.message}`, 'error');
     } finally {
-        setDeliveryConfigBusy(false);
+        finishDeliveryWrite(operation);
     }
 }
 
@@ -13381,42 +13439,48 @@ function readCardImportFile(event) {
 }
 
 async function importCardInventory() {
-    const context = requireDeliveryConfigContext();
-    if (!context) return;
     const secrets = (document.getElementById('cardImportInput')?.value || '')
         .split(/\r?\n/).map(value => value.trim()).filter(Boolean);
     if (!secrets.length) {
         setDeliveryConfigStatus('请先粘贴或选择要导入的卡密', 'error');
         return;
     }
-    setDeliveryConfigBusy(true);
+    const operation = beginDeliveryWrite('import');
+    if (!operation) return;
+    const { context } = operation;
     try {
         await deliveryConfigFetch(deliveryCardPaths(context.cardId, context.accountId).importItems, {
             method: 'POST', body: JSON.stringify({ secrets })
         });
+        if (!deliveryConfigSession.isWriteCurrent(operation)) return;
         document.getElementById('cardImportInput').value = '';
-        await refreshDeliveryInventory();
-        setDeliveryConfigStatus('卡密已导入，页面仅显示脱敏预览', 'success');
+        await refreshDeliveryInventory(context, operation);
+        if (!deliveryConfigSession.isWriteCurrent(operation)) return;
+        setDeliveryWriteStatus(operation, '卡密已导入，页面仅显示脱敏预览', 'success');
     } catch (error) {
-        setDeliveryConfigStatus(`导入失败：${error.message}`, 'error');
+        setDeliveryWriteStatus(operation, `导入失败：${error.message}`, 'error');
     } finally {
-        setDeliveryConfigBusy(false);
+        finishDeliveryWrite(operation);
     }
 }
 
 async function generateCardInventory() {
-    const context = requireDeliveryConfigContext();
-    if (!context) return;
-    setDeliveryConfigBusy(true);
+    const inventoryPayload = buildInventorySettingsPayload();
+    const operation = beginDeliveryWrite('generate');
+    if (!operation) return;
+    const { context } = operation;
     try {
-        await saveInventorySettings();
+        await saveInventorySettings(context, inventoryPayload);
+        if (!deliveryConfigSession.isWriteCurrent(operation)) return;
         await deliveryConfigFetch(deliveryCardPaths(context.cardId, context.accountId).generate, { method: 'POST' });
-        await refreshDeliveryInventory();
-        setDeliveryConfigStatus('库存已按当前生成设置补充', 'success');
+        if (!deliveryConfigSession.isWriteCurrent(operation)) return;
+        await refreshDeliveryInventory(context, operation);
+        if (!deliveryConfigSession.isWriteCurrent(operation)) return;
+        setDeliveryWriteStatus(operation, '库存已按当前生成设置补充', 'success');
     } catch (error) {
-        setDeliveryConfigStatus(`生成失败：${error.message}`, 'error');
+        setDeliveryWriteStatus(operation, `生成失败：${error.message}`, 'error');
     } finally {
-        setDeliveryConfigBusy(false);
+        finishDeliveryWrite(operation);
     }
 }
 
@@ -13435,14 +13499,17 @@ function handleCardReplenish() {
 }
 
 async function continueDeliveryProcessing() {
-    setDeliveryConfigBusy(true);
+    const operation = beginDeliveryWrite('continue');
+    if (!operation) return;
+    const { context } = operation;
     try {
-        await refreshDeliveryInventory();
-        setDeliveryConfigStatus('库存状态已刷新；补足后系统将重试');
+        await refreshDeliveryInventory(context, operation);
+        if (!deliveryConfigSession.isWriteCurrent(operation)) return;
+        setDeliveryWriteStatus(operation, '库存状态已刷新；补足后系统将重试');
     } catch (error) {
-        setDeliveryConfigStatus(`刷新库存失败：${error.message}`, 'error');
+        setDeliveryWriteStatus(operation, `刷新库存失败：${error.message}`, 'error');
     } finally {
-        setDeliveryConfigBusy(false);
+        finishDeliveryWrite(operation);
     }
 }
 
@@ -13600,7 +13667,7 @@ function displayCurrentPageItems() {
         <td>${formatDateTime(item.updated_at)}</td>
             <td>
                 <div class="d-flex flex-wrap gap-1" role="group">
-                <button type="button" class="btn btn-sm btn-outline-success" data-delivery-item-index="${itemIndex}">
+                <button type="button" class="btn btn-sm btn-outline-success" data-delivery-item-index="${itemIndex}"${deliveryConfigSession.isWriteActive() ? ' disabled title="当前商品正在处理中，完成后才能切换"' : ''}>
                     设置交付方式
                 </button>
                 <button class="btn btn-sm btn-outline-primary" onclick="editItem('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}')" title="编辑详情">

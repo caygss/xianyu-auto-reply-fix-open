@@ -71,6 +71,7 @@ function createHarness({ honorAbort = true } = {}) {
     return elements.get(id);
   };
   const inventoryDds = Array.from({ length: 6 }, () => new Element());
+  const deliveryItemButtons = Array.from({ length: 2 }, () => new Element());
   [
     'deliveryConfigPanel', 'deliveryConfigPanelBody', 'deliveryConfigToggleButton',
     'deliveryConfigOpenButton', 'deliveryConfigStatus', 'deliveryMethodSelect',
@@ -94,6 +95,7 @@ function createHarness({ honorAbort = true } = {}) {
     },
     querySelectorAll: (selector) => {
       if (selector === '#cardInventorySummary dd') return inventoryDds;
+      if (selector === '[data-delivery-item-index]') return deliveryItemButtons;
       if (selector === '[data-delivery-method]') return [];
       if (selector === '#sidebar .sidebar-nav .nav-link') return [];
       return [];
@@ -135,8 +137,17 @@ function createHarness({ honorAbort = true } = {}) {
     clearInterval() {}, clearTimeout() {},
     window: {},
   };
-  vm.runInNewContext(`${deliverySource()}\nglobalThis.deliveryTestApi = { openDeliveryConfigForItem, showSection, setDeliveryConfigBusy, initDeliveryConfigUi, state: () => ({ context: deliveryConfigContext, ready: deliveryConfigReady, owner: deliveryLoadUiOwner }) };`, sandbox);
-  return { api: sandbox.deliveryTestApi, elements, inventoryDds, requests, respond };
+  vm.runInNewContext(`${deliverySource()}\nglobalThis.deliveryTestApi = {
+    openDeliveryConfigForItem, showSection, setDeliveryConfigBusy, initDeliveryConfigUi,
+    saveCurrentDeliveryConfig, deleteCurrentDeliveryConfig, importCardInventory,
+    generateCardInventory, continueDeliveryProcessing,
+    beginDeliveryWrite: typeof beginDeliveryWrite === 'undefined' ? null : beginDeliveryWrite,
+    finishDeliveryWrite: typeof finishDeliveryWrite === 'undefined' ? null : finishDeliveryWrite,
+    setDeliveryWriteStatus: typeof setDeliveryWriteStatus === 'undefined' ? null : setDeliveryWriteStatus,
+    setContext: (context) => { deliveryConfigContext = context; },
+    state: () => ({ context: deliveryConfigContext, ready: deliveryConfigReady, loadOwner: deliveryLoadUiOwner, writeOwner: typeof deliveryWriteUiOwner === 'undefined' ? null : deliveryWriteUiOwner })
+  };`, sandbox);
+  return { api: sandbox.deliveryTestApi, elements, inventoryDds, deliveryItemButtons, requests, respond };
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -157,11 +168,28 @@ async function settleSuccessfulB(harness, load) {
   await load;
 }
 
+async function loadDeliveryItem(harness, accountId = 'account-A', itemId = 'item-A', cardId = 'card-A') {
+  const load = harness.api.openDeliveryConfigForItem(accountId, itemId, `商品 ${itemId.slice(-1).toUpperCase()}`);
+  harness.respond(`/api/items/${itemId}/delivery-card`, { card_id: cardId });
+  await tick();
+  harness.respond('/delivery-config', { mode: 'generated_card' });
+  harness.respond('/inventory/settings', { settings: { stock_ceiling: 10, generator_prefix: 'A-' } });
+  harness.respond('/inventory?', { inventory: { available: 7, shortage: 0 } });
+  harness.respond('/inventory/preview', { items: ['A***'] });
+  await load;
+}
+
+function assertOnlyAUrls(harness) {
+  const urls = harness.requests.map((request) => request.url);
+  assert.ok(urls.some((url) => url.includes('card-A') && url.includes('account-A')));
+  assert.ok(urls.every((url) => !url.includes('card-B') && !url.includes('account-B')));
+}
+
 test('setDeliveryConfigBusy(false) preserves a current B load owner', () => {
   const harness = createHarness({ honorAbort: false });
   void harness.api.openDeliveryConfigForItem('account-B', 'item-B', '商品 B');
 
-  assert.ok(harness.api.state().owner);
+  assert.ok(harness.api.state().loadOwner);
   assert.equal(harness.elements.get('deliveryConfigPanel').getAttribute('aria-busy'), 'true');
   harness.api.setDeliveryConfigBusy(false);
 
@@ -236,4 +264,119 @@ test('leaving item management aborts an unfinished load without a user-facing er
   assert.deepEqual(identity(harness), before.identity);
   assert.equal(harness.elements.get('deliveryConfigStatus').textContent, before.status);
   assert.equal(harness.elements.get('deliveryConfigPanel').getAttribute('aria-busy'), 'false');
+});
+
+test('save config and inventory use the same captured A context', async () => {
+  const harness = createHarness();
+  await loadDeliveryItem(harness);
+  harness.elements.get('deliveryMethodSelect').value = 'generated_card';
+  harness.elements.get('inventoryStockCeiling').value = '42';
+
+  const save = harness.api.saveCurrentDeliveryConfig();
+  const configRequest = harness.requests.at(-1);
+  assert.match(configRequest.url, /card-A.*account-A/);
+  assert.deepEqual(JSON.parse(configRequest.options.body), { mode: 'generated_card', config: { source: 'local-generated' } });
+  assert.ok(writeButtonIds.every((id) => harness.elements.get(id).disabled));
+  assert.ok(harness.deliveryItemButtons.every((button) => button.disabled));
+
+  await harness.api.openDeliveryConfigForItem('account-B', 'item-B', '商品 B');
+  assert.equal(harness.requests.filter((request) => request.url.includes('/api/items/item-B/delivery-card')).length, 0);
+  assert.match(harness.elements.get('deliveryConfigStatus').textContent, /商品 A/);
+
+  harness.respond('/delivery-config', {});
+  await tick();
+  const settingsRequest = harness.requests.at(-1);
+  assert.match(settingsRequest.url, /card-A.*account-A/);
+  assert.deepEqual(JSON.parse(settingsRequest.options.body), {
+    stock_ceiling: 42, low_stock_threshold: 0, auto_replenish: false,
+    generator_prefix: 'A-', generator_length: 0, generator_charset: '',
+  });
+  assert.ok(writeButtonIds.every((id) => harness.elements.get(id).disabled));
+  assert.ok(harness.deliveryItemButtons.every((button) => button.disabled));
+  harness.respond('/inventory/settings', {});
+  await save;
+
+  assertOnlyAUrls(harness);
+  assert.ok(writeButtonIds.every((id) => !harness.elements.get(id).disabled));
+  assert.ok(harness.deliveryItemButtons.every((button) => !button.disabled));
+});
+
+test('delete uses its captured A context after the visible context mutates', async () => {
+  const harness = createHarness();
+  await loadDeliveryItem(harness);
+  const deletion = harness.api.deleteCurrentDeliveryConfig();
+  harness.api.setContext({ accountId: 'account-B', itemId: 'item-B', itemTitle: '商品 B', cardId: 'card-B' });
+  assert.match(harness.requests.at(-1).url, /card-A.*account-A/);
+  harness.respond('/delivery-config', {});
+  await deletion;
+  assertOnlyAUrls(harness);
+});
+
+test('import uses its captured A context for import and refresh after visible context mutates', async () => {
+  const harness = createHarness();
+  await loadDeliveryItem(harness);
+  harness.elements.get('cardImportInput').value = 'one\ntwo';
+  const imported = harness.api.importCardInventory();
+  harness.api.setContext({ accountId: 'account-B', itemId: 'item-B', itemTitle: '商品 B', cardId: 'card-B' });
+  assert.match(harness.requests.at(-1).url, /card-A.*account-A/);
+  assert.deepEqual(JSON.parse(harness.requests.at(-1).options.body), { secrets: ['one', 'two'] });
+  harness.respond('/inventory/import', {});
+  await tick();
+  assert.match(harness.requests.at(-2).url, /card-A.*account-A/);
+  assert.match(harness.requests.at(-1).url, /card-A.*account-A/);
+  harness.respond('/inventory?', { inventory: {} });
+  harness.respond('/inventory/preview', { items: [] });
+  await imported;
+  assertOnlyAUrls(harness);
+});
+
+test('generate uses its captured A context for settings, generation, and refresh', async () => {
+  const harness = createHarness();
+  await loadDeliveryItem(harness);
+  const generated = harness.api.generateCardInventory();
+  harness.api.setContext({ accountId: 'account-B', itemId: 'item-B', itemTitle: '商品 B', cardId: 'card-B' });
+  assert.match(harness.requests.at(-1).url, /card-A.*account-A/);
+  harness.respond('/inventory/settings', {});
+  await tick();
+  assert.match(harness.requests.at(-1).url, /card-A.*account-A/);
+  harness.respond('/inventory/generate', {});
+  await tick();
+  assert.match(harness.requests.at(-2).url, /card-A.*account-A/);
+  assert.match(harness.requests.at(-1).url, /card-A.*account-A/);
+  harness.respond('/inventory?', { inventory: {} });
+  harness.respond('/inventory/preview', { items: [] });
+  await generated;
+  assertOnlyAUrls(harness);
+});
+
+test('continue gets A exclusively from the coordinator even if visible context was mutated first', async () => {
+  const harness = createHarness();
+  await loadDeliveryItem(harness);
+  harness.api.setContext({ accountId: 'account-B', itemId: 'item-B', itemTitle: '商品 B', cardId: 'card-B' });
+  const continued = harness.api.continueDeliveryProcessing();
+  assert.match(harness.requests.at(-2).url, /card-A.*account-A/);
+  assert.match(harness.requests.at(-1).url, /card-A.*account-A/);
+  harness.respond('/inventory?', { inventory: {} });
+  harness.respond('/inventory/preview', { items: [] });
+  await continued;
+  assertOnlyAUrls(harness);
+});
+
+test('a stale write token cannot enable controls or replace the current status', async () => {
+  const harness = createHarness();
+  await loadDeliveryItem(harness);
+  assert.equal(typeof harness.api.beginDeliveryWrite, 'function');
+  const stale = harness.api.beginDeliveryWrite('stale');
+  assert.ok(stale);
+  assert.equal(harness.api.finishDeliveryWrite(stale), true);
+  const current = harness.api.beginDeliveryWrite('current');
+  assert.ok(current);
+  harness.elements.get('deliveryConfigStatus').textContent = 'current write status';
+
+  assert.equal(harness.api.finishDeliveryWrite(stale), false);
+  assert.equal(harness.api.setDeliveryWriteStatus(stale, 'stale write status'), false);
+  assert.ok(writeButtonIds.every((id) => harness.elements.get(id).disabled));
+  assert.ok(harness.deliveryItemButtons.every((button) => button.disabled));
+  assert.equal(harness.elements.get('deliveryConfigStatus').textContent, 'current write status');
+  assert.equal(harness.api.finishDeliveryWrite(current), true);
 });
