@@ -95,6 +95,152 @@ def test_begin_send_is_one_shot_and_durably_blocks_stale_reclaim(services):
     assert row[3] == claim_token
 
 
+def test_service_owned_orchestrate_persists_begin_send_before_sender(services):
+    service, _, _, manager = services
+    request = make_request(
+        1,
+        order_line_id="line-service-owned-orchestrate",
+        item_id="item-service-owned-orchestrate",
+    )
+    observed = []
+
+    def sender(contents, normalized_request):
+        observed.append(
+            manager.conn.execute(
+                """
+                SELECT send_started_at, verification_required
+                FROM delivery_orchestration_states
+                WHERE order_line_id = ?
+                """,
+                (normalized_request.order_line_id,),
+            ).fetchone()
+        )
+        return True
+
+    result = service.orchestrate(request, sender)
+
+    assert observed and observed[0][0] is not None
+    assert observed[0][1] == 1
+    assert result["status"] == "sent"
+
+
+def test_service_owned_retry_persists_begin_send_before_sender(services):
+    service, inventory, _, manager = services
+    inventory.import_items(7, 1, "account-a", ["retry-card"])
+    request = make_request(
+        1,
+        order_line_id="line-service-owned-retry",
+        item_id="item-service-owned-retry",
+        mode="imported_card",
+    )
+    prepared = service.prepare(request)
+    reservation_id = prepared["reservation_id"]
+    service.mark_failed(
+        request,
+        prepared["_orchestration_private"]["claim_token"],
+        RuntimeError("initial sender failure"),
+    )
+    observed = []
+
+    def sender(contents, normalized_request):
+        observed.append(
+            manager.conn.execute(
+                """
+                SELECT send_started_at, verification_required, reservation_id
+                FROM delivery_orchestration_states
+                WHERE order_line_id = ?
+                """,
+                (normalized_request.order_line_id,),
+            ).fetchone()
+        )
+        return True
+
+    result = service.retry(request, sender)
+
+    assert observed and observed[0][0] is not None
+    assert observed[0][1:] == (1, reservation_id)
+    assert result["status"] == "sent"
+    assert manager.conn.execute(
+        "SELECT COUNT(*) FROM card_inventory_reservations"
+    ).fetchone()[0] == 1
+
+
+def test_service_owned_sender_exception_clears_begin_send_for_same_reservation_retry(
+    services,
+):
+    service, inventory, _, manager = services
+    inventory.import_items(7, 1, "account-a", ["exception-card"])
+    request = make_request(
+        1,
+        order_line_id="line-service-owned-exception",
+        item_id="item-service-owned-exception",
+        mode="imported_card",
+    )
+
+    failed = service.orchestrate(request, Sender(RuntimeError("sender failed")))
+    failed_row = manager.conn.execute(
+        """
+        SELECT send_started_at, verification_required, reservation_id
+        FROM delivery_orchestration_states
+        WHERE order_line_id = ?
+        """,
+        (request.order_line_id,),
+    ).fetchone()
+    recovered = service.retry(request, Sender())
+
+    assert failed["status"] == "failed"
+    assert failed_row == (None, 0, failed["reservation_id"])
+    assert recovered["status"] == "sent"
+    assert recovered["reservation_id"] == failed["reservation_id"]
+    assert manager.conn.execute(
+        "SELECT COUNT(*) FROM card_inventory_reservations"
+    ).fetchone()[0] == 1
+
+
+def test_service_owned_keyboard_interrupt_keeps_barrier_past_claim_lease(services):
+    service, _, _, manager = services
+    service.claim_lease_seconds = 1
+    request = make_request(
+        1,
+        order_line_id="line-service-owned-interrupt",
+        item_id="item-service-owned-interrupt",
+    )
+    interrupted_sender = Sender(KeyboardInterrupt("process interrupted"))
+
+    with pytest.raises(KeyboardInterrupt, match="process interrupted"):
+        service.orchestrate(request, interrupted_sender)
+
+    with manager.lock:
+        manager.conn.execute(
+            """
+            UPDATE delivery_orchestration_states
+            SET claimed_at = datetime('now', '-10 minutes')
+            WHERE order_line_id = ?
+            """,
+            (request.order_line_id,),
+        )
+        manager.conn.commit()
+
+    second_sender = Sender()
+    retried = service.retry(request, second_sender)
+    row = manager.conn.execute(
+        """
+        SELECT status, send_started_at, verification_required
+        FROM delivery_orchestration_states
+        WHERE order_line_id = ?
+        """,
+        (request.order_line_id,),
+    ).fetchone()
+
+    assert len(interrupted_sender.calls) == 1
+    assert second_sender.calls == []
+    assert retried["status"] == "in_progress"
+    assert retried["verification_required"] is True
+    assert row[0] == "sending"
+    assert row[1] is not None
+    assert row[2] == 1
+
+
 @pytest.mark.parametrize(
     "mismatch",
     ["quantity", "mode", "item_id", "idempotency_key", "card_id"],

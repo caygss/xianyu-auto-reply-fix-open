@@ -305,37 +305,233 @@ class DBManager:
                     f"ADD COLUMN {column_name} {definition}"
                 )
 
-        historical_rows = cursor.execute(
-            """
-            SELECT item_id, delivery_meta
-            FROM delivery_finalization_states
-            WHERE status = 'sent' AND delivery_meta IS NOT NULL
-            """
-        ).fetchall()
-        for row in historical_rows:
+        def parse_metadata(raw):
             try:
-                metadata = json.loads(row[1] or "{}")
+                value = json.loads(raw or "{}")
             except (TypeError, ValueError):
-                continue
-            if not isinstance(metadata, dict) or not metadata.get(
-                "claim_verification_required"
-            ):
+                return {}
+            return value if isinstance(value, dict) else {}
+
+        finalization_rows = []
+        for row in cursor.execute(
+            """
+            SELECT id, order_id, cookie_id, item_id, delivery_meta
+            FROM delivery_finalization_states
+            """
+        ).fetchall():
+            finalization_rows.append(
+                {
+                    "id": row[0],
+                    "order_id": str(row[1] or "").strip(),
+                    "account_id": str(row[2] or "").strip(),
+                    "item_id": str(row[3] or "").strip(),
+                    "metadata": parse_metadata(row[4]),
+                }
+            )
+
+        explicit_verification_reason = (
+            "历史发货记录要求人工核实，已阻止自动重发、确认和收尾"
+        )
+        for finalization in finalization_rows:
+            metadata = finalization["metadata"]
+            if not metadata.get("claim_verification_required"):
                 continue
             idempotency_key = str(metadata.get("idempotency_key") or "").strip()
             if not idempotency_key:
                 continue
-            item_id = str(row[0] or metadata.get("item_id") or "").strip() or None
+            item_candidates = {
+                value
+                for value in (
+                    finalization["item_id"],
+                    str(metadata.get("item_id") or "").strip(),
+                )
+                if value
+            }
+            item_id = next(iter(item_candidates)) if len(item_candidates) == 1 else None
             cursor.execute(
                 """
                 UPDATE delivery_orchestration_states
                 SET item_id = COALESCE(NULLIF(item_id, ''), ?),
                     send_started_at = COALESCE(send_started_at, CURRENT_TIMESTAMP),
                     verification_required = 1,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE idempotency_key = ? AND status = 'sending'
+                    last_error_code = 'historical_send_result_unverified',
+                    last_error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE idempotency_key = ?
                 """,
-                (item_id, idempotency_key),
+                (item_id, explicit_verification_reason, idempotency_key),
             )
+
+        def mark_finalizations_for_verification(order_id, account_id, reason):
+            for finalization in finalization_rows:
+                if (
+                    finalization["order_id"] != order_id
+                    or finalization["account_id"] != account_id
+                ):
+                    continue
+                metadata = dict(finalization["metadata"])
+                metadata["claim_verification_required"] = True
+                metadata["claim_verification_reason"] = reason
+                cursor.execute(
+                    """
+                    UPDATE delivery_finalization_states
+                    SET delivery_meta = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        json.dumps(
+                            metadata,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        finalization["id"],
+                    ),
+                )
+
+        historical_states = cursor.execute(
+            """
+            SELECT id, user_id, card_id, account_id, order_id, order_line_id,
+                   idempotency_key, status
+            FROM delivery_orchestration_states
+            WHERE item_id IS NULL OR TRIM(item_id) = ''
+            """
+        ).fetchall()
+        for state in historical_states:
+            (
+                state_id,
+                user_id,
+                card_id,
+                account_id,
+                order_id,
+                order_line_id,
+                idempotency_key,
+                status,
+            ) = state
+            account_id = str(account_id or "").strip()
+            order_id = str(order_id or "").strip()
+            order_line_id = str(order_line_id or "").strip()
+            idempotency_key = str(idempotency_key or "").strip()
+
+            order_level_candidates = {
+                str(row[0]).strip()
+                for row in cursor.execute(
+                    """
+                    SELECT item_id FROM orders
+                    WHERE order_id = ? AND cookie_id = ?
+                      AND item_id IS NOT NULL AND TRIM(item_id) != ''
+                    """,
+                    (order_id, account_id),
+                ).fetchall()
+            }
+            state_count = cursor.execute(
+                """
+                SELECT COUNT(*) FROM delivery_orchestration_states
+                WHERE account_id = ? AND order_id = ?
+                """,
+                (account_id, order_id),
+            ).fetchone()[0]
+            for finalization in finalization_rows:
+                if (
+                    finalization["order_id"] != order_id
+                    or finalization["account_id"] != account_id
+                ):
+                    continue
+                metadata = finalization["metadata"]
+                metadata_key = str(metadata.get("idempotency_key") or "").strip()
+                if metadata_key:
+                    matches_state = metadata_key == idempotency_key
+                else:
+                    metadata_card_id = str(metadata.get("card_id") or "").strip()
+                    metadata_line_id = str(metadata.get("order_line_id") or "").strip()
+                    has_scope = bool(metadata_card_id or metadata_line_id)
+                    matches_state = (
+                        (
+                            not metadata_card_id
+                            or metadata_card_id == str(card_id)
+                        )
+                        and (
+                            not metadata_line_id
+                            or metadata_line_id == order_line_id
+                        )
+                        and (has_scope or state_count == 1)
+                    )
+                if not matches_state:
+                    continue
+                for candidate in (
+                    finalization["item_id"],
+                    str(metadata.get("item_id") or "").strip(),
+                ):
+                    if candidate:
+                        order_level_candidates.add(candidate)
+
+            candidates = order_level_candidates
+            if not candidates:
+                candidates = {
+                    str(row[0]).strip()
+                    for row in cursor.execute(
+                        """
+                        SELECT DISTINCT item_id FROM item_delivery_bindings
+                        WHERE user_id = ? AND account_id = ? AND card_id = ?
+                          AND item_id IS NOT NULL AND TRIM(item_id) != ''
+                        """,
+                        (user_id, account_id, card_id),
+                    ).fetchall()
+                }
+
+            if len(candidates) == 1:
+                resolved_item_id = next(iter(candidates))
+                if status == "sending":
+                    reason = (
+                        "历史发货处于发送中，发送结果无法核实，已阻止自动重发、确认和收尾"
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE delivery_orchestration_states
+                        SET item_id = ?,
+                            send_started_at = COALESCE(send_started_at, CURRENT_TIMESTAMP),
+                            verification_required = 1,
+                            last_error_code = 'historical_send_result_unverified',
+                            last_error = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (resolved_item_id, reason, state_id),
+                    )
+                    mark_finalizations_for_verification(
+                        order_id,
+                        account_id,
+                        reason,
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE delivery_orchestration_states
+                        SET item_id = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (resolved_item_id, state_id),
+                    )
+                continue
+
+            if candidates:
+                reason = (
+                    "历史发货商品范围存在冲突，已转为待人工核实并阻止自动重发、确认和收尾"
+                )
+            else:
+                reason = (
+                    "历史发货商品范围无法可靠识别，已转为待人工核实并阻止自动重发、确认和收尾"
+                )
+            cursor.execute(
+                """
+                UPDATE delivery_orchestration_states
+                SET send_started_at = COALESCE(send_started_at, CURRENT_TIMESTAMP),
+                    verification_required = 1,
+                    last_error_code = 'historical_item_scope_unverified',
+                    last_error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (reason, state_id),
+            )
+
+            mark_finalizations_for_verification(order_id, account_id, reason)
     
     def init_db(self):
         """初始化数据库表结构"""

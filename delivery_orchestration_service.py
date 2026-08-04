@@ -605,6 +605,13 @@ class DeliveryOrchestrationService:
         state = self._get_state(request)
         if state is None:
             state = self._insert_state(request, request.delivery_config["mode"])
+        if state.get("verification_required"):
+            return self._result(
+                state,
+                status_override=(
+                    "in_progress" if state["status"] == "sending" else None
+                ),
+            )
         if (
             state["quantity"] != request.quantity
             or state["mode"] != request.delivery_config["mode"]
@@ -875,12 +882,11 @@ class DeliveryOrchestrationService:
                 raise DeliveryOrchestrationError("send_failed", "交付消息发送失败", "sender")
             return result
 
-    def orchestrate(self, request: DeliveryOrchestrationRequest, sender: Callable):
-        normalized = self._normalize_request(request)
-        prepared = self._prepare(normalized)
-        if not prepared.get("claimed"):
-            return prepared
+    def _send_prepared(self, normalized, prepared, sender: Callable):
+        """Run a service-owned sender behind the durable begin-send barrier."""
         claim_token = prepared["_orchestration_private"]["claim_token"]
+        if not self.begin_send(normalized, claim_token):
+            return self._claim_lost_result(normalized)
         try:
             self._sender_result(
                 sender,
@@ -902,6 +908,13 @@ class DeliveryOrchestrationService:
                 raise
             return self._claim_lost_result(normalized)
 
+    def orchestrate(self, request: DeliveryOrchestrationRequest, sender: Callable):
+        normalized = self._normalize_request(request)
+        prepared = self._prepare(normalized)
+        if not prepared.get("claimed"):
+            return prepared
+        return self._send_prepared(normalized, prepared, sender)
+
     def retry(self, request: DeliveryOrchestrationRequest, sender: Callable):
         normalized = self._normalize_request(request)
         state = self._get_state(normalized)
@@ -914,24 +927,4 @@ class DeliveryOrchestrationService:
         prepared = self._prepare(normalized, allow_retry=True)
         if not prepared.get("claimed"):
             return prepared
-        claim_token = prepared["_orchestration_private"]["claim_token"]
-        try:
-            self._sender_result(
-                sender,
-                prepared.get("contents") or [],
-                normalized,
-                claim_token,
-            )
-        except Exception as exc:
-            try:
-                return self.mark_failed(normalized, claim_token, exc)
-            except DeliveryOrchestrationError as mark_error:
-                if mark_error.code != "claim_token_mismatch":
-                    raise
-                return self._claim_lost_result(normalized)
-        try:
-            return self.mark_sent(normalized, claim_token)
-        except DeliveryOrchestrationError as mark_error:
-            if mark_error.code != "claim_token_mismatch":
-                raise
-            return self._claim_lost_result(normalized)
+        return self._send_prepared(normalized, prepared, sender)

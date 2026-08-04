@@ -18,6 +18,8 @@ The existing `status='sending'` remains the active claim state. This avoids rebu
 
 `DeliveryOrchestrationService.begin_send(request, claim_token)` is the only configured-send preflight API. It normalizes the request, verifies the exact persisted claim payload (`token`, `quantity`, `mode`, `idempotency_key`, `item_id`, and existing order/card/account/line scope), and atomically writes `send_started_at` plus `verification_required=1` before returning success.
 
+The synchronous compatibility APIs `orchestrate()` and `retry()` own their sender invocation, so they call `begin_send()` exactly once after prepare and before invoking the sender. An ordinary sender `Exception` is a proven failure and goes through `mark_failed`; a `BaseException` is allowed to propagate while the durable barrier remains. The externally segmented async runtime owns its own `begin_send()` call and therefore continues to use `prepare_retry()` rather than either service-owned sender API.
+
 `mark_failed` clears `send_started_at` and `verification_required` only for a confirmed ordinary sender failure with the current token. `mark_sent` clears those fields as part of the terminal sent transition.
 
 ## Runtime arbitration
@@ -42,11 +44,16 @@ User-facing dispositions and reasons use token-free Chinese text such as “发�
 
 The canonical table definition includes all three fields. Existing databases add missing columns inside the existing `init_db` transaction. Historical uncertain finalization metadata is parsed in Python and updates matching orchestration rows before the transaction commits. Migration failures roll back initialization.
 
+For ordinary historical rows with no `item_id`, migration uses only persisted scope evidence. An order item matched by `(order_id, account_id)` and an exactly scoped finalization anchor are order-level evidence; disagreement is a conflict. Only when no order-level evidence exists may a unique `(user_id, account_id, card_id)` binding supply the item. The schema has no persisted orchestration request payload, and `order_line_id` is not treated as an item identifier. Unique evidence backfills the item for `failed`, `paused`, and `sent`; historical `sending` is still quarantined because the old row cannot prove whether its sender completed. Missing or conflicting evidence retains the reservation, writes a token-free Chinese verification reason, and marks related finalization anchors so recovery cannot confirm or finalize them automatically.
+
 ## Tests
 
 Tests use real SQLite state and only mock external sender or injected storage failures. Required coverage includes:
 
 - canonical and legacy schema migration;
+- trusted historical item backfill for failed/paused/sent and safe quarantine for sending;
+- unresolved/conflicting historical item scope, reservation retention, and finalization blocking;
+- service-owned `orchestrate()`/`retry()` begin-send coverage including ordinary failure and `BaseException` interruption;
 - begin-send False/exception with zero sender calls;
 - lease expiry cannot reclaim any send-started row;
 - unknown sender result cannot confirm, finalize, ship, or resend;
