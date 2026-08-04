@@ -6,7 +6,7 @@
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
   } else {
-    root.createDeliveryConfigSessionCoordinator = api.createDeliveryConfigSessionCoordinator;
+    root.DeliveryConfigSession = api;
   }
 }(typeof globalThis !== 'undefined' ? globalThis : this, function createApi() {
   function trimRequired(value, name) {

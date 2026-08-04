@@ -2,10 +2,30 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
 
 const {
   createDeliveryConfigSessionCoordinator,
 } = require('../../static/js/delivery-config-session.js');
+
+test('browser build exposes the frozen API on DeliveryConfigSession only', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '../../static/js/delivery-config-session.js'),
+    'utf8',
+  );
+  const sandbox = { AbortController };
+  vm.runInNewContext(source, sandbox);
+
+  assert.ok(sandbox.DeliveryConfigSession);
+  assert.ok(Object.isFrozen(sandbox.DeliveryConfigSession));
+  assert.equal(
+    typeof sandbox.DeliveryConfigSession.createDeliveryConfigSessionCoordinator,
+    'function',
+  );
+  assert.equal(sandbox.createDeliveryConfigSessionCoordinator, undefined);
+});
 
 function selection(name) {
   return {
