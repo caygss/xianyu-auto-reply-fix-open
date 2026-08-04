@@ -338,10 +338,7 @@ class DBManager:
             UPDATE delivery_orchestration_states
             SET item_scope_migration_version = 1
             WHERE item_scope_migration_version < 1
-              AND (
-                  (item_id IS NOT NULL AND TRIM(item_id) != '')
-                  OR verification_required = 1
-              )
+              AND verification_required = 1
             """
         )
         pending_migration = cursor.execute(
@@ -517,8 +514,6 @@ class DBManager:
             exact_anchors = anchors_by_state_id.get(state["id"], [])
             anchor_conflict = len(exact_anchors) > 1
             candidates = set()
-            if state["item_id"]:
-                candidates.add(state["item_id"])
             candidates.update(
                 order_items.get(
                     (state["account_id"], state["order_id"]),
@@ -550,12 +545,19 @@ class DBManager:
                 if len(candidates) == 1 and not anchor_conflict
                 else None
             )
+            existing_item_id = state["item_id"]
+            item_conflict = bool(
+                existing_item_id
+                and resolved_item_id
+                and existing_item_id != resolved_item_id
+            )
             explicit_verification = bool(
                 exact_anchor
                 and exact_anchor["metadata"].get("claim_verification_required")
             )
             if (
                 resolved_item_id
+                and not item_conflict
                 and state["status"] != "sending"
                 and not explicit_verification
             ):
@@ -571,7 +573,8 @@ class DBManager:
                 continue
 
             if resolved_item_id and (
-                state["status"] == "sending" or explicit_verification
+                not item_conflict
+                and (state["status"] == "sending" or explicit_verification)
             ):
                 reason = (
                     "历史发货结果无法核实，已阻止自动重发、确认和收尾"

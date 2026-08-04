@@ -105,6 +105,18 @@ def _create_legacy_delivery_tables(connection):
     )
 
 
+def _add_pre_marker_send_state_columns(connection):
+    """Mirror the e368 durable-send schema before the owner-safe marker existed."""
+    connection.executescript(
+        """
+        ALTER TABLE delivery_orchestration_states ADD COLUMN item_id TEXT;
+        ALTER TABLE delivery_orchestration_states ADD COLUMN send_started_at TIMESTAMP;
+        ALTER TABLE delivery_orchestration_states
+            ADD COLUMN verification_required INTEGER NOT NULL DEFAULT 0;
+        """
+    )
+
+
 def _insert_historical_orchestration(
     connection,
     *,
@@ -1086,6 +1098,381 @@ def test_unresolved_failed_sibling_does_not_quarantine_exact_sent_anchor_on_rest
         assert dispatcher.requests == []
     finally:
         second_start.close()
+
+
+def test_pre_marker_card_only_item_backfill_is_revalidated_and_quarantined(
+    monkeypatch,
+    tmp_path,
+):
+    from card_inventory_service import CardInventoryService
+    from db_manager import DBManager
+    from delivery_orchestration_service import (
+        DeliveryOrchestrationRequest,
+        DeliveryOrchestrationService,
+    )
+    from test_delivery_quantity_contract import FakeDispatcher
+
+    database_path = tmp_path / "pre-marker-card-only-corruption.sqlite3"
+    connection = sqlite3.connect(database_path)
+    _create_legacy_delivery_tables(connection)
+    _add_pre_marker_send_state_columns(connection)
+    states = []
+    for line_id in ("line-1", "line-2"):
+        state = _insert_historical_orchestration(
+            connection,
+            status="failed",
+            suffix=f"pre-marker-{line_id}",
+            card_id=7,
+            order_id="order-pre-marker-corrupt",
+            order_line_id=line_id,
+            reservation_id=f"reservation-{line_id}",
+        )
+        states.append(state)
+    connection.execute(
+        """
+        UPDATE delivery_orchestration_states
+        SET item_id = 'item-from-old-card-only-migration'
+        """
+    )
+    original_meta = (
+        '{"configured": true, "card_id": 7, '
+        '"audit_note": "old card-only migration evidence"}'
+    )
+    connection.execute(
+        """
+        INSERT INTO delivery_finalization_states(
+            order_id, unit_index, cookie_id, item_id, status, delivery_meta
+        ) VALUES ('order-pre-marker-corrupt', 1, 'account-a',
+                  'item-from-old-card-only-migration', 'sent', ?)
+        """,
+        (original_meta,),
+    )
+    connection.commit()
+    connection.close()
+
+    first_start = DBManager(str(database_path))
+    try:
+        migrated = first_start.conn.execute(
+            """
+            SELECT order_line_id, item_id, verification_required,
+                   item_scope_migration_version, reservation_id
+            FROM delivery_orchestration_states
+            ORDER BY order_line_id
+            """
+        ).fetchall()
+        assert migrated == [
+            (
+                "line-1",
+                "item-from-old-card-only-migration",
+                1,
+                1,
+                "reservation-line-1",
+            ),
+            (
+                "line-2",
+                "item-from-old-card-only-migration",
+                1,
+                1,
+                "reservation-line-2",
+            ),
+        ]
+        assert first_start.conn.execute(
+            "SELECT delivery_meta FROM delivery_finalization_states"
+        ).fetchone()[0] == original_meta
+    finally:
+        first_start.close()
+
+    real_migration = DBManager._migrate_delivery_orchestration_send_state
+    second_start_events = {"source_loads": 0}
+
+    def traced_second_migration(manager, cursor):
+        def trace(statement):
+            normalized = " ".join(str(statement).split()).upper()
+            if any(
+                source in normalized
+                for source in (
+                    "FROM DELIVERY_FINALIZATION_STATES",
+                    "FROM ORDERS",
+                    "FROM ITEM_DELIVERY_BINDINGS",
+                )
+            ):
+                second_start_events["source_loads"] += 1
+
+        manager.conn.set_trace_callback(trace)
+        try:
+            return real_migration(manager, cursor)
+        finally:
+            manager.conn.set_trace_callback(None)
+
+    monkeypatch.setattr(
+        DBManager,
+        "_migrate_delivery_orchestration_send_state",
+        traced_second_migration,
+    )
+    second_start = DBManager(str(database_path))
+    try:
+        inventory = CardInventoryService(second_start)
+        dispatcher = FakeDispatcher(inventory)
+        service = DeliveryOrchestrationService(second_start, inventory, dispatcher)
+        sender_calls = []
+
+        def sender(contents, request):
+            sender_calls.append((contents, request))
+            return True
+
+        results = []
+        for order_id, order_line_id, idempotency_key in states:
+            results.append(
+                service.retry(
+                    DeliveryOrchestrationRequest(
+                        user_id=1,
+                        card_id=7,
+                        account_id="account-a",
+                        order_id=order_id,
+                        order_line_id=order_line_id,
+                        quantity=1,
+                        delivery_config={
+                            "mode": "fixed_link",
+                            "url": "https://example.test/pre-marker",
+                        },
+                        item_id="item-from-old-card-only-migration",
+                        idempotency_key=idempotency_key,
+                    ),
+                    sender,
+                )
+            )
+
+        assert all(result["verification_required"] is True for result in results)
+        assert sender_calls == []
+        assert dispatcher.requests == []
+        assert second_start_events["source_loads"] == 0
+        assert second_start.conn.execute(
+            "SELECT delivery_meta FROM delivery_finalization_states"
+        ).fetchone()[0] == original_meta
+        assert second_start.conn.execute(
+            "SELECT COUNT(*) FROM card_inventory_reservations"
+        ).fetchone()[0] == 2
+    finally:
+        second_start.close()
+
+
+def test_pre_marker_item_is_confirmed_only_by_independent_exact_evidence(
+    monkeypatch,
+    tmp_path,
+):
+    from card_inventory_service import CardInventoryService
+    from db_manager import DBManager
+    from delivery_orchestration_service import (
+        DeliveryOrchestrationRequest,
+        DeliveryOrchestrationService,
+    )
+    from test_delivery_quantity_contract import FakeDispatcher
+
+    database_path = tmp_path / "pre-marker-exact-confirmation.sqlite3"
+    connection = sqlite3.connect(database_path)
+    _create_legacy_delivery_tables(connection)
+    _add_pre_marker_send_state_columns(connection)
+    order_id, order_line_id, idempotency_key = _insert_historical_orchestration(
+        connection,
+        status="failed",
+        suffix="pre-marker-exact",
+        card_id=8,
+        reservation_id="reservation-pre-marker-exact",
+    )
+    connection.execute(
+        """
+        UPDATE delivery_orchestration_states
+        SET item_id = 'item-independently-confirmed'
+        WHERE idempotency_key = ?
+        """,
+        (idempotency_key,),
+    )
+    original_meta = json.dumps(
+        {
+            "configured": True,
+            "idempotency_key": idempotency_key,
+            "audit_note": "independent exact evidence",
+        },
+        separators=(", ", ": "),
+    )
+    connection.execute(
+        """
+        INSERT INTO delivery_finalization_states(
+            order_id, unit_index, cookie_id, item_id, status, delivery_meta
+        ) VALUES (?, 1, 'account-a', 'item-independently-confirmed', 'sent', ?)
+        """,
+        (order_id, original_meta),
+    )
+    connection.commit()
+    connection.close()
+
+    real_migration = DBManager._migrate_delivery_orchestration_send_state
+    migration_events = {"finalization_loads": 0}
+
+    def traced_migration(manager, cursor):
+        def trace(statement):
+            normalized = " ".join(str(statement).split()).upper()
+            if "FROM DELIVERY_FINALIZATION_STATES" in normalized:
+                migration_events["finalization_loads"] += 1
+
+        manager.conn.set_trace_callback(trace)
+        try:
+            return real_migration(manager, cursor)
+        finally:
+            manager.conn.set_trace_callback(None)
+
+    monkeypatch.setattr(
+        DBManager,
+        "_migrate_delivery_orchestration_send_state",
+        traced_migration,
+    )
+    manager = DBManager(str(database_path))
+    try:
+        migrated = manager.conn.execute(
+            """
+            SELECT item_id, verification_required, item_scope_migration_version,
+                   reservation_id
+            FROM delivery_orchestration_states
+            WHERE idempotency_key = ?
+            """,
+            (idempotency_key,),
+        ).fetchone()
+        assert migrated == (
+            "item-independently-confirmed",
+            0,
+            1,
+            "reservation-pre-marker-exact",
+        )
+        assert migration_events["finalization_loads"] == 1
+        assert manager.conn.execute(
+            "SELECT delivery_meta FROM delivery_finalization_states"
+        ).fetchone()[0] == original_meta
+
+        inventory = CardInventoryService(manager)
+        dispatcher = FakeDispatcher(inventory)
+        service = DeliveryOrchestrationService(manager, inventory, dispatcher)
+        retry = service.prepare_retry(
+            DeliveryOrchestrationRequest(
+                user_id=1,
+                card_id=8,
+                account_id="account-a",
+                order_id=order_id,
+                order_line_id=order_line_id,
+                quantity=1,
+                delivery_config={
+                    "mode": "fixed_link",
+                    "url": "https://example.test/pre-marker",
+                },
+                item_id="item-independently-confirmed",
+                idempotency_key=idempotency_key,
+            )
+        )
+        assert retry["status"] == "sending"
+        assert retry["reservation_id"] == "reservation-pre-marker-exact"
+        assert retry["verification_required"] is False
+        assert manager.conn.execute(
+            "SELECT COUNT(*) FROM card_inventory_reservations"
+        ).fetchone()[0] == 1
+    finally:
+        manager.close()
+
+
+def test_pre_marker_item_conflicting_with_exact_evidence_is_quarantined(
+    tmp_path,
+):
+    from card_inventory_service import CardInventoryService
+    from db_manager import DBManager
+    from delivery_orchestration_service import (
+        DeliveryOrchestrationRequest,
+        DeliveryOrchestrationService,
+    )
+    from test_delivery_quantity_contract import FakeDispatcher
+
+    database_path = tmp_path / "pre-marker-exact-conflict.sqlite3"
+    connection = sqlite3.connect(database_path)
+    _create_legacy_delivery_tables(connection)
+    _add_pre_marker_send_state_columns(connection)
+    order_id, order_line_id, idempotency_key = _insert_historical_orchestration(
+        connection,
+        status="failed",
+        suffix="pre-marker-conflict",
+        card_id=9,
+        reservation_id="reservation-pre-marker-conflict",
+    )
+    connection.execute(
+        """
+        UPDATE delivery_orchestration_states
+        SET item_id = 'item-written-by-old-migration'
+        WHERE idempotency_key = ?
+        """,
+        (idempotency_key,),
+    )
+    connection.execute(
+        """
+        INSERT INTO delivery_finalization_states(
+            order_id, unit_index, cookie_id, item_id, status, delivery_meta
+        ) VALUES (?, 1, 'account-a', 'item-from-exact-owner-evidence', 'sent', ?)
+        """,
+        (
+            order_id,
+            json.dumps(
+                {
+                    "configured": True,
+                    "idempotency_key": idempotency_key,
+                }
+            ),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    manager = DBManager(str(database_path))
+    try:
+        migrated = manager.conn.execute(
+            """
+            SELECT item_id, verification_required, item_scope_migration_version,
+                   reservation_id
+            FROM delivery_orchestration_states
+            WHERE idempotency_key = ?
+            """,
+            (idempotency_key,),
+        ).fetchone()
+        assert migrated == (
+            "item-written-by-old-migration",
+            1,
+            1,
+            "reservation-pre-marker-conflict",
+        )
+
+        inventory = CardInventoryService(manager)
+        dispatcher = FakeDispatcher(inventory)
+        service = DeliveryOrchestrationService(manager, inventory, dispatcher)
+        sender_calls = []
+        result = service.retry(
+            DeliveryOrchestrationRequest(
+                user_id=1,
+                card_id=9,
+                account_id="account-a",
+                order_id=order_id,
+                order_line_id=order_line_id,
+                quantity=1,
+                delivery_config={
+                    "mode": "fixed_link",
+                    "url": "https://example.test/pre-marker",
+                },
+                item_id="item-written-by-old-migration",
+                idempotency_key=idempotency_key,
+            ),
+            lambda contents, request: sender_calls.append((contents, request)),
+        )
+        assert result["verification_required"] is True
+        assert sender_calls == []
+        assert dispatcher.requests == []
+        assert manager.conn.execute(
+            "SELECT COUNT(*) FROM card_inventory_reservations"
+        ).fetchone()[0] == 1
+    finally:
+        manager.close()
 
 
 def test_send_state_migration_rolls_back_all_columns_on_failure(
