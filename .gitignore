@@ -820,6 +820,7 @@ secure_confirm_ultra.py
 secure_freeshipping_ultra.py
 test_php_stats.py
 .playwright-browsers/
+.worktrees/
 
 # Keep the republish store regression test under version control.
 !tests/test_republish_store.py
