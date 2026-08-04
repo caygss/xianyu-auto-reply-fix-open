@@ -747,6 +747,7 @@ class DBManager:
                 reservation_id TEXT,
                 claim_token TEXT,
                 claimed_at TIMESTAMP,
+                terminal_claim_token TEXT,
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'paused', 'reserved', 'sending', 'sent', 'failed')),
                 result_meta TEXT NOT NULL DEFAULT '{}',
@@ -6118,13 +6119,23 @@ Cookie数量: {cookie_count}
             expected = 1
 
         states = self.get_delivery_finalization_states(order_id)
-        state_by_unit = {}
-        for state in states:
+
+        def _state_unit_index(state):
             try:
-                unit_index = max(1, int(state.get('unit_index') or 1))
+                return max(1, int(state.get('unit_index') or 1))
             except (TypeError, ValueError):
-                unit_index = 1
-            state_by_unit[unit_index] = state
+                return 1
+
+        states = sorted(
+            states,
+            key=lambda state: (
+                _state_unit_index(state),
+                int(state.get('id') or 0),
+            ),
+        )
+        explicit_state_by_unit = {}
+        for state in states:
+            explicit_state_by_unit.setdefault(_state_unit_index(state), state)
 
         def _metadata_integer(value):
             if isinstance(value, bool):
@@ -6135,28 +6146,52 @@ Cookie数量: {cookie_count}
                 return int(value.strip())
             return None
 
-        sent_batch_anchor_by_unit = {}
-        for unit_index, state in list(state_by_unit.items()):
+        coverage_by_state = []
+        contributors_by_unit = {}
+        for unit_index, state in explicit_state_by_unit.items():
             status = state.get('status')
             delivery_meta = state.get('delivery_meta') or {}
+            coverage = {unit_index}
+            batch_anchor = None
             if (
-                status not in {'sent', 'finalized'}
-                or not isinstance(delivery_meta, dict)
-                or delivery_meta.get('configured') is not True
+                status in {'sent', 'finalized'}
+                and isinstance(delivery_meta, dict)
+                and delivery_meta.get('configured') is True
             ):
-                continue
-            anchor = _metadata_integer(delivery_meta.get('delivery_unit_index'))
-            quantity = _metadata_integer(delivery_meta.get('quantity'))
-            if anchor != unit_index or quantity is None:
-                continue
-            if quantity < 1 or anchor < 1 or anchor + quantity - 1 > expected:
-                quantity = 1
-            if quantity == 1:
-                continue
-            for covered_unit_index in range(anchor, anchor + quantity):
+                anchor = _metadata_integer(delivery_meta.get('delivery_unit_index'))
+                quantity = _metadata_integer(delivery_meta.get('quantity'))
+                if anchor == unit_index and quantity is not None:
+                    if quantity < 1 or anchor < 1 or anchor + quantity - 1 > expected:
+                        quantity = 1
+                    if quantity > 1:
+                        batch_anchor = anchor
+                        coverage = set(range(anchor, anchor + quantity))
+            coverage_by_state.append((state, coverage, batch_anchor))
+            for covered_unit_index in coverage:
+                contributors_by_unit.setdefault(covered_unit_index, []).append(state)
+
+        conflict_unit_indexes = sorted(
+            unit_index
+            for unit_index, contributors in contributors_by_unit.items()
+            if 1 <= unit_index <= expected and len(contributors) > 1
+        )
+        state_by_unit = dict(explicit_state_by_unit)
+        sent_batch_anchor_by_unit = {}
+        for state, coverage, batch_anchor in coverage_by_state:
+            for covered_unit_index in coverage:
+                if covered_unit_index in explicit_state_by_unit:
+                    if (
+                        batch_anchor is not None
+                        and covered_unit_index == batch_anchor
+                        and state.get('status') == 'sent'
+                    ):
+                        sent_batch_anchor_by_unit[covered_unit_index] = batch_anchor
+                    continue
+                if len(contributors_by_unit.get(covered_unit_index, ())) != 1:
+                    continue
                 state_by_unit[covered_unit_index] = state
-                if status == 'sent':
-                    sent_batch_anchor_by_unit[covered_unit_index] = anchor
+                if batch_anchor is not None and state.get('status') == 'sent':
+                    sent_batch_anchor_by_unit[covered_unit_index] = batch_anchor
 
         finalized_unit_indexes = []
         pending_finalize_unit_indexes = []
@@ -6177,7 +6212,9 @@ Cookie数量: {cookie_count}
             else:
                 remaining_unit_indexes.append(unit_index)
 
-        if pending_finalize_count:
+        if conflict_unit_indexes:
+            aggregate_status = 'conflict'
+        elif pending_finalize_count:
             aggregate_status = 'partial_pending_finalize'
         elif len(finalized_unit_indexes) >= expected:
             aggregate_status = 'shipped'
@@ -6196,6 +6233,8 @@ Cookie数量: {cookie_count}
             'finalized_unit_indexes': finalized_unit_indexes,
             'pending_finalize_unit_indexes': pending_finalize_unit_indexes,
             'remaining_unit_indexes': remaining_unit_indexes,
+            'coverage_conflict': bool(conflict_unit_indexes),
+            'conflict_unit_indexes': conflict_unit_indexes,
             'aggregate_status': aggregate_status,
             'states': states,
         }

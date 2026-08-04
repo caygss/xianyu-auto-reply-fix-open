@@ -1,6 +1,39 @@
 import sqlite3
 
 
+def test_new_orchestration_table_defines_terminal_claim_token_canonically(
+    monkeypatch,
+    tmp_path,
+):
+    import db_manager as db_manager_module
+
+    statements = []
+    original_connect = db_manager_module.sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(db_manager_module.sqlite3, "connect", traced_connect)
+    manager = db_manager_module.DBManager(str(tmp_path / "canonical.sqlite3"))
+    try:
+        create_statement = next(
+            statement
+            for statement in statements
+            if "CREATE TABLE IF NOT EXISTS delivery_orchestration_states"
+            in statement
+        )
+        assert "terminal_claim_token TEXT" in create_statement
+        assert not any(
+            "ALTER TABLE delivery_orchestration_states" in statement
+            and "terminal_claim_token" in statement
+            for statement in statements
+        )
+    finally:
+        manager.close()
+
+
 def test_delivery_orchestration_state_table_has_scoped_unique_key(tmp_path):
     from db_manager import DBManager
 

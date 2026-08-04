@@ -6,6 +6,7 @@ import re
 import sqlite3
 import threading
 import uuid
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping
 
@@ -546,6 +547,28 @@ class DeliveryOrchestrationService:
             self.db.conn.commit()
         return cursor.rowcount == 1
 
+    @contextmanager
+    def _claim_heartbeat(self, state_id: int, claim_token: str):
+        stop_heartbeat = threading.Event()
+        interval = max(0.1, min(self.claim_lease_seconds / 3.0, 30.0))
+
+        def renew_claim_while_active():
+            while not stop_heartbeat.wait(interval):
+                if not self._renew_claim(state_id, claim_token):
+                    return
+
+        heartbeat = threading.Thread(
+            target=renew_claim_while_active,
+            name=f"delivery-claim-heartbeat-{state_id}",
+            daemon=True,
+        )
+        heartbeat.start()
+        try:
+            yield
+        finally:
+            stop_heartbeat.set()
+            heartbeat.join()
+
     def _claim_lost_result(self, request):
         current = self._get_state(request)
         if current and current["status"] == "sending":
@@ -581,82 +604,83 @@ class DeliveryOrchestrationService:
             if current and current["status"] == "sending":
                 return self._result(current, status_override="in_progress")
             return self._result(current or state)
-        state = self._get_state(request)
-        mode = request.delivery_config["mode"]
-        reservation_id = state.get("reservation_id")
-        if mode in CARD_MODES and not reservation_id:
-            try:
-                reservation = self.inventory.reserve_items(
-                    request.card_id,
-                    request.user_id,
-                    request.account_id,
-                    request.order_id,
-                    request.quantity,
-                    idempotency_key=request.idempotency_key,
-                    order_line_id=request.order_line_id,
-                )
-                reservation_id = reservation["reservation_id"]
-                if not self._transition_claim(
-                    state["id"], claim_token, status="sending",
-                    reservation_id=reservation_id,
-                ):
-                    return self._claim_lost_result(request)
-                state = self._get_state(request)
-            except CardInventoryError as exc:
-                code, message, _, details = self._error_info(exc, "inventory")
-                available = details.get("available")
-                shortage = (
-                    max(request.quantity - int(available), 0)
-                    if available is not None
-                    else request.quantity
-                )
-                if not self._transition_claim(
-                    state["id"], claim_token, status="paused",
-                    error_code=code, error=message, clear_claim=True,
-                    result_meta={
-                        "available": available,
-                        "requested": request.quantity,
-                        "shortage": shortage,
-                    },
-                ):
-                    return self._claim_lost_result(request)
-                return self._result(self._get_state(request))
+        with self._claim_heartbeat(state["id"], claim_token):
+            state = self._get_state(request)
+            mode = request.delivery_config["mode"]
+            reservation_id = state.get("reservation_id")
+            if mode in CARD_MODES and not reservation_id:
+                try:
+                    reservation = self.inventory.reserve_items(
+                        request.card_id,
+                        request.user_id,
+                        request.account_id,
+                        request.order_id,
+                        request.quantity,
+                        idempotency_key=request.idempotency_key,
+                        order_line_id=request.order_line_id,
+                    )
+                    reservation_id = reservation["reservation_id"]
+                    if not self._transition_claim(
+                        state["id"], claim_token, status="sending",
+                        reservation_id=reservation_id,
+                    ):
+                        return self._claim_lost_result(request)
+                    state = self._get_state(request)
+                except CardInventoryError as exc:
+                    code, message, _, details = self._error_info(exc, "inventory")
+                    available = details.get("available")
+                    shortage = (
+                        max(request.quantity - int(available), 0)
+                        if available is not None
+                        else request.quantity
+                    )
+                    if not self._transition_claim(
+                        state["id"], claim_token, status="paused",
+                        error_code=code, error=message, clear_claim=True,
+                        result_meta={
+                            "available": available,
+                            "requested": request.quantity,
+                            "shortage": shortage,
+                        },
+                    ):
+                        return self._claim_lost_result(request)
+                    return self._result(self._get_state(request))
 
-        delivery_request = DeliveryRequest(
-            user_id=request.user_id,
-            card_id=request.card_id,
-            account_id=request.account_id,
-            order_id=request.order_id,
-            reservation_id=reservation_id,
-            context=request.context,
-            mode=mode,
-            quantity=request.quantity,
-            idempotency_key=request.idempotency_key,
-            order_line_id=request.order_line_id,
-            item_id=request.item_id,
-            delivery_config=request.delivery_config,
-        )
-        try:
-            prepared = self.dispatcher.prepare(delivery_request)
-            contents = self._contents(prepared, mode, request.quantity)
-        except Exception as exc:
+            delivery_request = DeliveryRequest(
+                user_id=request.user_id,
+                card_id=request.card_id,
+                account_id=request.account_id,
+                order_id=request.order_id,
+                reservation_id=reservation_id,
+                context=request.context,
+                mode=mode,
+                quantity=request.quantity,
+                idempotency_key=request.idempotency_key,
+                order_line_id=request.order_line_id,
+                item_id=request.item_id,
+                delivery_config=request.delivery_config,
+            )
             try:
-                return self.mark_failed(request, claim_token, exc)
-            except DeliveryOrchestrationError as mark_error:
-                if mark_error.code != "claim_token_mismatch":
-                    raise
+                prepared = self.dispatcher.prepare(delivery_request)
+                contents = self._contents(prepared, mode, request.quantity)
+            except Exception as exc:
+                try:
+                    return self.mark_failed(request, claim_token, exc)
+                except DeliveryOrchestrationError as mark_error:
+                    if mark_error.code != "claim_token_mismatch":
+                        raise
+                    return self._claim_lost_result(request)
+
+            if not self._transition_claim(
+                state["id"], claim_token, status="sending", reservation_id=reservation_id,
+                result_meta={"content_count": len(contents), "technical_category": "delivery"},
+                error_code=None, error=None,
+            ):
                 return self._claim_lost_result(request)
-
-        if not self._transition_claim(
-            state["id"], claim_token, status="sending", reservation_id=reservation_id,
-            result_meta={"content_count": len(contents), "technical_category": "delivery"},
-            error_code=None, error=None,
-        ):
-            return self._claim_lost_result(request)
-        return self._result(
-            self._get_state(request), contents=contents, request=request, claimed=True,
-            claim_token=claim_token,
-        )
+            return self._result(
+                self._get_state(request), contents=contents, request=request, claimed=True,
+                claim_token=claim_token,
+            )
 
     def prepare(self, request: DeliveryOrchestrationRequest):
         return self._prepare(request)
@@ -764,34 +788,21 @@ class DeliveryOrchestrationService:
         return self._renew_claim(state["id"], token)
 
     def _sender_result(self, sender: Callable, contents, request, claim_token=None):
-        stop_heartbeat = threading.Event()
-        heartbeat = None
+        heartbeat_state_id = None
         if claim_token:
             state = self._get_state(request)
             if not state:
                 raise DeliveryOrchestrationError(
                     "claim_state_missing", "交付 claim 状态不存在", "concurrency"
                 )
-            interval = max(0.1, min(self.claim_lease_seconds / 3.0, 30.0))
-
-            def renew_while_sending():
-                while not stop_heartbeat.wait(interval):
-                    if not self._renew_claim(state["id"], claim_token):
-                        return
-
-            heartbeat = threading.Thread(target=renew_while_sending, daemon=True)
-            heartbeat.start()
-        try:
+            heartbeat_state_id = state["id"]
+        with self._claim_heartbeat(heartbeat_state_id, claim_token) if claim_token else nullcontext():
             result = sender(contents, request)
             if inspect.isawaitable(result):
                 raise DeliveryOrchestrationError("async_sender_required", "异步发送器请使用异步编排入口")
             if result is False:
                 raise DeliveryOrchestrationError("send_failed", "交付消息发送失败", "sender")
             return result
-        finally:
-            stop_heartbeat.set()
-            if heartbeat:
-                heartbeat.join(timeout=1)
 
     def orchestrate(self, request: DeliveryOrchestrationRequest, sender: Callable):
         normalized = self._normalize_request(request)

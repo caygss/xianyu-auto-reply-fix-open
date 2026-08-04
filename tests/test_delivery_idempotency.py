@@ -722,3 +722,76 @@ def test_active_sender_renews_claim_lease_and_cannot_be_reclaimed(services):
     assert second["status"] == "in_progress"
     assert second_sender.calls == []
     assert first["status"] == "sent"
+
+
+def test_active_prepare_renews_claim_lease_and_cannot_be_reclaimed(
+    monkeypatch,
+    services,
+):
+    service, _, dispatcher, _ = services
+    service.claim_lease_seconds = 1
+    request = make_request(1, order_line_id="line-prepare-heartbeat")
+    prepare_started = threading.Event()
+    release_prepare = threading.Event()
+    original_prepare = dispatcher.prepare
+    prepare_calls = []
+
+    def slow_first_prepare(delivery_request):
+        prepare_calls.append(delivery_request)
+        if len(prepare_calls) == 1:
+            prepare_started.set()
+            assert release_prepare.wait(5)
+        return original_prepare(delivery_request)
+
+    monkeypatch.setattr(dispatcher, "prepare", slow_first_prepare)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first_future = executor.submit(service.prepare, request)
+        assert prepare_started.wait(5)
+        time.sleep(1.25)
+
+        second = service.prepare_retry(request)
+
+        release_prepare.set()
+        first = first_future.result(timeout=5)
+
+    assert second["status"] == "in_progress"
+    assert second["state"] == "sending"
+    assert "claimed" not in second
+    assert first["status"] == "sending"
+    assert len(prepare_calls) == 1
+    assert not any(
+        thread.name.startswith("delivery-claim-heartbeat-")
+        for thread in threading.enumerate()
+    )
+
+
+def test_prepare_exception_stops_claim_heartbeat(monkeypatch, services):
+    service, _, dispatcher, _ = services
+    service.claim_lease_seconds = 1
+    request = make_request(1, order_line_id="line-prepare-heartbeat-error")
+    prepare_started = threading.Event()
+    release_prepare = threading.Event()
+
+    def failing_prepare(delivery_request):
+        prepare_started.set()
+        assert release_prepare.wait(5)
+        raise RuntimeError("prepare failed")
+
+    monkeypatch.setattr(dispatcher, "prepare", failing_prepare)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(service.prepare, request)
+        assert prepare_started.wait(5)
+        assert any(
+            thread.name.startswith("delivery-claim-heartbeat-")
+            for thread in threading.enumerate()
+        )
+        release_prepare.set()
+        result = future.result(timeout=5)
+
+    assert result["status"] == "failed"
+    assert not any(
+        thread.name.startswith("delivery-claim-heartbeat-")
+        for thread in threading.enumerate()
+    )
