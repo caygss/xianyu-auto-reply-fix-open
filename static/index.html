@@ -1131,6 +1131,12 @@
                   </div>
                 </div>
 
+                <div id="deliveryCurrentItemIdentity" class="delivery-config-current-item" role="status" aria-live="polite" data-ready="false">
+                  <span id="deliveryCurrentAccountIdentity">账号：未选择</span>
+                  <span id="deliveryCurrentTitleIdentity">商品：未选择</span>
+                  <span id="deliveryCurrentIdIdentity">商品 ID：未选择</span>
+                </div>
+
                 <label for="deliveryMethodSelect">交付方式</label>
                 <select id="deliveryMethodSelect" name="delivery_method">
                   <option value="fixed_link">固定内容/网盘链接</option>
@@ -5335,7 +5341,8 @@
 
   <!-- JS依赖 -->
   <script src="/static/lib/bootstrap/bootstrap.bundle.min.js"></script>
-  <script src="/static/js/app.js?v=1.2.9"></script>
+  <script src="/static/js/delivery-config-session.js?v=1"></script>
+  <script src="/static/js/app.js?v=1.2.10"></script>
 
   <!-- 默认回复管理模态框 -->
   <div class="modal fade" id="defaultReplyModal" tabindex="-1" aria-labelledby="defaultReplyModalLabel" aria-hidden="true">

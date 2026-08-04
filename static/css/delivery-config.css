@@ -154,6 +154,25 @@
   margin-bottom: 14px;
 }
 
+.delivery-config-current-item {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: 0 0 14px;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.delivery-config-current-item[data-ready="true"] {
+  color: var(--text-color);
+  font-weight: 600;
+}
+
+.delivery-config-panel[aria-busy="true"] {
+  cursor: progress;
+}
+
 .delivery-config-section > label,
 .delivery-config-method-card label,
 .delivery-config-form-grid label {

@@ -629,6 +629,10 @@ const LOADING_SHOW_DELAY = 120;
 function showSection(sectionName) {
     console.log('切换到页面:', sectionName); // 调试信息
 
+    if (sectionName !== 'items') {
+        cancelDeliveryConfigLoadForLifecycle();
+    }
+
     // 获取并校验目标内容区域
     const targetSection = document.getElementById(sectionName + '-section');
     if (!targetSection) {
@@ -12854,7 +12858,11 @@ async function checkRepublishNow(templateId) {
 const DELIVERY_UI_STATE_KEY = 'deliveryConfigUiState';
 const DELIVERY_DEFAULT_CONTENT_KEY = 'deliveryDefaultContent';
 const DELIVERY_CARD_BATCH_NOTES_KEY = 'deliveryCardBatchNotes';
+const deliveryConfigSession =
+    DeliveryConfigSession.createDeliveryConfigSessionCoordinator();
 let deliveryConfigContext = null;
+let deliveryLoadUiOwner = null;
+let deliveryConfigReady = false;
 
 function readDeliveryConfigUiState() {
     try {
@@ -12881,9 +12889,9 @@ function readDeliveryCardBatchNotes() {
     }
 }
 
-function restoreDeliveryCardBatchNote() {
+function restoreDeliveryCardBatchNote(context = deliveryConfigContext) {
     const input = document.getElementById('cardGeneratorBatch');
-    const key = deliveryCardBatchNoteKey();
+    const key = deliveryCardBatchNoteKey(context);
     if (input) input.value = key ? (readDeliveryCardBatchNotes()[key] || '') : '';
 }
 
@@ -12939,16 +12947,68 @@ function setDeliveryConfigStatus(message, type = 'info') {
     status.dataset.status = type;
 }
 
-function setDeliveryConfigBusy(busy) {
-    const panel = document.getElementById('deliveryConfigPanel');
-    panel?.setAttribute('aria-busy', String(busy));
+function setDeliveryConfigWriteControlsDisabled(disabled) {
     [
         'deliveryConfigSaveButton', 'deliveryConfigDeleteButton', 'cardImportButton',
         'cardGenerateButton', 'cardReplenishButton', 'cardContinueButton'
     ].forEach(id => {
         const button = document.getElementById(id);
-        if (button) button.disabled = busy;
+        if (button) button.disabled = disabled;
     });
+}
+
+function setDeliveryConfigBusy(busy) {
+    const panel = document.getElementById('deliveryConfigPanel');
+    panel?.setAttribute('aria-busy', String(busy));
+    setDeliveryConfigWriteControlsDisabled(busy || !deliveryConfigReady);
+}
+
+function setDeliveryLoadBusy(operation, busy) {
+    const panel = document.getElementById('deliveryConfigPanel');
+    if (busy) {
+        if (!operation.isCurrent()) return false;
+        deliveryLoadUiOwner = operation;
+        panel?.setAttribute('aria-busy', 'true');
+        setDeliveryConfigWriteControlsDisabled(true);
+        return true;
+    }
+    if (deliveryLoadUiOwner !== operation) return false;
+    deliveryLoadUiOwner = null;
+    panel?.setAttribute('aria-busy', 'false');
+    setDeliveryConfigWriteControlsDisabled(!deliveryConfigReady);
+    return true;
+}
+
+function deliveryCurrentItemLabel(selection) {
+    return selection.itemTitle || selection.itemId;
+}
+
+function renderDeliveryCurrentItemIdentity(selection, ready = false) {
+    const region = document.getElementById('deliveryCurrentItemIdentity');
+    const account = document.getElementById('deliveryCurrentAccountIdentity');
+    const title = document.getElementById('deliveryCurrentTitleIdentity');
+    const item = document.getElementById('deliveryCurrentIdIdentity');
+    if (region) region.setAttribute('data-ready', String(ready));
+    if (account) account.textContent = `账号：${selection?.accountId || '未选择'}`;
+    if (title) title.textContent = `商品：${deliveryCurrentItemLabel(selection || { itemId: '未选择', itemTitle: '' })}`;
+    if (item) item.textContent = `商品 ID：${selection?.itemId || '未选择'}`;
+}
+
+function clearDeliveryConfigLoadValues() {
+    applyDeliveryConfig(null);
+    [
+        'inventoryStockCeiling', 'inventoryLowStockThreshold', 'cardGeneratorPrefix',
+        'cardGeneratorLength', 'cardGeneratorCharset', 'cardGeneratorBatch',
+        'cardGenerateQuantity', 'cardImportInput', 'providerTimeoutSeconds',
+        'providerMaxRetries'
+    ].forEach(id => {
+        const input = document.getElementById(id);
+        if (input) input.value = '';
+    });
+    const autoReplenish = document.getElementById('inventoryAutoReplenish');
+    if (autoReplenish) autoReplenish.checked = false;
+    renderInventorySummary({});
+    renderInventoryPreview([]);
 }
 
 function deliveryConfigErrorMessage(payload, fallback = '请求失败，请稍后重试') {
@@ -12975,9 +13035,9 @@ async function deliveryConfigFetch(path, options = {}) {
     return payload;
 }
 
-async function deliveryConfigFetchOptional(path) {
+async function deliveryConfigFetchOptional(path, options = {}) {
     try {
-        return await deliveryConfigFetch(path);
+        return await deliveryConfigFetch(path, options);
     } catch (error) {
         if (error.status === 404) return null;
         throw error;
@@ -13083,35 +13143,91 @@ async function openDeliveryConfigForItem(accountId, itemId, itemTitle) {
         setDeliveryConfigStatus('商品信息无效，无法打开交付配置', 'error');
         return;
     }
-    setDeliveryConfigBusy(true);
-    setDeliveryConfigStatus('正在准备当前商品的交付配置…');
+    accountId = normalizedAccountId;
+    itemId = normalizedItemId;
+    const selection = Object.freeze({
+        accountId: normalizedAccountId,
+        itemId: normalizedItemId,
+        itemTitle: String(itemTitle || '').trim()
+    });
+    const started = deliveryConfigSession.beginLoad(selection);
+    if (!started.accepted) {
+        const target = deliveryCurrentItemLabel(started.context);
+        setDeliveryConfigStatus(`商品“${target}”的交付配置正在保存，需完成后才能切换。`, 'error');
+        return;
+    }
+    const operation = started.operation;
+    const displayName = deliveryCurrentItemLabel(operation.selection);
+    let loadSucceeded = false;
+    deliveryConfigContext = null;
+    deliveryConfigReady = false;
+    openDeliveryConfigPanel();
+    renderDeliveryCurrentItemIdentity(operation.selection, false);
+    clearDeliveryConfigLoadValues();
+    setDeliveryLoadBusy(operation, true);
+    setDeliveryConfigStatus(`正在加载“${displayName}”的交付配置…`);
+    document.getElementById('deliveryConfigPanel')?.scrollIntoView({ behavior: 'auto', block: 'start' });
     try {
         const resolved = await deliveryConfigFetch(
             `/api/items/${encodeURIComponent(itemId)}/delivery-card?account_id=${encodeURIComponent(accountId)}`,
-            { method: 'POST' }
+            { method: 'POST', signal: operation.signal }
         );
+        if (!operation.isCurrent()) return;
         const cardId = resolved.card_id;
-        deliveryConfigContext = { accountId: normalizedAccountId, itemId: normalizedItemId, itemTitle: String(itemTitle || ''), cardId };
-        restoreDeliveryCardBatchNote();
-        openDeliveryConfigPanel();
-        document.getElementById('deliveryConfigPanel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        const context = deliveryConfigSession.commitLoad(operation, cardId);
+        if (!operation.isCurrent() || !context) return;
         const paths = deliveryCardPaths(cardId, normalizedAccountId);
         const [config, settingsPayload, inventoryPayload, previewPayload] = await Promise.all([
-            deliveryConfigFetchOptional(paths.config),
-            deliveryConfigFetch(paths.settings),
-            deliveryConfigFetch(paths.inventory),
-            deliveryConfigFetch(paths.preview)
+            deliveryConfigFetchOptional(paths.config, { signal: operation.signal }),
+            deliveryConfigFetch(paths.settings, { signal: operation.signal }),
+            deliveryConfigFetch(paths.inventory, { signal: operation.signal }),
+            deliveryConfigFetch(paths.preview, { signal: operation.signal })
         ]);
+        if (!operation.isCurrent()) return;
         applyDeliveryConfig(config);
+        if (!operation.isCurrent()) return;
         applyInventorySettings(settingsPayload?.settings || {});
+        if (!operation.isCurrent()) return;
         renderInventorySummary(inventoryPayload?.inventory || {});
+        if (!operation.isCurrent()) return;
         renderInventoryPreview(previewPayload?.items || []);
-        setDeliveryConfigStatus(config ? `已加载“${itemTitle || '当前商品'}”的交付配置` : `请为“${itemTitle || '当前商品'}”选择交付方式`);
+        if (!operation.isCurrent()) return;
+        deliveryConfigContext = context;
+        deliveryConfigReady = true;
+        renderDeliveryCurrentItemIdentity(operation.selection, true);
+        restoreDeliveryCardBatchNote(context);
+        setDeliveryConfigStatus(config ? `已加载“${displayName}”的交付配置，请确认后点击保存。` : `请为“${displayName}”选择交付方式，然后点击保存。`);
+        loadSucceeded = true;
     } catch (error) {
-        setDeliveryConfigStatus(`打开交付配置失败：${error.message}`, 'error');
+        if (!operation.isCurrent() || error?.name === 'AbortError') return;
+        deliveryConfigContext = null;
+        deliveryConfigReady = false;
+        renderDeliveryCurrentItemIdentity(operation.selection, false);
+        clearDeliveryConfigLoadValues();
+        setDeliveryConfigBusy(true);
+        setDeliveryConfigStatus(`“${displayName}”加载失败，请重新点击商品列表中的“设置交付方式”。`, 'error');
     } finally {
-        setDeliveryConfigBusy(false);
+        if (operation.isCurrent()) {
+            if (loadSucceeded) {
+                deliveryConfigSession.finishLoad(operation);
+            } else {
+                deliveryConfigSession.failLoad(operation);
+            }
+            deliveryConfigContext = deliveryConfigSession.getActiveContext();
+            setDeliveryLoadBusy(operation, false);
+        }
     }
+}
+
+function cancelDeliveryConfigLoadForLifecycle() {
+    const operation = deliveryConfigSession.getActiveLoad();
+    if (!operation) return false;
+    const cancelled = deliveryConfigSession.cancelLoad();
+    if (!cancelled) return false;
+    deliveryConfigContext = null;
+    deliveryConfigReady = false;
+    setDeliveryLoadBusy(operation, false);
+    return true;
 }
 
 function parseAdvancedJson(elementId) {
@@ -13329,6 +13445,7 @@ async function continueDeliveryProcessing() {
 }
 
 function initDeliveryConfigUi() {
+    cancelDeliveryConfigLoadForLifecycle();
     const state = readDeliveryConfigUiState();
     const prompt = document.getElementById('deliveryConfigPrompt');
     if (prompt) prompt.hidden = Boolean(state.promptClosed);
