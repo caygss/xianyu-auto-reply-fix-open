@@ -15898,7 +15898,7 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 for prepared_unit in group_units:
                     unit_index = prepared_unit.get('unit_index') or 1
                     rule_meta = prepared_unit.get('rule_meta') or {}
-                    xianyu_instance._mark_configured_delivery_failed(
+                    await xianyu_instance._mark_configured_delivery_failed(
                         rule_meta,
                         send_error,
                         order_id=order_id,
