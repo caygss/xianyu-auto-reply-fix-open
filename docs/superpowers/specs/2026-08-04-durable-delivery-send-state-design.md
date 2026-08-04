@@ -6,11 +6,12 @@ Prevent bound deliveries from being automatically resent or falsely finalized wh
 
 ## State model
 
-`delivery_orchestration_states` gains three durable fields:
+`delivery_orchestration_states` gains four durable fields:
 
 - `item_id`: the trusted item scope captured when the orchestration row is created.
 - `send_started_at`: written atomically before invoking an external sender. A non-null value permanently excludes the row from stale claim reclamation until a terminal transition explicitly clears it.
 - `verification_required`: set with the durable pre-send barrier and kept until successful completion or a confirmed sender failure. Such rows require human verification and cannot be automatically resent, marked sent, platform-confirmed, or finalized while the outcome remains unknown.
+- `item_scope_migration_version`: records completion of historical item-scope resolution. Canonical rows start at the current version; upgraded rows start at zero and are processed once.
 
 The existing `status='sending'` remains the active claim state. This avoids rebuilding the status CHECK constraint and keeps historical status consumers compatible.
 
@@ -42,15 +43,24 @@ User-facing dispositions and reasons use token-free Chinese text such as “发�
 
 ## Migration
 
-The canonical table definition includes all three fields. Existing databases add missing columns inside the existing `init_db` transaction. Historical uncertain finalization metadata is parsed in Python and updates matching orchestration rows before the transaction commits. Migration failures roll back initialization.
+The canonical table definition includes all four fields. Existing databases add missing columns inside the existing `init_db` transaction. Historical uncertain finalization metadata is parsed in Python and updates matching orchestration rows before the transaction commits. Migration failures roll back initialization.
 
-For ordinary historical rows with no `item_id`, migration uses only persisted scope evidence. An order item matched by `(order_id, account_id)` and an exactly scoped finalization anchor are order-level evidence; disagreement is a conflict. Only when no order-level evidence exists may a unique `(user_id, account_id, card_id)` binding supply the item. The schema has no persisted orchestration request payload, and `order_line_id` is not treated as an item identifier. Unique evidence backfills the item for `failed`, `paused`, and `sent`; historical `sending` is still quarantined because the old row cannot prove whether its sender completed. Missing or conflicting evidence retains the reservation, writes a token-free Chinese verification reason, and marks related finalization anchors so recovery cannot confirm or finalize them automatically.
+For ordinary historical rows with no `item_id`, migration uses only persisted scope evidence. It loads states, finalization anchors, orders, and bindings once and builds indexes by account/order, idempotency key, complete card/line scope, and binding scope. A finalization anchor belongs to a state only when the anchor's own account/order matches and either its idempotency key uniquely identifies that state or its metadata contains both `card_id` and `order_line_id` and uniquely maps to one state. Metadata cannot override the anchor's account/order ownership. Missing line scope, partial scope, cross-owner keys, multiple candidates, and conflicting item evidence are never accepted.
+
+Exact evidence is locked before ambiguous anchors are considered. A normally resolved sibling cannot later be quarantined by another partial anchor. Ambiguous anchors may quarantine only unresolved candidate states in the anchor's own account/order; when candidate ownership is not reliable, only each already-pending orchestration row fails closed. Finalization metadata is changed only for one uniquely owned anchor, by merging token-free verification fields while preserving all original fields. Ambiguous anchor metadata is left byte-for-byte unchanged.
+
+An order item matched by `(order_id, account_id)` and one uniquely owned finalization anchor are order-level evidence; disagreement is a conflict. Only when no order-level evidence exists may a unique `(user_id, account_id, card_id)` binding supply the item. The schema has no persisted orchestration request payload, and `order_line_id` is not treated as an item identifier. Unique evidence backfills the item for `failed`, `paused`, and `sent`; historical `sending` is still quarantined because the old row cannot prove whether its sender completed. Missing or conflicting evidence retains the reservation and writes a token-free Chinese verification reason.
+
+Every processed row advances `item_scope_migration_version`, including isolated rows whose `item_id` remains null. A partial index selects only old-version rows. If no such row exists on a later startup, migration does not load finalization anchors, orders, or bindings. The marker column, partial index, data changes, and schema upgrades remain inside the existing atomic savepoint.
 
 ## Tests
 
 Tests use real SQLite state and only mock external sender or injected storage failures. Required coverage includes:
 
 - canonical and legacy schema migration;
+- exact finalization ownership, cross-account rejection, complete-scope uniqueness, and ambiguous metadata preservation;
+- sibling isolation across two database startups;
+- 10,000-row migration with marker-based second-startup short circuit and bounded query count;
 - trusted historical item backfill for failed/paused/sent and safe quarantine for sending;
 - unresolved/conflicting historical item scope, reservation retention, and finalization blocking;
 - service-owned `orchestrate()`/`retry()` begin-send coverage including ordinary failure and `BaseException` interruption;

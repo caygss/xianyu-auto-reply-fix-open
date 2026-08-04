@@ -10,6 +10,7 @@ import re
 import aiohttp
 import io
 import base64
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
@@ -18,6 +19,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from loguru import logger
 
 ITEM_DELIVERY_BINDING_MARKER = "[system:item-delivery-binding]"
+DELIVERY_ITEM_SCOPE_MIGRATION_VERSION = 1
 
 
 class _CardsTableMigrationError(RuntimeError):
@@ -297,13 +299,63 @@ class DBManager:
             "item_id": "TEXT",
             "send_started_at": "TIMESTAMP",
             "verification_required": "INTEGER NOT NULL DEFAULT 0",
+            "item_scope_migration_version": "INTEGER NOT NULL DEFAULT 1",
         }
+        marker_added = "item_scope_migration_version" not in columns
         for column_name, definition in column_definitions.items():
             if column_name not in columns:
                 cursor.execute(
                     f"ALTER TABLE delivery_orchestration_states "
                     f"ADD COLUMN {column_name} {definition}"
                 )
+        if marker_added:
+            cursor.execute(
+                """
+                UPDATE delivery_orchestration_states
+                SET item_scope_migration_version = 0
+                """
+            )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                idx_delivery_orchestration_item_scope_migration
+            ON delivery_orchestration_states(item_scope_migration_version)
+            WHERE item_scope_migration_version < 1
+            """
+        )
+
+        pending_migration = cursor.execute(
+            """
+            SELECT 1 FROM delivery_orchestration_states
+            WHERE item_scope_migration_version < 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if pending_migration is None:
+            return
+        cursor.execute(
+            """
+            UPDATE delivery_orchestration_states
+            SET item_scope_migration_version = 1
+            WHERE item_scope_migration_version < 1
+              AND (
+                  (item_id IS NOT NULL AND TRIM(item_id) != '')
+                  OR verification_required = 1
+              )
+            """
+        )
+        pending_migration = cursor.execute(
+            """
+            SELECT 1 FROM delivery_orchestration_states
+            WHERE item_scope_migration_version < 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if pending_migration is None:
+            return
+
+        def normalized_text(value):
+            return str(value or "").strip()
 
         def parse_metadata(raw):
             try:
@@ -312,226 +364,252 @@ class DBManager:
                 return {}
             return value if isinstance(value, dict) else {}
 
-        finalization_rows = []
+        states = []
+        states_by_idempotency = defaultdict(list)
+        states_by_complete_scope = defaultdict(list)
+        for row in cursor.execute(
+            """
+            SELECT id, user_id, card_id, account_id, order_id, order_line_id,
+                   idempotency_key, status, item_id, verification_required,
+                   item_scope_migration_version
+            FROM delivery_orchestration_states
+            """
+        ).fetchall():
+            state = {
+                "id": row[0],
+                "user_id": int(row[1]),
+                "card_id": int(row[2]),
+                "account_id": normalized_text(row[3]),
+                "order_id": normalized_text(row[4]),
+                "order_line_id": normalized_text(row[5]),
+                "idempotency_key": normalized_text(row[6]),
+                "status": normalized_text(row[7]),
+                "item_id": normalized_text(row[8]),
+                "verification_required": bool(row[9]),
+                "item_scope_migration_version": int(row[10] or 0),
+            }
+            states.append(state)
+            states_by_idempotency[state["idempotency_key"]].append(state)
+            states_by_complete_scope[
+                (
+                    state["account_id"],
+                    state["order_id"],
+                    str(state["card_id"]),
+                    state["order_line_id"],
+                )
+            ].append(state)
+
+        anchors_by_state_id = defaultdict(list)
         for row in cursor.execute(
             """
             SELECT id, order_id, cookie_id, item_id, delivery_meta
             FROM delivery_finalization_states
             """
         ).fetchall():
-            finalization_rows.append(
-                {
-                    "id": row[0],
-                    "order_id": str(row[1] or "").strip(),
-                    "account_id": str(row[2] or "").strip(),
-                    "item_id": str(row[3] or "").strip(),
-                    "metadata": parse_metadata(row[4]),
-                }
-            )
-
-        explicit_verification_reason = (
-            "历史发货记录要求人工核实，已阻止自动重发、确认和收尾"
-        )
-        for finalization in finalization_rows:
-            metadata = finalization["metadata"]
-            if not metadata.get("claim_verification_required"):
-                continue
-            idempotency_key = str(metadata.get("idempotency_key") or "").strip()
-            if not idempotency_key:
-                continue
-            item_candidates = {
-                value
-                for value in (
-                    finalization["item_id"],
-                    str(metadata.get("item_id") or "").strip(),
-                )
-                if value
+            anchor = {
+                "id": row[0],
+                "order_id": normalized_text(row[1]),
+                "account_id": normalized_text(row[2]),
+                "item_id": normalized_text(row[3]),
+                "metadata": parse_metadata(row[4]),
             }
-            item_id = next(iter(item_candidates)) if len(item_candidates) == 1 else None
+            metadata = anchor["metadata"]
+            metadata_key = normalized_text(metadata.get("idempotency_key"))
+            metadata_card_id = normalized_text(metadata.get("card_id"))
+            metadata_line_id = normalized_text(metadata.get("order_line_id"))
+            owner = None
+            if metadata_key:
+                key_matches = states_by_idempotency.get(metadata_key, [])
+                if len(key_matches) == 1:
+                    candidate = key_matches[0]
+                    if (
+                        candidate["account_id"] == anchor["account_id"]
+                        and candidate["order_id"] == anchor["order_id"]
+                    ):
+                        owner = candidate
+                        if metadata_card_id and metadata_line_id:
+                            scope_matches = states_by_complete_scope.get(
+                                (
+                                    anchor["account_id"],
+                                    anchor["order_id"],
+                                    metadata_card_id,
+                                    metadata_line_id,
+                                ),
+                                [],
+                            )
+                            if (
+                                len(scope_matches) != 1
+                                or scope_matches[0]["id"] != owner["id"]
+                            ):
+                                owner = None
+            elif metadata_card_id and metadata_line_id:
+                scope_matches = states_by_complete_scope.get(
+                    (
+                        anchor["account_id"],
+                        anchor["order_id"],
+                        metadata_card_id,
+                        metadata_line_id,
+                    ),
+                    [],
+                )
+                if len(scope_matches) == 1:
+                    owner = scope_matches[0]
+            if owner is not None:
+                anchors_by_state_id[owner["id"]].append(anchor)
+
+        order_items = defaultdict(set)
+        for account_id, order_id, item_id in cursor.execute(
+            """
+            SELECT cookie_id, order_id, item_id FROM orders
+            WHERE item_id IS NOT NULL AND TRIM(item_id) != ''
+            """
+        ).fetchall():
+            order_items[
+                (normalized_text(account_id), normalized_text(order_id))
+            ].add(normalized_text(item_id))
+
+        binding_items = defaultdict(set)
+        for user_id, account_id, card_id, item_id in cursor.execute(
+            """
+            SELECT user_id, account_id, card_id, item_id
+            FROM item_delivery_bindings
+            WHERE item_id IS NOT NULL AND TRIM(item_id) != ''
+            """
+        ).fetchall():
+            binding_items[
+                (int(user_id), normalized_text(account_id), int(card_id))
+            ].add(normalized_text(item_id))
+
+        target_state_ids = {
+            state["id"]
+            for state in states
+            if state["item_scope_migration_version"]
+            < DELIVERY_ITEM_SCOPE_MIGRATION_VERSION
+        }
+
+        def mark_exact_anchor_for_verification(state_id, reason):
+            exact_anchors = anchors_by_state_id.get(state_id, [])
+            if len(exact_anchors) != 1:
+                return
+            anchor = exact_anchors[0]
+            metadata = dict(anchor["metadata"])
+            metadata["claim_verification_required"] = True
+            metadata["claim_verification_reason"] = reason
             cursor.execute(
                 """
-                UPDATE delivery_orchestration_states
-                SET item_id = COALESCE(NULLIF(item_id, ''), ?),
-                    send_started_at = COALESCE(send_started_at, CURRENT_TIMESTAMP),
-                    verification_required = 1,
-                    last_error_code = 'historical_send_result_unverified',
-                    last_error = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE idempotency_key = ?
+                UPDATE delivery_finalization_states
+                SET delivery_meta = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
                 """,
-                (item_id, explicit_verification_reason, idempotency_key),
+                (
+                    json.dumps(
+                        metadata,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    anchor["id"],
+                ),
             )
 
-        def mark_finalizations_for_verification(order_id, account_id, reason):
-            for finalization in finalization_rows:
-                if (
-                    finalization["order_id"] != order_id
-                    or finalization["account_id"] != account_id
+        for state in states:
+            if state["id"] not in target_state_ids:
+                continue
+            exact_anchors = anchors_by_state_id.get(state["id"], [])
+            anchor_conflict = len(exact_anchors) > 1
+            candidates = set()
+            if state["item_id"]:
+                candidates.add(state["item_id"])
+            candidates.update(
+                order_items.get(
+                    (state["account_id"], state["order_id"]),
+                    set(),
+                )
+            )
+            exact_anchor = exact_anchors[0] if len(exact_anchors) == 1 else None
+            if exact_anchor is not None:
+                for value in (
+                    exact_anchor["item_id"],
+                    normalized_text(exact_anchor["metadata"].get("item_id")),
                 ):
-                    continue
-                metadata = dict(finalization["metadata"])
-                metadata["claim_verification_required"] = True
-                metadata["claim_verification_reason"] = reason
+                    if value:
+                        candidates.add(value)
+            if not candidates and not anchor_conflict:
+                candidates.update(
+                    binding_items.get(
+                        (
+                            state["user_id"],
+                            state["account_id"],
+                            state["card_id"],
+                        ),
+                        set(),
+                    )
+                )
+
+            resolved_item_id = (
+                next(iter(candidates))
+                if len(candidates) == 1 and not anchor_conflict
+                else None
+            )
+            explicit_verification = bool(
+                exact_anchor
+                and exact_anchor["metadata"].get("claim_verification_required")
+            )
+            if (
+                resolved_item_id
+                and state["status"] != "sending"
+                and not explicit_verification
+            ):
                 cursor.execute(
                     """
-                    UPDATE delivery_finalization_states
-                    SET delivery_meta = ?, updated_at = CURRENT_TIMESTAMP
+                    UPDATE delivery_orchestration_states
+                    SET item_id = ?, item_scope_migration_version = 1,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (
-                        json.dumps(
-                            metadata,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
-                        finalization["id"],
-                    ),
+                    (resolved_item_id, state["id"]),
                 )
-
-        historical_states = cursor.execute(
-            """
-            SELECT id, user_id, card_id, account_id, order_id, order_line_id,
-                   idempotency_key, status
-            FROM delivery_orchestration_states
-            WHERE item_id IS NULL OR TRIM(item_id) = ''
-            """
-        ).fetchall()
-        for state in historical_states:
-            (
-                state_id,
-                user_id,
-                card_id,
-                account_id,
-                order_id,
-                order_line_id,
-                idempotency_key,
-                status,
-            ) = state
-            account_id = str(account_id or "").strip()
-            order_id = str(order_id or "").strip()
-            order_line_id = str(order_line_id or "").strip()
-            idempotency_key = str(idempotency_key or "").strip()
-
-            order_level_candidates = {
-                str(row[0]).strip()
-                for row in cursor.execute(
-                    """
-                    SELECT item_id FROM orders
-                    WHERE order_id = ? AND cookie_id = ?
-                      AND item_id IS NOT NULL AND TRIM(item_id) != ''
-                    """,
-                    (order_id, account_id),
-                ).fetchall()
-            }
-            state_count = cursor.execute(
-                """
-                SELECT COUNT(*) FROM delivery_orchestration_states
-                WHERE account_id = ? AND order_id = ?
-                """,
-                (account_id, order_id),
-            ).fetchone()[0]
-            for finalization in finalization_rows:
-                if (
-                    finalization["order_id"] != order_id
-                    or finalization["account_id"] != account_id
-                ):
-                    continue
-                metadata = finalization["metadata"]
-                metadata_key = str(metadata.get("idempotency_key") or "").strip()
-                if metadata_key:
-                    matches_state = metadata_key == idempotency_key
-                else:
-                    metadata_card_id = str(metadata.get("card_id") or "").strip()
-                    metadata_line_id = str(metadata.get("order_line_id") or "").strip()
-                    has_scope = bool(metadata_card_id or metadata_line_id)
-                    matches_state = (
-                        (
-                            not metadata_card_id
-                            or metadata_card_id == str(card_id)
-                        )
-                        and (
-                            not metadata_line_id
-                            or metadata_line_id == order_line_id
-                        )
-                        and (has_scope or state_count == 1)
-                    )
-                if not matches_state:
-                    continue
-                for candidate in (
-                    finalization["item_id"],
-                    str(metadata.get("item_id") or "").strip(),
-                ):
-                    if candidate:
-                        order_level_candidates.add(candidate)
-
-            candidates = order_level_candidates
-            if not candidates:
-                candidates = {
-                    str(row[0]).strip()
-                    for row in cursor.execute(
-                        """
-                        SELECT DISTINCT item_id FROM item_delivery_bindings
-                        WHERE user_id = ? AND account_id = ? AND card_id = ?
-                          AND item_id IS NOT NULL AND TRIM(item_id) != ''
-                        """,
-                        (user_id, account_id, card_id),
-                    ).fetchall()
-                }
-
-            if len(candidates) == 1:
-                resolved_item_id = next(iter(candidates))
-                if status == "sending":
-                    reason = (
-                        "历史发货处于发送中，发送结果无法核实，已阻止自动重发、确认和收尾"
-                    )
-                    cursor.execute(
-                        """
-                        UPDATE delivery_orchestration_states
-                        SET item_id = ?,
-                            send_started_at = COALESCE(send_started_at, CURRENT_TIMESTAMP),
-                            verification_required = 1,
-                            last_error_code = 'historical_send_result_unverified',
-                            last_error = ?, updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?
-                        """,
-                        (resolved_item_id, reason, state_id),
-                    )
-                    mark_finalizations_for_verification(
-                        order_id,
-                        account_id,
-                        reason,
-                    )
-                else:
-                    cursor.execute(
-                        """
-                        UPDATE delivery_orchestration_states
-                        SET item_id = ?, updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?
-                        """,
-                        (resolved_item_id, state_id),
-                    )
                 continue
 
-            if candidates:
+            if resolved_item_id and (
+                state["status"] == "sending" or explicit_verification
+            ):
                 reason = (
-                    "历史发货商品范围存在冲突，已转为待人工核实并阻止自动重发、确认和收尾"
+                    "历史发货结果无法核实，已阻止自动重发、确认和收尾"
                 )
-            else:
-                reason = (
-                    "历史发货商品范围无法可靠识别，已转为待人工核实并阻止自动重发、确认和收尾"
+                cursor.execute(
+                    """
+                    UPDATE delivery_orchestration_states
+                    SET item_id = ?,
+                        send_started_at = COALESCE(send_started_at, CURRENT_TIMESTAMP),
+                        verification_required = 1,
+                        item_scope_migration_version = 1,
+                        last_error_code = 'historical_send_result_unverified',
+                        last_error = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (resolved_item_id, reason, state["id"]),
                 )
+                mark_exact_anchor_for_verification(state["id"], reason)
+                continue
+
+            reason = (
+                "历史发货商品范围存在冲突，已转为待人工核实并阻止自动重发、确认和收尾"
+                if candidates or anchor_conflict
+                else "历史发货商品范围无法可靠识别，已转为待人工核实并阻止自动重发、确认和收尾"
+            )
             cursor.execute(
                 """
                 UPDATE delivery_orchestration_states
                 SET send_started_at = COALESCE(send_started_at, CURRENT_TIMESTAMP),
                     verification_required = 1,
+                    item_scope_migration_version = 1,
                     last_error_code = 'historical_item_scope_unverified',
                     last_error = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (reason, state_id),
+                (reason, state["id"]),
             )
-
-            mark_finalizations_for_verification(order_id, account_id, reason)
+            mark_exact_anchor_for_verification(state["id"], reason)
     
     def init_db(self):
         """初始化数据库表结构"""
@@ -1001,6 +1079,7 @@ class DBManager:
                 item_id TEXT,
                 send_started_at TIMESTAMP,
                 verification_required INTEGER NOT NULL DEFAULT 0,
+                item_scope_migration_version INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'paused', 'reserved', 'sending', 'sent', 'failed')),
                 result_meta TEXT NOT NULL DEFAULT '{}',
