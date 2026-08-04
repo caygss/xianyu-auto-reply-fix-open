@@ -135,7 +135,7 @@ function createHarness({ honorAbort = true } = {}) {
     clearInterval() {}, clearTimeout() {},
     window: {},
   };
-  vm.runInNewContext(`${deliverySource()}\nglobalThis.deliveryTestApi = { openDeliveryConfigForItem, showSection, state: () => ({ context: deliveryConfigContext, ready: deliveryConfigReady, owner: deliveryLoadUiOwner }) };`, sandbox);
+  vm.runInNewContext(`${deliverySource()}\nglobalThis.deliveryTestApi = { openDeliveryConfigForItem, showSection, setDeliveryConfigBusy, initDeliveryConfigUi, state: () => ({ context: deliveryConfigContext, ready: deliveryConfigReady, owner: deliveryLoadUiOwner }) };`, sandbox);
   return { api: sandbox.deliveryTestApi, elements, inventoryDds, requests, respond };
 }
 
@@ -156,6 +156,27 @@ async function settleSuccessfulB(harness, load) {
   harness.respond('/inventory/preview', { items: ['B***'] });
   await load;
 }
+
+test('setDeliveryConfigBusy(false) preserves a current B load owner', () => {
+  const harness = createHarness({ honorAbort: false });
+  void harness.api.openDeliveryConfigForItem('account-B', 'item-B', '商品 B');
+
+  assert.ok(harness.api.state().owner);
+  assert.equal(harness.elements.get('deliveryConfigPanel').getAttribute('aria-busy'), 'true');
+  harness.api.setDeliveryConfigBusy(false);
+
+  assert.equal(harness.elements.get('deliveryConfigPanel').getAttribute('aria-busy'), 'true');
+  assert.ok(writeButtonIds.every((id) => harness.elements.get(id).disabled));
+});
+
+test('initDeliveryConfigUi disables writes without a ready context', () => {
+  const harness = createHarness();
+
+  harness.api.initDeliveryConfigUi();
+
+  assert.equal(harness.api.state().ready, false);
+  assert.ok(writeButtonIds.every((id) => harness.elements.get(id).disabled));
+});
 
 test('slow A cannot overwrite fast B or release B loading state', async () => {
   const harness = createHarness({ honorAbort: false });

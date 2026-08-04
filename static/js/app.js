@@ -12958,9 +12958,11 @@ function setDeliveryConfigWriteControlsDisabled(disabled) {
 }
 
 function setDeliveryConfigBusy(busy) {
+    if (!busy && deliveryLoadUiOwner) return false;
     const panel = document.getElementById('deliveryConfigPanel');
     panel?.setAttribute('aria-busy', String(busy));
     setDeliveryConfigWriteControlsDisabled(busy || !deliveryConfigReady);
+    return true;
 }
 
 function setDeliveryLoadBusy(operation, busy) {
@@ -13446,6 +13448,7 @@ async function continueDeliveryProcessing() {
 
 function initDeliveryConfigUi() {
     cancelDeliveryConfigLoadForLifecycle();
+    setDeliveryConfigWriteControlsDisabled(!deliveryConfigReady);
     const state = readDeliveryConfigUiState();
     const prompt = document.getElementById('deliveryConfigPrompt');
     if (prompt) prompt.hidden = Boolean(state.promptClosed);
