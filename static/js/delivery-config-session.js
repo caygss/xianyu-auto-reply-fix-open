@@ -1,14 +1,14 @@
 'use strict';
 
 (function deliveryConfigSessionModule(root, factory) {
-  const api = factory();
+  const api = factory(root);
 
   if (typeof module === 'object' && module.exports) {
     module.exports = api;
   } else {
     root.DeliveryConfigSession = api;
   }
-}(typeof globalThis !== 'undefined' ? globalThis : this, function createApi() {
+}(typeof globalThis !== 'undefined' ? globalThis : this, function createApi(root) {
   function trimRequired(value, name) {
     if (typeof value !== 'string' || value.trim() === '') {
       throw new TypeError(`${name} is required`);
@@ -29,7 +29,7 @@
   }
 
   function createDeliveryConfigSessionCoordinator(options = {}) {
-    const AbortControllerConstructor = options.AbortController || globalThis.AbortController;
+    const AbortControllerConstructor = options.AbortController || root.AbortController;
     if (typeof AbortControllerConstructor !== 'function') {
       throw new TypeError('AbortController is required');
     }

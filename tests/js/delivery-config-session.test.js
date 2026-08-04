@@ -27,6 +27,20 @@ test('browser build exposes the frozen API on DeliveryConfigSession only', () =>
   assert.equal(sandbox.createDeliveryConfigSessionCoordinator, undefined);
 });
 
+test('browser fallback resolves AbortController from its root', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '../../static/js/delivery-config-session.js'),
+    'utf8',
+  );
+  const sandbox = { AbortController };
+  vm.runInNewContext(`const globalThis = undefined;\n${source}`, sandbox);
+
+  assert.ok(sandbox.DeliveryConfigSession);
+  assert.doesNotThrow(() => {
+    sandbox.DeliveryConfigSession.createDeliveryConfigSessionCoordinator();
+  });
+});
+
 function selection(name) {
   return {
     accountId: ` account-${name} `,
