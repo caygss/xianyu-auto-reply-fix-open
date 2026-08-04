@@ -4354,6 +4354,14 @@ class XianyuLive:
     def _sync_order_delivery_progress(self, order_id: str, cookie_id: str, expected_quantity: int = 1,
                                       context: str = "自动发货进度同步"):
         summary = self._summarize_delivery_progress(order_id, expected_quantity=expected_quantity)
+        if summary.get('coverage_conflict'):
+            conflict_unit_indexes = summary.get('conflict_unit_indexes') or []
+            logger.error(
+                f"【{self.cookie_id}】发货记录冲突，停止同步订单发货进度: "
+                f"order_id={order_id}, conflict_unit_indexes={conflict_unit_indexes}, context={context}"
+            )
+            return summary
+
         aggregate_status = summary.get('aggregate_status') or 'pending_ship'
         previous_status = None
 

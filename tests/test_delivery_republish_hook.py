@@ -89,6 +89,60 @@ def test_delivery_success_sync_calls_hook_after_shipped_order_write(monkeypatch)
     ]
 
 
+def test_delivery_progress_conflict_returns_summary_without_order_side_effects(monkeypatch):
+    live = _bare_live()
+    summary = {
+        "coverage_conflict": True,
+        "conflict_unit_indexes": [2, 3],
+        "aggregate_status": "shipped",
+        "expected_quantity": 3,
+        "finalized_count": 2,
+        "pending_finalize_count": 1,
+        "remaining_count": 0,
+    }
+    errors = []
+
+    class FailingStatusHandler:
+        @staticmethod
+        def handle_auto_delivery_order_status(**kwargs):
+            raise AssertionError("conflicting progress must not notify delivery success")
+
+    live.order_status_handler = FailingStatusHandler()
+    monkeypatch.setattr(live, "_summarize_delivery_progress", lambda *args, **kwargs: summary)
+    monkeypatch.setattr(
+        "XianyuAutoAsync.db_manager.get_order_by_id",
+        lambda order_id: (_ for _ in ()).throw(
+            AssertionError("conflicting progress must not read or write order status")
+        ),
+    )
+    monkeypatch.setattr(
+        "XianyuAutoAsync.db_manager.insert_or_update_order",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("conflicting progress must not write order status")
+        ),
+    )
+    monkeypatch.setattr(
+        live,
+        "_notify_republish_after_delivery_finalized",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("conflicting progress must not notify republish")
+        ),
+    )
+    monkeypatch.setattr(
+        "XianyuAutoAsync.logger.error",
+        lambda message, *args, **kwargs: errors.append(message),
+    )
+
+    result = live._sync_order_delivery_progress("order-conflict", "account-1", expected_quantity=3)
+
+    assert result is summary
+    assert live.delivery_sent_orders == set()
+    assert live.last_delivery_time == {}
+    assert len(errors) == 1
+    assert "发货记录冲突" in errors[0]
+    assert "2, 3" in errors[0]
+
+
 @pytest.mark.parametrize(
     "previous_status,persisted_status",
     [

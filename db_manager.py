@@ -6213,7 +6213,7 @@ Cookie数量: {cookie_count}
                 remaining_unit_indexes.append(unit_index)
 
         if conflict_unit_indexes:
-            aggregate_status = 'conflict'
+            aggregate_status = 'pending_ship'
         elif pending_finalize_count:
             aggregate_status = 'partial_pending_finalize'
         elif len(finalized_unit_indexes) >= expected:

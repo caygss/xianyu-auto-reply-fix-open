@@ -5,6 +5,7 @@ from collections import defaultdict
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 import XianyuAutoAsync as xianyu_module
 import db_manager as db_manager_module
@@ -942,6 +943,98 @@ def test_manual_entry_prepares_bound_whole_order_once_and_legacy_remaining_units
 
     assert len(auto_delivery_calls) == 2
     assert [call[1]["delivery_unit_index"] for call in auto_delivery_calls] == [2, 3]
+
+
+def _configure_conflicting_manual_delivery(monkeypatch, live, manager, order_id):
+    reply_server = _configure_manual_bound_route(monkeypatch, live, manager, order_id)
+    conflict_summary = {
+        "coverage_conflict": True,
+        "conflict_unit_indexes": [1, 2],
+        "pending_finalize_unit_indexes": [1],
+        "remaining_unit_indexes": [],
+        "aggregate_status": "pending_ship",
+    }
+    finalize_calls = []
+    send_calls = []
+
+    monkeypatch.setattr(
+        live,
+        "_summarize_delivery_progress",
+        lambda value, expected_quantity: conflict_summary,
+    )
+
+    async def record_finalize(**kwargs):
+        finalize_calls.append(kwargs)
+        return {"success": True}
+
+    async def record_send(*args, **kwargs):
+        send_calls.append((args, kwargs))
+
+    monkeypatch.setattr(live, "_finalize_delivery_after_send", record_finalize)
+    monkeypatch.setattr(live, "send_delivery_steps_once", record_send)
+    return reply_server, finalize_calls, send_calls
+
+
+def test_manual_delivery_function_rejects_conflict_before_pending_finalize(
+    runtime,
+    monkeypatch,
+):
+    live, manager = runtime
+    create_binding(manager)
+    reply_server, finalize_calls, send_calls = _configure_conflicting_manual_delivery(
+        monkeypatch,
+        live,
+        manager,
+        "order-manual-conflict-function",
+    )
+
+    with pytest.raises(HTTPException) as conflict_error:
+        asyncio.run(
+            reply_server.manual_deliver_order(
+                "order-manual-conflict-function",
+                current_user={"user_id": USER_ID, "username": "owner"},
+            )
+        )
+
+    assert conflict_error.value.status_code == 409
+    assert "发货记录冲突，请先核对" in str(conflict_error.value.detail)
+    assert finalize_calls == []
+    assert send_calls == []
+
+
+def test_manual_delivery_http_rejects_conflict_before_pending_finalize(
+    runtime,
+    monkeypatch,
+):
+    live, manager = runtime
+    create_binding(manager)
+    reply_server, finalize_calls, send_calls = _configure_conflicting_manual_delivery(
+        monkeypatch,
+        live,
+        manager,
+        "order-manual-conflict-http",
+    )
+    previous_override = reply_server.app.dependency_overrides.get(reply_server.get_current_user)
+    reply_server.app.dependency_overrides[reply_server.get_current_user] = lambda: {
+        "user_id": USER_ID,
+        "username": "owner",
+    }
+
+    try:
+        client = TestClient(reply_server.app)
+        response = client.post("/api/orders/order-manual-conflict-http/deliver")
+    finally:
+        if 'client' in locals():
+            client.close()
+        if previous_override is None:
+            reply_server.app.dependency_overrides.pop(reply_server.get_current_user, None)
+        else:
+            reply_server.app.dependency_overrides[reply_server.get_current_user] = previous_override
+
+    assert response.status_code == 409
+    assert "发货记录冲突，请先核对" in response.json()["detail"]
+    assert finalize_calls == []
+    assert send_calls == []
 
 
 def test_recovered_entry_passes_bound_order_quantity_and_preserves_legacy_single_call(

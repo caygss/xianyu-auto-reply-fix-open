@@ -15595,6 +15595,12 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 expected_quantity = 1
 
         progress_summary_before = xianyu_instance._summarize_delivery_progress(order_id, expected_quantity)
+        if progress_summary_before.get('coverage_conflict'):
+            raise HTTPException(
+                status_code=409,
+                detail="发货记录冲突，请先核对",
+            )
+
         pending_finalize_units = list(progress_summary_before.get('pending_finalize_unit_indexes') or [])
         finalize_completed_units = 0
         for unit_index in pending_finalize_units:

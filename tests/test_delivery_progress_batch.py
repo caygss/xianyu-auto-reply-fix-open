@@ -88,7 +88,7 @@ def test_configured_batch_overlap_preserves_explicit_unit_independent_of_db_orde
     assert summary["pending_finalize_count"] == 2
     assert summary["pending_finalize_unit_indexes"] == [1]
     assert summary["remaining_unit_indexes"] == []
-    assert summary["aggregate_status"] == "conflict"
+    assert summary["aggregate_status"] == "pending_ship"
 
 
 @pytest.mark.parametrize("reverse_db_order", [False, True])
@@ -129,7 +129,7 @@ def test_overlapping_configured_batches_report_stable_conflict_and_one_sent_anch
     assert summary["pending_finalize_unit_indexes"] == [1]
     assert summary["finalized_unit_indexes"] == [2, 4]
     assert summary["remaining_unit_indexes"] == [3]
-    assert summary["aggregate_status"] == "conflict"
+    assert summary["aggregate_status"] == "pending_ship"
 
 
 def test_finalized_overlap_never_reports_shipped(manager):
@@ -148,7 +148,7 @@ def test_finalized_overlap_never_reports_shipped(manager):
     assert summary["conflict_unit_indexes"] == [2]
     assert summary["finalized_count"] == 3
     assert summary["remaining_count"] == 0
-    assert summary["aggregate_status"] == "conflict"
+    assert summary["aggregate_status"] == "pending_ship"
 
 
 def test_legacy_per_unit_progress_is_unchanged(manager):
