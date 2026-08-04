@@ -1415,14 +1415,20 @@ def test_manual_bound_route_uses_real_orchestration_and_keeps_claim_private(
         "order-manual-real",
     )
     sent_steps = []
+    wrapped_sends = []
 
     async def record_send(buyer_id, item_id, steps):
         sent_steps.append(list(steps))
+
+    async def record_claim_wrapper(delivery_meta, sender, **kwargs):
+        wrapped_sends.append(dict(delivery_meta))
+        return await sender()
 
     async def finalize_without_network(**kwargs):
         return {"success": True}
 
     monkeypatch.setattr(live, "send_delivery_steps_once", record_send)
+    monkeypatch.setattr(live, "_send_with_delivery_claim", record_claim_wrapper)
     monkeypatch.setattr(live, "_finalize_delivery_after_send", finalize_without_network)
     monkeypatch.setattr(live, "_mark_data_reservation_sent_if_needed", lambda meta: True)
 
@@ -1434,6 +1440,8 @@ def test_manual_bound_route_uses_real_orchestration_and_keeps_claim_private(
     )
 
     assert sent_steps == [[{"type": "text", "content": "https://example.test/manual-real"}]]
+    assert len(wrapped_sends) == 1
+    assert wrapped_sends[0]["configured"] is True
     with manager.lock:
         state_count = manager.conn.execute(
             "SELECT COUNT(*) FROM delivery_orchestration_states"
@@ -1615,6 +1623,7 @@ def test_real_delivery_entries_persist_only_sanitized_finalization_meta(
         },
     }
     finalized_meta = []
+    wrapped_sends = []
 
     monkeypatch.setattr(live, "can_auto_delivery", lambda value: True)
     monkeypatch.setattr(live, "is_lock_held", lambda value: False)
@@ -1635,7 +1644,12 @@ def test_real_delivery_entries_persist_only_sanitized_finalization_meta(
     async def ignore_async(*args, **kwargs):
         return None
 
+    async def record_claim_wrapper(delivery_meta, sender, **kwargs):
+        wrapped_sends.append(dict(delivery_meta))
+        return await sender()
+
     monkeypatch.setattr(live, "_auto_delivery", return_raw_result)
+    monkeypatch.setattr(live, "_send_with_delivery_claim", record_claim_wrapper)
     monkeypatch.setattr(live, "_finalize_delivery_after_send", finalize_without_network)
     monkeypatch.setattr(live, "_mark_data_reservation_sent_if_needed", lambda meta: True)
     monkeypatch.setattr(live, "_sync_order_delivery_progress", lambda **kwargs: None)
@@ -1682,6 +1696,7 @@ def test_real_delivery_entries_persist_only_sanitized_finalization_meta(
 
     assert stored_meta == expected_meta
     assert finalized_meta == [expected_meta]
+    assert wrapped_sends == [expected_meta]
     assert set(stored_meta["_orchestration_private"]) == {"claim_token"}
     assert stored_meta["_orchestration_private"]["claim_token"] == "approved-claim-token"
     assert "claim_token" not in stored_meta

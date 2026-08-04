@@ -9,6 +9,7 @@ import random
 import secrets
 import threading
 import math
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from enum import Enum
 from urllib.parse import parse_qs, urlparse
@@ -3621,6 +3622,105 @@ class XianyuLive:
 
         return f"{reason_text} [{', '.join(context_parts)}]"
 
+    def _configured_delivery_orchestration(self, delivery_meta: dict = None,
+                                           order_id: str = None, item_id: str = None):
+        """Rebuild the private orchestration scope without persisted config secrets."""
+        meta = delivery_meta or {}
+        private = meta.get('_orchestration_private')
+        if not meta.get('configured') or not isinstance(private, dict):
+            return None
+
+        claim_token = str(private.get('claim_token') or '').strip()
+        if not claim_token:
+            return None
+
+        from delivery_orchestration_service import DeliveryOrchestrationRequest
+
+        request = DeliveryOrchestrationRequest(
+            user_id=self.user_id,
+            card_id=meta.get('card_id'),
+            account_id=self.cookie_id,
+            order_id=order_id or meta.get('order_id'),
+            order_line_id=meta.get('order_line_id'),
+            quantity=meta.get('quantity'),
+            delivery_config={'mode': meta.get('mode')},
+            item_id=item_id,
+            idempotency_key=meta.get('idempotency_key'),
+        )
+        service = self._new_delivery_orchestration_service()
+        return service, request, claim_token
+
+    def _new_delivery_orchestration_service(self, inventory=None, dispatcher=None):
+        from delivery_orchestration_service import (
+            DEFAULT_CLAIM_LEASE_SECONDS,
+            DeliveryOrchestrationService,
+        )
+
+        lease_seconds = getattr(
+            self,
+            'delivery_claim_lease_seconds',
+            DEFAULT_CLAIM_LEASE_SECONDS,
+        )
+        return DeliveryOrchestrationService(
+            db_manager,
+            inventory,
+            dispatcher,
+            claim_lease_seconds=lease_seconds,
+        )
+
+    @asynccontextmanager
+    async def _delivery_claim_heartbeat(self, delivery_meta: dict = None,
+                                        order_id: str = None, item_id: str = None):
+        orchestration = self._configured_delivery_orchestration(
+            delivery_meta,
+            order_id=order_id,
+            item_id=item_id,
+        )
+        if not orchestration:
+            yield
+            return
+
+        service, request, claim_token = orchestration
+        interval = min(service.claim_lease_seconds / 3.0, 30.0)
+
+        async def renew_while_sending():
+            while True:
+                await asyncio.sleep(interval)
+                if not service.renew_claim(request, claim_token):
+                    return
+
+        heartbeat = asyncio.create_task(
+            renew_while_sending(),
+            name=f"delivery-claim-heartbeat-{request.order_id}",
+        )
+        try:
+            yield
+        finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
+
+    async def _send_with_delivery_claim(self, delivery_meta: dict, sender,
+                                        order_id: str = None, item_id: str = None):
+        async with self._delivery_claim_heartbeat(
+            delivery_meta,
+            order_id=order_id,
+            item_id=item_id,
+        ):
+            return await sender()
+
+    def _mark_configured_delivery_failed(self, delivery_meta: dict, error,
+                                         order_id: str = None, item_id: str = None):
+        orchestration = self._configured_delivery_orchestration(
+            delivery_meta,
+            order_id=order_id,
+            item_id=item_id,
+        )
+        if not orchestration:
+            return None
+        service, request, claim_token = orchestration
+        return service.mark_failed(request, claim_token, error)
+
     async def _finalize_delivery_after_send(self, delivery_meta: dict = None, order_id: str = None,
                                             item_id: str = None, skip_confirm: bool = False,
                                             force_confirm: bool = False):
@@ -3634,6 +3734,15 @@ class XianyuLive:
             }
 
         from db_manager import db_manager
+
+        orchestration = self._configured_delivery_orchestration(
+            meta,
+            order_id=order_id,
+            item_id=item_id,
+        )
+        if orchestration:
+            service, request, claim_token = orchestration
+            service.mark_sent(request, claim_token)
 
         consume_required = bool(meta.get('data_card_pending_consume'))
         rule_id = meta.get('rule_id')
@@ -4865,6 +4974,13 @@ class XianyuLive:
 
             pending_finalize_meta = self._get_pending_delivery_finalization_meta(order_id, 1)
             if pending_finalize_meta:
+                pending_expected_quantity = 1
+                if pending_finalize_meta.get('configured'):
+                    pending_expected_quantity = (
+                        self._normalize_trusted_delivery_quantity(
+                            pending_finalize_meta.get('quantity')
+                        ) or 1
+                    )
                 finalize_result = await self._finalize_delivery_after_send(
                     delivery_meta=pending_finalize_meta,
                     order_id=order_id,
@@ -4902,7 +5018,7 @@ class XianyuLive:
                 self._sync_order_delivery_progress(
                     order_id=order_id,
                     cookie_id=self.cookie_id,
-                    expected_quantity=1,
+                    expected_quantity=pending_expected_quantity,
                     context=f"{source} 补完成收尾成功",
                 )
                 self._activate_delivery_lock(lock_key, delay_minutes=10)
@@ -4985,7 +5101,18 @@ class XianyuLive:
                 )
 
             try:
-                await self.send_delivery_steps_once(buyer_id, item_id, delivery_steps)
+                message_sent = False
+                await self._send_with_delivery_claim(
+                    delivery_meta,
+                    lambda: self.send_delivery_steps_once(
+                        buyer_id,
+                        item_id,
+                        delivery_steps,
+                    ),
+                    order_id=order_id,
+                    item_id=item_id,
+                )
+                message_sent = True
 
                 if not self._mark_data_reservation_sent_if_needed(delivery_meta):
                     self._release_data_reservation_if_needed(delivery_meta, error='补偿发货发送成功后标记预占已发送失败')
@@ -5053,6 +5180,13 @@ class XianyuLive:
                 logger.warning(f"【{self.cookie_id}】{source} 已完成补偿自动发货: order_id={order_id}")
                 return True
             except Exception as send_error:
+                if not message_sent:
+                    self._mark_configured_delivery_failed(
+                        delivery_meta,
+                        send_error,
+                        order_id=order_id,
+                        item_id=item_id,
+                    )
                 self._release_data_reservation_if_needed(delivery_meta, error=self._safe_str(send_error))
                 self._persist_delivery_finalization_state(
                     order_id=order_id,
@@ -5736,6 +5870,13 @@ class XianyuLive:
 
                 pending_finalize_meta = self._get_pending_delivery_finalization_meta(order_id, 1)
                 if pending_finalize_meta:
+                    pending_expected_quantity = 1
+                    if pending_finalize_meta.get('configured'):
+                        pending_expected_quantity = (
+                            self._normalize_trusted_delivery_quantity(
+                                pending_finalize_meta.get('quantity')
+                            ) or 1
+                        )
                     finalize_result = await self._finalize_delivery_after_send(
                         delivery_meta=pending_finalize_meta,
                         order_id=order_id,
@@ -5750,7 +5891,7 @@ class XianyuLive:
                                 buyer_id=user_id,
                                 delivery_meta=pending_finalize_meta,
                                 confirm_error=finalize_error,
-                                expected_quantity=1,
+                                expected_quantity=pending_expected_quantity,
                                 context="自动发货补完成收尾时平台确认失败"
                             )
                         else:
@@ -5793,7 +5934,7 @@ class XianyuLive:
                     self._sync_order_delivery_progress(
                         order_id=order_id,
                         cookie_id=self.cookie_id,
-                        expected_quantity=1,
+                        expected_quantity=pending_expected_quantity,
                         context="自动发货补完成收尾成功"
                     )
                     self._activate_delivery_lock(lock_key, delay_minutes=10)
@@ -5821,7 +5962,7 @@ class XianyuLive:
                 # legacy 入口继续保持单次准备。
                 from db_manager import db_manager
                 cached_order = db_manager.get_order_by_id(order_id) or {}
-                _, preparation_plan = self._build_known_order_auto_delivery_preparation_plan(
+                order_quantity, preparation_plan = self._build_known_order_auto_delivery_preparation_plan(
                     item_id,
                     cached_order,
                     legacy_unit_indexes=[1],
@@ -5864,14 +6005,21 @@ class XianyuLive:
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
                     
                     try:
-                        await self._send_delivery_steps(
-                            websocket,
-                            chat_id,
-                            user_id,
-                            delivery_steps,
-                            user_url=user_url,
-                            log_prefix=f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 自动发货'
+                        message_sent = False
+                        await self._send_with_delivery_claim(
+                            delivery_rule_meta,
+                            lambda: self._send_delivery_steps(
+                                websocket,
+                                chat_id,
+                                user_id,
+                                delivery_steps,
+                                user_url=user_url,
+                                log_prefix=f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 自动发货'
+                            ),
+                            order_id=order_id,
+                            item_id=item_id,
                         )
+                        message_sent = True
 
                         if not self._mark_data_reservation_sent_if_needed(delivery_rule_meta):
                             self._release_data_reservation_if_needed(
@@ -5903,7 +6051,7 @@ class XianyuLive:
                                     buyer_id=user_id,
                                     delivery_meta=delivery_rule_meta,
                                     confirm_error=finalize_error,
-                                    expected_quantity=1,
+                                    expected_quantity=order_quantity,
                                     context="自动发货发送成功后平台确认失败"
                                 )
                             else:
@@ -5947,7 +6095,7 @@ class XianyuLive:
                         self._sync_order_delivery_progress(
                             order_id=order_id,
                             cookie_id=self.cookie_id,
-                            expected_quantity=1,
+                            expected_quantity=order_quantity,
                             context="自动发货发送成功"
                         )
                         self._activate_delivery_lock(lock_key, delay_minutes=10)
@@ -5962,6 +6110,13 @@ class XianyuLive:
                             rule_meta=delivery_rule_meta
                         )
                     except Exception as send_e:
+                        if not message_sent:
+                            self._mark_configured_delivery_failed(
+                                delivery_rule_meta,
+                                send_e,
+                                order_id=order_id,
+                                item_id=item_id,
+                            )
                         self._record_delivery_log(
                             order_id=order_id,
                             item_id=item_id,
@@ -6367,6 +6522,18 @@ class XianyuLive:
                         )
                     )
 
+                    progress_before_prepare = db_manager.get_delivery_progress_summary(
+                        order_id,
+                        expected_quantity=quantity_to_send,
+                    )
+                    if progress_before_prepare.get('coverage_conflict'):
+                        logger.error(
+                            f"【{self.cookie_id}】发货记录冲突，阻止自动发货准备: "
+                            f"order_id={order_id}, "
+                            f"conflict_unit_indexes={progress_before_prepare.get('conflict_unit_indexes') or []}"
+                        )
+                        return
+
                     successful_send_count = 0
                     last_delivery_error = None
                     prepared_units = []
@@ -6565,19 +6732,30 @@ class XianyuLive:
                             group_log_prefix = f'[{msg_time}] 多数量自动发货 {single_unit_index}/{quantity_to_send}'
 
                         try:
-                            await self._send_delivery_steps(
-                                websocket,
-                                chat_id,
-                                send_user_id,
-                                send_group.get('delivery_steps') or [],
-                                user_url=user_url,
-                                log_prefix=group_log_prefix
+                            await self._send_with_delivery_claim(
+                                first_unit.get('rule_meta') or {},
+                                lambda: self._send_delivery_steps(
+                                    websocket,
+                                    chat_id,
+                                    send_user_id,
+                                    send_group.get('delivery_steps') or [],
+                                    user_url=user_url,
+                                    log_prefix=group_log_prefix
+                                ),
+                                order_id=order_id,
+                                item_id=item_id,
                             )
                         except Exception as e:
                             group_error = self._safe_str(e)
                             for prepared_unit in group_units:
                                 unit_rule_meta = prepared_unit.get('rule_meta') or {}
                                 unit_index = prepared_unit.get('unit_index') or 1
+                                self._mark_configured_delivery_failed(
+                                    unit_rule_meta,
+                                    e,
+                                    order_id=order_id,
+                                    item_id=item_id,
+                                )
                                 self._release_data_reservation_if_needed(
                                     unit_rule_meta,
                                     error=f'发送失败(unit={unit_index}): {group_error}'
@@ -12231,10 +12409,7 @@ class XianyuLive:
         from card_inventory_service import CardInventoryService
         from delivery_adapter_service import DeliveryDispatcher
         from delivery_config_service import DeliveryConfigService
-        from delivery_orchestration_service import (
-            DeliveryOrchestrationRequest,
-            DeliveryOrchestrationService,
-        )
+        from delivery_orchestration_service import DeliveryOrchestrationRequest
 
         card_id = binding["card_id"]
         config_service = DeliveryConfigService(db_manager)
@@ -12267,11 +12442,10 @@ class XianyuLive:
                 "expected_binding_snapshot": expected_binding_snapshot,
             },
         )
-        return DeliveryOrchestrationService(
-            db_manager,
+        return self._new_delivery_orchestration_service(
             inventory,
             dispatcher,
-        ).prepare(request)
+        ).prepare_retry(request)
 
     def _bound_delivery_result(self, prepared: dict, *, include_meta: bool):
         """Adapt orchestration prepare output to the legacy auto-delivery contract."""
