@@ -3706,12 +3706,6 @@ class XianyuLive:
             idempotency_key=idempotency_key,
         )
         service = self._new_delivery_orchestration_service()
-        try:
-            request = service._normalize_request(request)
-        except Exception:
-            raise DeliveryClaimValidationError(
-                '绑定商品发货 claim 作用域无效，已阻止发送'
-            ) from None
         return service, request, claim_token
 
     def _new_delivery_orchestration_service(self, inventory=None, dispatcher=None):
@@ -3746,8 +3740,8 @@ class XianyuLive:
 
         service, request, claim_token = orchestration
         try:
-            owned = await asyncio.to_thread(
-                service.renew_claim,
+            send_started = await asyncio.to_thread(
+                service.begin_send,
                 request,
                 claim_token,
             )
@@ -3755,11 +3749,11 @@ class XianyuLive:
             raise
         except Exception:
             raise DeliveryClaimOwnershipError(
-                '绑定商品发货 claim 所有权校验失败，已阻止发送'
+                '绑定商品发货启动状态预写失败，已阻止发送'
             ) from None
-        if not owned:
+        if not send_started:
             raise DeliveryClaimOwnershipError(
-                '绑定商品发货 claim 所有权校验失败，已阻止发送'
+                '绑定商品发货启动状态预写失败，已阻止发送'
             )
 
         interval = min(service.claim_lease_seconds / 3.0, 30.0)
@@ -3788,33 +3782,24 @@ class XianyuLive:
             renew_while_sending(),
             name=f"delivery-claim-heartbeat-{request.order_id}",
         )
-        body_failed = False
         try:
             yield heartbeat
-        except BaseException:
-            body_failed = True
-            raise
         finally:
             if not heartbeat.done():
                 heartbeat.cancel()
-            try:
-                await heartbeat
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                if not body_failed:
-                    raise
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
-    async def _persist_delivery_claim_uncertain(self, delivery_meta: dict,
-                                                order_id: str = None,
-                                                item_id: str = None):
+    async def _persist_completed_delivery_after_claim_loss(
+        self,
+        delivery_meta: dict,
+        order_id: str = None,
+        item_id: str = None,
+    ):
         meta = dict(delivery_meta or {})
-        meta.update({
-            'claim_verification_required': True,
-            'delivery_claim_status': 'uncertain',
-        })
+        meta.pop('claim_verification_required', None)
+        meta['delivery_claim_status'] = 'send_completed_pending_finalize'
         effective_order_id = order_id or meta.get('order_id')
-        await asyncio.to_thread(
+        return await asyncio.to_thread(
             self._persist_delivery_finalization_state,
             order_id=effective_order_id,
             item_id=item_id,
@@ -3822,7 +3807,7 @@ class XianyuLive:
             delivery_meta=meta,
             channel='auto',
             status='sent',
-            last_error='发货 claim 续租失败，发送结果待核实',
+            last_error='消息已确认发送完成，claim 续租异常，等待安全收尾',
         )
 
     async def _send_with_delivery_claim(self, delivery_meta: dict, sender,
@@ -3842,59 +3827,77 @@ class XianyuLive:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             except asyncio.CancelledError:
-                try:
-                    await asyncio.shield(
-                        self._persist_delivery_claim_uncertain(
-                            delivery_meta,
-                            order_id=order_id,
-                            item_id=item_id,
-                        )
-                    )
-                except BaseException:
-                    pass
-                finally:
-                    sender_task.cancel()
-                    heartbeat.cancel()
-                    await asyncio.gather(
-                        sender_task,
-                        heartbeat,
-                        return_exceptions=True,
-                    )
+                sender_task.cancel()
+                heartbeat.cancel()
+                await asyncio.gather(
+                    sender_task,
+                    heartbeat,
+                    return_exceptions=True,
+                )
                 raise
 
             if heartbeat in done:
-                try:
-                    await self._persist_delivery_claim_uncertain(
-                        delivery_meta,
-                        order_id=order_id,
-                        item_id=item_id,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
-                finally:
-                    if not sender_task.done():
-                        sender_task.cancel()
-                    await asyncio.gather(
-                        sender_task,
-                        heartbeat,
-                        return_exceptions=True,
-                    )
+                if not sender_task.done():
+                    await asyncio.sleep(0)
+                if sender_task.done() and not sender_task.cancelled():
+                    sender_error = sender_task.exception()
+                    if sender_error is not None:
+                        await asyncio.gather(heartbeat, return_exceptions=True)
+                        raise sender_error
+                    sender_result = sender_task.result()
+                    try:
+                        persisted = await (
+                            self._persist_completed_delivery_after_claim_loss(
+                                delivery_meta,
+                                order_id=order_id,
+                                item_id=item_id,
+                            )
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        raise DeliveryClaimUncertainError(
+                            '绑定商品消息已发送，但安全收尾状态保存失败，需人工核实'
+                        ) from None
+                    if not persisted:
+                        raise DeliveryClaimUncertainError(
+                            '绑定商品消息已发送，但安全收尾状态保存失败，需人工核实'
+                        )
+                    await asyncio.gather(heartbeat, return_exceptions=True)
+                    return sender_result
+
+                sender_task.cancel()
+                heartbeat.cancel()
+                await asyncio.gather(
+                    sender_task,
+                    heartbeat,
+                    return_exceptions=True,
+                )
                 raise DeliveryClaimUncertainError(
-                    '绑定商品发货 claim 续租失败，发送结果待核实'
+                    '绑定商品发货续租失败，发送结果待人工核实，已阻止自动重发和确认发货'
                 ) from None
+
+            sender_error = None
+            sender_result = None
+            if sender_task.cancelled():
+                sender_error = asyncio.CancelledError()
+            else:
+                sender_error = sender_task.exception()
+                if sender_error is None:
+                    sender_result = sender_task.result()
 
             heartbeat.cancel()
             heartbeat_result = (
                 await asyncio.gather(heartbeat, return_exceptions=True)
             )[0]
-            if isinstance(heartbeat_result, Exception) and not isinstance(
+            if sender_error is not None:
+                raise sender_error
+            if isinstance(heartbeat_result, BaseException) and not isinstance(
                 heartbeat_result,
                 asyncio.CancelledError,
             ):
                 try:
-                    await self._persist_delivery_claim_uncertain(
+                    persisted = await self._persist_completed_delivery_after_claim_loss(
                         delivery_meta,
                         order_id=order_id,
                         item_id=item_id,
@@ -3902,11 +3905,14 @@ class XianyuLive:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    pass
-                raise DeliveryClaimUncertainError(
-                    '绑定商品发货 claim 续租失败，发送结果待核实'
-                ) from None
-            return await sender_task
+                    raise DeliveryClaimUncertainError(
+                        '绑定商品消息已发送，但安全收尾状态保存失败，需人工核实'
+                    ) from None
+                if not persisted:
+                    raise DeliveryClaimUncertainError(
+                        '绑定商品消息已发送，但安全收尾状态保存失败，需人工核实'
+                    )
+            return sender_result
 
     async def _mark_configured_delivery_failed(self, delivery_meta: dict, error,
                                                order_id: str = None, item_id: str = None):
@@ -4065,6 +4071,8 @@ class XianyuLive:
             return None
 
         delivery_meta = state.get('delivery_meta') or {}
+        if delivery_meta.get('claim_verification_required'):
+            return None
         delivery_meta.setdefault('success', True)
         delivery_meta.setdefault('delivery_unit_index', delivery_unit_index)
         return delivery_meta
@@ -5282,7 +5290,11 @@ class XianyuLive:
                     if isinstance(delivery_result, dict)
                     else None
                 )
-                if disposition in {'noop_sent', 'defer_in_progress'}:
+                if disposition in {
+                    'noop_sent',
+                    'defer_in_progress',
+                    'verification_required',
+                }:
                     self._record_delivery_log(
                         order_id=order_id,
                         item_id=item_id,
@@ -6359,7 +6371,11 @@ class XianyuLive:
                         if isinstance(delivery_result, dict)
                         else None
                     )
-                    if disposition in {'noop_sent', 'defer_in_progress'}:
+                    if disposition in {
+                        'noop_sent',
+                        'defer_in_progress',
+                        'verification_required',
+                    }:
                         self._record_delivery_log(
                             order_id=order_id,
                             item_id=item_id,
@@ -6853,7 +6869,11 @@ class XianyuLive:
                                     if isinstance(delivery_result, dict)
                                     else None
                                 )
-                                if disposition in {'noop_sent', 'defer_in_progress'}:
+                                if disposition in {
+                                    'noop_sent',
+                                    'defer_in_progress',
+                                    'verification_required',
+                                }:
                                     non_failure_dispositions.append(disposition)
                                     self._record_delivery_log(
                                         order_id=order_id,
@@ -12672,19 +12692,30 @@ class XianyuLive:
             if str(value).strip()
         ]
         claimed = bool(prepared.get("claimed"))
+        verification_required = bool(prepared.get("verification_required"))
         private = prepared.get("_orchestration_private") or {}
-        success = status == "sending" and claimed and bool(contents)
+        success = (
+            status == "sending"
+            and claimed
+            and bool(contents)
+            and not verification_required
+        )
 
-        disposition = {
-            "sending": "send",
-            "sent": "noop_sent",
-            "in_progress": "defer_in_progress",
-            "paused": "blocked_paused",
-            "failed": "failed",
-        }.get(status, "failed")
+        if verification_required:
+            disposition = "verification_required"
+        else:
+            disposition = {
+                "sending": "send",
+                "sent": "noop_sent",
+                "in_progress": "defer_in_progress",
+                "paused": "blocked_paused",
+                "failed": "failed",
+            }.get(status, "failed")
 
         if success:
             error = None
+        elif verification_required:
+            error = "发货结果待人工核实，已阻止自动重发和确认发货"
         elif status == "in_progress":
             error = "该订单发货正在处理中，已阻止重复准备"
         elif status == "sent":

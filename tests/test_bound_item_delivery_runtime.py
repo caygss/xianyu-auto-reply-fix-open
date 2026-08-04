@@ -1344,6 +1344,7 @@ def _configure_manual_bound_route(monkeypatch, live, manager, order_id):
         "buyer_id": "buyer-1",
         "buyer_nick": "买家",
         "quantity": "1",
+        "order_status": "pending_ship",
         "sid": "",
     }
     monkeypatch.setattr(manager, "get_order_by_id", lambda value: dict(order))
@@ -1535,6 +1536,83 @@ def test_manual_bound_sent_or_in_progress_is_skipped_without_send_or_failure(
     assert logs
     assert {row[0] for row in logs} == {"skipped"}
     assert expected_disposition in logs[-1][1]
+
+
+def test_manual_bound_verification_required_skips_send_finalize_and_keeps_order_pending(
+    runtime,
+    monkeypatch,
+):
+    live, manager = runtime
+    card_id = create_binding(manager)
+    DeliveryConfigService(manager).save(
+        USER_ID,
+        card_id,
+        ACCOUNT_ID,
+        "fixed_link",
+        {"url": "https://example.test/manual-verification"},
+    )
+    order_id = "order-manual-verification-required"
+    reply_server = _configure_manual_bound_route(
+        monkeypatch,
+        live,
+        manager,
+        order_id,
+    )
+    prepared = asyncio.run(
+        live._auto_delivery(
+            ITEM_ID,
+            "绑定商品",
+            order_id,
+            "buyer-1",
+            include_meta=True,
+            quantity=1,
+            order_line_id=ITEM_ID,
+        )
+    )
+    delivery_meta = live._delivery_result_to_finalization_meta(prepared)
+    service, request, claim_token = live._configured_delivery_orchestration(
+        delivery_meta,
+        order_id=order_id,
+        item_id=ITEM_ID,
+    )
+    assert service.begin_send(request, claim_token) is True
+    sender_calls = []
+    finalize_calls = []
+
+    async def fail_if_sent(*args, **kwargs):
+        sender_calls.append((args, kwargs))
+        raise AssertionError("verification-required manual delivery must not send")
+
+    async def fail_if_finalized(*args, **kwargs):
+        finalize_calls.append((args, kwargs))
+        raise AssertionError("verification-required manual delivery must not finalize")
+
+    monkeypatch.setattr(live, "send_delivery_steps_once", fail_if_sent)
+    monkeypatch.setattr(live, "_finalize_delivery_after_send", fail_if_finalized)
+
+    response = asyncio.run(
+        reply_server.manual_deliver_order(
+            order_id,
+            current_user={"user_id": USER_ID, "username": "owner"},
+        )
+    )
+
+    with manager.lock:
+        logs = manager.conn.execute(
+            "SELECT status, reason FROM delivery_logs WHERE order_id = ?",
+            (order_id,),
+        ).fetchall()
+    assert sender_calls == []
+    assert finalize_calls == []
+    assert response["success"] is True
+    assert response["delivered"] is False
+    assert manager.get_order_by_id(order_id)["order_status"] == "pending_ship"
+    assert logs
+    assert {row[0] for row in logs} == {"skipped"}
+    assert "verification_required" in logs[-1][1]
+    assert "待人工核实" in logs[-1][1]
+    assert claim_token not in json.dumps(response, ensure_ascii=False)
+    assert all(claim_token not in row[1] for row in logs)
 
 
 @pytest.mark.parametrize(

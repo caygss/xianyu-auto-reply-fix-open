@@ -165,7 +165,8 @@ class DeliveryOrchestrationService:
             "quantity", "mode", "idempotency_key", "reservation_id", "status",
             "result_meta", "last_error_code", "last_error", "created_at",
             "updated_at", "sent_at", "claim_token", "claimed_at",
-            "terminal_claim_token",
+            "terminal_claim_token", "item_id", "send_started_at",
+            "verification_required",
         )
         state = dict(zip(columns, row))
         try:
@@ -182,7 +183,8 @@ class DeliveryOrchestrationService:
                        quantity, mode, idempotency_key, reservation_id, status,
                        result_meta, last_error_code, last_error, created_at,
                        updated_at, sent_at, claim_token, claimed_at,
-                       terminal_claim_token
+                       terminal_claim_token, item_id, send_started_at,
+                       verification_required
                 FROM delivery_orchestration_states
                 WHERE user_id = ? AND card_id = ? AND account_id = ?
                   AND order_id = ? AND order_line_id = ?
@@ -208,7 +210,8 @@ class DeliveryOrchestrationService:
                            quantity, mode, idempotency_key, reservation_id, status,
                            result_meta, last_error_code, last_error, created_at,
                            updated_at, sent_at, claim_token, claimed_at,
-                           terminal_claim_token
+                           terminal_claim_token, item_id, send_started_at,
+                           verification_required
                     FROM delivery_orchestration_states
                     WHERE user_id = ? AND account_id = ?
                       AND order_id = ? AND order_line_id = ?
@@ -272,9 +275,9 @@ class DeliveryOrchestrationService:
                     """
                     INSERT INTO delivery_orchestration_states(
                         user_id, card_id, account_id, order_id, order_line_id,
-                        quantity, mode, idempotency_key, status, result_meta,
+                        quantity, mode, idempotency_key, item_id, status, result_meta,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', '{}',
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '{}',
                               CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """,
                     (
@@ -286,6 +289,7 @@ class DeliveryOrchestrationService:
                         request.quantity,
                         mode,
                         request.idempotency_key,
+                        request.item_id,
                     ),
                 )
                 row = cursor.execute(
@@ -294,7 +298,8 @@ class DeliveryOrchestrationService:
                            quantity, mode, idempotency_key, reservation_id, status,
                            result_meta, last_error_code, last_error, created_at,
                            updated_at, sent_at, claim_token, claimed_at,
-                           terminal_claim_token
+                           terminal_claim_token, item_id, send_started_at,
+                           verification_required
                     FROM delivery_orchestration_states
                     WHERE user_id = ? AND card_id = ? AND account_id = ?
                       AND order_id = ? AND order_line_id = ?
@@ -314,7 +319,8 @@ class DeliveryOrchestrationService:
                                quantity, mode, idempotency_key, reservation_id, status,
                                result_meta, last_error_code, last_error, created_at,
                                updated_at, sent_at, claim_token, claimed_at,
-                               terminal_claim_token
+                               terminal_claim_token, item_id, send_started_at,
+                               verification_required
                         FROM delivery_orchestration_states
                         WHERE idempotency_key = ?
                         """,
@@ -334,7 +340,8 @@ class DeliveryOrchestrationService:
                            quantity, mode, idempotency_key, reservation_id, status,
                            result_meta, last_error_code, last_error, created_at,
                            updated_at, sent_at, claim_token, claimed_at,
-                           terminal_claim_token
+                           terminal_claim_token, item_id, send_started_at,
+                           verification_required
                     FROM delivery_orchestration_states
                     WHERE user_id = ? AND card_id = ? AND account_id = ?
                       AND order_id = ? AND order_line_id = ?
@@ -436,8 +443,11 @@ class DeliveryOrchestrationService:
             "order_line_id": state["order_line_id"],
             "quantity": state["quantity"],
             "mode": state["mode"],
+            "item_id": state.get("item_id"),
             "idempotency_key": state["idempotency_key"],
             "reservation_id": state.get("reservation_id"),
+            "send_started": bool(state.get("send_started_at")),
+            "verification_required": bool(state.get("verification_required")),
             "error_code": state.get("last_error_code"),
             "error": state.get("last_error"),
             "meta": state.get("result_meta") or {},
@@ -461,7 +471,8 @@ class DeliveryOrchestrationService:
         condition_params = list(allowed_statuses)
         if reclaim_stale:
             conditions += (
-                " OR (status = 'sending' AND (claim_token IS NULL OR claimed_at IS NULL "
+                " OR (status = 'sending' AND send_started_at IS NULL "
+                "AND (claim_token IS NULL OR claimed_at IS NULL "
                 "OR julianday(claimed_at) <= julianday('now', ?)))"
             )
             condition_params.append(f"-{self.claim_lease_seconds} seconds")
@@ -472,6 +483,7 @@ class DeliveryOrchestrationService:
                 SET status = 'sending', claim_token = ?,
                     claimed_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
                     terminal_claim_token = NULL,
+                    send_started_at = NULL, verification_required = 0,
                     last_error_code = NULL, last_error = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND ({conditions})
@@ -509,12 +521,21 @@ class DeliveryOrchestrationService:
                 "claimed_at = strftime('%Y-%m-%d %H:%M:%f', 'now')"
             )
         )
+        send_safety_sql = (
+            "send_started_at = NULL, verification_required = 0"
+            if status in {"paused", "failed", "sent"}
+            else (
+                "send_started_at = send_started_at, "
+                "verification_required = verification_required"
+            )
+        )
         with self.db.lock:
             cursor = self.db.conn.execute(
                 f"""
                 UPDATE delivery_orchestration_states
                 SET status = ?, {reservation_sql}, result_meta = ?,
                     last_error_code = ?, last_error = ?, {claim_sql},
+                    {send_safety_sql},
                     sent_at = CASE WHEN ? = 'sent' THEN CURRENT_TIMESTAMP ELSE sent_at END,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND status = 'sending' AND claim_token = ?
@@ -584,7 +605,13 @@ class DeliveryOrchestrationService:
         state = self._get_state(request)
         if state is None:
             state = self._insert_state(request, request.delivery_config["mode"])
-        if state["quantity"] != request.quantity or state["mode"] != request.delivery_config["mode"]:
+        if (
+            state["quantity"] != request.quantity
+            or state["mode"] != request.delivery_config["mode"]
+            or state["idempotency_key"] != request.idempotency_key
+            or str(state.get("item_id") or "").strip()
+            != str(request.item_id or "").strip()
+        ):
             raise DeliveryOrchestrationError("idempotency_conflict", "同一幂等键的订单参数不一致")
         if state["status"] == "sent":
             return self._result(state)
@@ -687,6 +714,50 @@ class DeliveryOrchestrationService:
 
     def prepare_retry(self, request: DeliveryOrchestrationRequest):
         return self._prepare(request, allow_retry=True)
+
+    def begin_send(self, request: DeliveryOrchestrationRequest, claim_token: str):
+        normalized = self._normalize_request(request)
+        state = self._get_state(normalized)
+        token = str(claim_token or "").strip()
+        requested_item_id = str(normalized.item_id or "").strip()
+        scope_matches = bool(state and requested_item_id) and (
+            state["quantity"] == normalized.quantity
+            and state["mode"] == normalized.delivery_config["mode"]
+            and state["idempotency_key"] == normalized.idempotency_key
+            and str(state.get("item_id") or "").strip() == requested_item_id
+        )
+        if not scope_matches:
+            raise DeliveryOrchestrationError(
+                "claim_scope_mismatch",
+                "交付 claim 作用域与持久状态不一致，已阻止发送",
+                "concurrency",
+            )
+        if not token:
+            return False
+
+        with self.db.lock:
+            cursor = self.db.conn.execute(
+                """
+                UPDATE delivery_orchestration_states
+                SET send_started_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+                    verification_required = 1,
+                    claimed_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'sending' AND claim_token = ?
+                  AND quantity = ? AND mode = ? AND idempotency_key = ?
+                  AND item_id = ? AND send_started_at IS NULL
+                """,
+                (
+                    state["id"],
+                    token,
+                    normalized.quantity,
+                    normalized.delivery_config["mode"],
+                    normalized.idempotency_key,
+                    requested_item_id,
+                ),
+            )
+            self.db.conn.commit()
+        return cursor.rowcount == 1
 
     def mark_sent(self, request: DeliveryOrchestrationRequest, claim_token: str):
         normalized = self._normalize_request(request)

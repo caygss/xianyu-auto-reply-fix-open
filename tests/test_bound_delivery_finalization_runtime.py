@@ -77,6 +77,19 @@ def orchestration_state(manager, order_id):
     return tuple(row) if row else None
 
 
+def orchestration_send_safety(manager, order_id):
+    with manager.lock:
+        row = manager.conn.execute(
+            """
+            SELECT item_id, send_started_at, verification_required
+            FROM delivery_orchestration_states
+            WHERE order_id = ?
+            """,
+            (order_id,),
+        ).fetchone()
+    return tuple(row) if row else None
+
+
 def prepare_fixed_link_claim(live, manager, order_id):
     card_id = create_binding(manager)
     DeliveryConfigService(manager).save(
@@ -98,6 +111,32 @@ def prepare_fixed_link_claim(live, manager, order_id):
     )
     assert prepared["success"] is True
     return live._delivery_result_to_finalization_meta(prepared)
+
+
+def test_historical_verification_anchor_is_not_eligible_for_auto_finalize(runtime):
+    live, manager = runtime
+    order_id = "order-historical-verification-anchor"
+    private_token = "historical-private-claim-token"
+    historical_meta = {
+        "success": True,
+        "configured": True,
+        "claim_verification_required": True,
+        "idempotency_key": "historical-verification-key",
+        "_orchestration_private": {"claim_token": private_token},
+    }
+    assert live._persist_delivery_finalization_state(
+        order_id=order_id,
+        item_id=ITEM_ID,
+        buyer_id="buyer-1",
+        delivery_meta=historical_meta,
+        channel="auto",
+        status="sent",
+    ) is True
+
+    assert live._get_pending_delivery_finalization_meta(order_id, 1) is None
+    stored = manager.get_delivery_finalization_state(order_id, 1)
+    assert stored["status"] == "sent"
+    assert stored["delivery_meta"]["claim_verification_required"] is True
 
 
 def test_fixed_link_finalize_marks_orchestration_sent(runtime):
@@ -264,7 +303,7 @@ def test_slow_external_send_renews_claim_and_leaves_no_heartbeat_task(
 
     repeated, leaked = asyncio.run(exercise())
 
-    assert repeated["disposition"] == "defer_in_progress"
+    assert repeated["disposition"] == "verification_required"
     assert len(renewal_times) >= 3
     assert all(
         later - earlier <= 0.45
@@ -335,8 +374,112 @@ def test_send_claim_wrapper_stops_heartbeat_on_error_or_cancellation(
     assert asyncio.run(exercise()) == []
 
 
+@pytest.mark.parametrize("begin_outcome", ["false", "error"])
+def test_configured_send_prewrite_failure_never_starts_sender(
+    runtime,
+    monkeypatch,
+    begin_outcome,
+):
+    live, manager = runtime
+    order_id = f"order-begin-send-{begin_outcome}"
+    delivery_meta = prepare_fixed_link_claim(live, manager, order_id)
+    sender_calls = []
+
+    def fail_begin_send(service, request, claim_token):
+        if begin_outcome == "error":
+            raise RuntimeError("begin send storage failed")
+        return False
+
+    async def sender():
+        sender_calls.append(True)
+        return "must-not-send"
+
+    monkeypatch.setattr(
+        DeliveryOrchestrationService,
+        "begin_send",
+        fail_begin_send,
+    )
+
+    with pytest.raises(xianyu_module.DeliveryClaimOwnershipError) as error_info:
+        asyncio.run(
+            live._send_with_delivery_claim(
+                delivery_meta,
+                sender,
+                order_id=order_id,
+                item_id=ITEM_ID,
+            )
+        )
+
+    assert sender_calls == []
+    assert delivery_meta["_orchestration_private"]["claim_token"] not in str(
+        error_info.value
+    )
+
+
 @pytest.mark.parametrize("renewal_outcome", ["error", "lost"])
-def test_heartbeat_failure_after_sender_started_is_pending_finalize_not_failed(
+def test_unfinished_sender_heartbeat_failure_requires_verification_and_never_reclaims(
+    runtime,
+    monkeypatch,
+    renewal_outcome,
+):
+    live, manager = runtime
+    live.delivery_claim_lease_seconds = 1
+    order_id = f"order-unfinished-{renewal_outcome}-verification"
+    delivery_meta = prepare_fixed_link_claim(live, manager, order_id)
+    sender_calls = []
+
+    def fail_renewal(service, request, claim_token):
+        if renewal_outcome == "error":
+            raise RuntimeError("heartbeat storage failed")
+        return False
+
+    async def sender():
+        sender_calls.append(True)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        DeliveryOrchestrationService,
+        "renew_claim",
+        fail_renewal,
+    )
+
+    with pytest.raises(xianyu_module.DeliveryClaimUncertainError):
+        asyncio.run(
+            live._send_with_delivery_claim(
+                delivery_meta,
+                sender,
+                order_id=order_id,
+                item_id=ITEM_ID,
+            )
+        )
+
+    time.sleep(1.05)
+    retried = asyncio.run(
+        live._auto_delivery(
+            ITEM_ID,
+            "绑定商品",
+            order_id,
+            "buyer-1",
+            include_meta=True,
+            order_line_id=ITEM_ID,
+        )
+    )
+
+    assert sender_calls == [True]
+    assert manager.get_delivery_finalization_state(order_id, 1) is None
+    item_id, send_started_at, verification_required = orchestration_send_safety(
+        manager,
+        order_id,
+    )
+    assert item_id == ITEM_ID
+    assert send_started_at is not None
+    assert verification_required == 1
+    assert retried["disposition"] == "verification_required"
+    assert retried["content"] is None
+
+
+@pytest.mark.parametrize("renewal_outcome", ["error", "lost"])
+def test_heartbeat_failure_after_sender_completed_persists_sent_anchor(
     runtime,
     monkeypatch,
     renewal_outcome,
@@ -347,14 +490,7 @@ def test_heartbeat_failure_after_sender_started_is_pending_finalize_not_failed(
     delivery_meta = prepare_fixed_link_claim(live, manager, order_id)
     private_token = delivery_meta["_orchestration_private"]["claim_token"]
     renewal_attempted = threading.Event()
-    renew_calls = 0
-    real_renew_claim = DeliveryOrchestrationService.renew_claim
-
-    def fail_after_initial_validation(service, request, claim_token):
-        nonlocal renew_calls
-        renew_calls += 1
-        if renew_calls == 1:
-            return real_renew_claim(service, request, claim_token)
+    def fail_renewal(service, request, claim_token):
         renewal_attempted.set()
         if renewal_outcome == "error":
             raise RuntimeError("database heartbeat exploded")
@@ -363,31 +499,28 @@ def test_heartbeat_failure_after_sender_started_is_pending_finalize_not_failed(
     monkeypatch.setattr(
         DeliveryOrchestrationService,
         "renew_claim",
-        fail_after_initial_validation,
+        fail_renewal,
     )
 
     async def exercise():
         async def sender():
             await asyncio.to_thread(renewal_attempted.wait)
+            await asyncio.sleep(0)
             return "sender-completed"
 
-        with pytest.raises(RuntimeError) as error_info:
-            await live._send_with_delivery_claim(
-                delivery_meta,
-                sender,
-                order_id=order_id,
-                item_id=ITEM_ID,
-            )
+        result = await live._send_with_delivery_claim(
+            delivery_meta,
+            sender,
+            order_id=order_id,
+            item_id=ITEM_ID,
+        )
 
         finalization = manager.get_delivery_finalization_state(order_id, 1)
         assert finalization["status"] == "sent"
-        assert finalization["delivery_meta"]["claim_verification_required"] is True
-
-        await live._mark_configured_delivery_failed(
-            delivery_meta,
-            error_info.value,
-            order_id=order_id,
-            item_id=ITEM_ID,
+        assert "claim_verification_required" not in finalization["delivery_meta"]
+        assert (
+            finalization["delivery_meta"]["delivery_claim_status"]
+            == "send_completed_pending_finalize"
         )
         await asyncio.sleep(0)
         leaked = [
@@ -397,14 +530,92 @@ def test_heartbeat_failure_after_sender_started_is_pending_finalize_not_failed(
             and task.get_name().startswith("delivery-claim-heartbeat-")
             and not task.done()
         ]
-        return str(error_info.value), leaked
+        return result, leaked
 
-    error_text, leaked = asyncio.run(exercise())
+    result, leaked = asyncio.run(exercise())
 
     assert orchestration_state(manager, order_id)[0] == "sending"
-    assert private_token not in error_text
-    assert "database heartbeat exploded" not in error_text
+    assert result == "sender-completed"
+    assert private_token not in manager.get_delivery_finalization_state(
+        order_id,
+        1,
+    )["last_error"]
     assert leaked == []
+
+
+@pytest.mark.parametrize("anchor_outcome", ["false", "error"])
+def test_completed_sender_anchor_write_failure_never_reclaims_after_lease(
+    runtime,
+    monkeypatch,
+    anchor_outcome,
+):
+    live, manager = runtime
+    live.delivery_claim_lease_seconds = 1
+    order_id = f"order-completed-anchor-{anchor_outcome}"
+    delivery_meta = prepare_fixed_link_claim(live, manager, order_id)
+    private_token = delivery_meta["_orchestration_private"]["claim_token"]
+    renewal_attempted = threading.Event()
+    sender_calls = []
+
+    def fail_renewal(service, request, claim_token):
+        renewal_attempted.set()
+        return False
+
+    def fail_anchor_write(*args, **kwargs):
+        if anchor_outcome == "error":
+            raise RuntimeError("finalization storage failed")
+        return False
+
+    async def sender():
+        sender_calls.append(True)
+        await asyncio.to_thread(renewal_attempted.wait)
+        await asyncio.sleep(0)
+        return "sender-completed"
+
+    monkeypatch.setattr(
+        DeliveryOrchestrationService,
+        "renew_claim",
+        fail_renewal,
+    )
+    monkeypatch.setattr(
+        live,
+        "_persist_delivery_finalization_state",
+        fail_anchor_write,
+    )
+
+    with pytest.raises(xianyu_module.DeliveryClaimUncertainError) as error_info:
+        asyncio.run(
+            live._send_with_delivery_claim(
+                delivery_meta,
+                sender,
+                order_id=order_id,
+                item_id=ITEM_ID,
+            )
+        )
+
+    time.sleep(1.05)
+    retried = asyncio.run(
+        live._auto_delivery(
+            ITEM_ID,
+            "绑定商品",
+            order_id,
+            "buyer-1",
+            include_meta=True,
+            order_line_id=ITEM_ID,
+        )
+    )
+
+    assert sender_calls == [True]
+    assert manager.get_delivery_finalization_state(order_id, 1) is None
+    _, send_started_at, verification_required = orchestration_send_safety(
+        manager,
+        order_id,
+    )
+    assert send_started_at is not None
+    assert verification_required == 1
+    assert retried["disposition"] == "verification_required"
+    assert retried["content"] is None
+    assert private_token not in str(error_info.value)
 
 
 def test_cancellation_during_heartbeat_failure_propagates_only_cancelled_error(
@@ -465,15 +676,18 @@ def test_cancellation_during_heartbeat_failure_propagates_only_cancelled_error(
         ]
 
     leaked = asyncio.run(exercise())
-    finalization = manager.get_delivery_finalization_state(order_id, 1)
-
-    assert finalization["status"] == "sent"
-    assert finalization["delivery_meta"]["claim_verification_required"] is True
+    assert manager.get_delivery_finalization_state(order_id, 1) is None
     assert orchestration_state(manager, order_id)[0] == "sending"
+    _, send_started_at, verification_required = orchestration_send_safety(
+        manager,
+        order_id,
+    )
+    assert send_started_at is not None
+    assert verification_required == 1
     assert leaked == []
 
 
-def test_cancellation_remains_primary_when_uncertain_anchor_write_raises(
+def test_cancellation_never_calls_completed_sender_anchor_writer(
     runtime,
     monkeypatch,
 ):
@@ -481,12 +695,15 @@ def test_cancellation_remains_primary_when_uncertain_anchor_write_raises(
     order_id = "order-cancel-anchor-error"
     delivery_meta = prepare_fixed_link_claim(live, manager, order_id)
 
+    completed_anchor_calls = []
+
     async def fail_anchor_write(*args, **kwargs):
+        completed_anchor_calls.append((args, kwargs))
         raise RuntimeError("anchor write failed")
 
     monkeypatch.setattr(
         live,
-        "_persist_delivery_claim_uncertain",
+        "_persist_completed_delivery_after_claim_loss",
         fail_anchor_write,
     )
 
@@ -522,9 +739,11 @@ def test_cancellation_remains_primary_when_uncertain_anchor_write_raises(
         ]
 
     assert asyncio.run(exercise()) == []
+    assert completed_anchor_calls == []
+    assert manager.get_delivery_finalization_state(order_id, 1) is None
 
 
-def test_heartbeat_failure_cleans_sender_when_uncertain_anchor_write_raises(
+def test_unfinished_sender_heartbeat_failure_never_calls_completed_anchor_writer(
     runtime,
     monkeypatch,
 ):
@@ -532,27 +751,23 @@ def test_heartbeat_failure_cleans_sender_when_uncertain_anchor_write_raises(
     live.delivery_claim_lease_seconds = 1
     order_id = "order-heartbeat-anchor-error"
     delivery_meta = prepare_fixed_link_claim(live, manager, order_id)
-    renew_calls = 0
-    real_renew_claim = DeliveryOrchestrationService.renew_claim
-
-    def fail_after_initial_validation(service, request, claim_token):
-        nonlocal renew_calls
-        renew_calls += 1
-        if renew_calls == 1:
-            return real_renew_claim(service, request, claim_token)
+    def fail_renewal(service, request, claim_token):
         raise RuntimeError("heartbeat failed")
 
+    completed_anchor_calls = []
+
     async def fail_anchor_write(*args, **kwargs):
+        completed_anchor_calls.append((args, kwargs))
         raise RuntimeError("anchor write failed")
 
     monkeypatch.setattr(
         DeliveryOrchestrationService,
         "renew_claim",
-        fail_after_initial_validation,
+        fail_renewal,
     )
     monkeypatch.setattr(
         live,
-        "_persist_delivery_claim_uncertain",
+        "_persist_completed_delivery_after_claim_loss",
         fail_anchor_write,
     )
 
@@ -580,9 +795,17 @@ def test_heartbeat_failure_cleans_sender_when_uncertain_anchor_write_raises(
         ]
 
     assert asyncio.run(exercise()) == []
+    assert completed_anchor_calls == []
+    assert manager.get_delivery_finalization_state(order_id, 1) is None
+    _, send_started_at, verification_required = orchestration_send_safety(
+        manager,
+        order_id,
+    )
+    assert send_started_at is not None
+    assert verification_required == 1
 
 
-def test_compensation_entry_preserves_uncertain_anchor_and_does_not_resend(
+def test_compensation_entry_keeps_unknown_send_for_verification_without_resend(
     runtime,
     monkeypatch,
 ):
@@ -614,33 +837,32 @@ def test_compensation_entry_preserves_uncertain_anchor_and_does_not_resend(
     live.order_confirm_cooldown = 300
     renewal_attempted = threading.Event()
     send_calls = []
-    renew_calls = 0
-    real_renew_claim = DeliveryOrchestrationService.renew_claim
+    delivery_logs = []
 
-    def fail_heartbeat_after_ownership_check(service, request, claim_token):
-        nonlocal renew_calls
-        renew_calls += 1
-        if renew_calls == 1:
-            return real_renew_claim(service, request, claim_token)
+    def fail_heartbeat(service, request, claim_token):
         renewal_attempted.set()
         raise RuntimeError("heartbeat database failure")
 
     async def send_once(*args, **kwargs):
         send_calls.append((args, kwargs))
         await asyncio.to_thread(renewal_attempted.wait)
-        return True
+        await asyncio.Event().wait()
 
     monkeypatch.setattr(
         DeliveryOrchestrationService,
         "renew_claim",
-        fail_heartbeat_after_ownership_check,
+        fail_heartbeat,
     )
     monkeypatch.setattr(live, "can_auto_delivery", lambda value: True)
     monkeypatch.setattr(live, "is_lock_held", lambda value: False)
     monkeypatch.setattr(live, "is_auto_confirm_enabled", lambda: False)
     monkeypatch.setattr(live, "send_delivery_steps_once", send_once)
     monkeypatch.setattr(live, "_activate_delivery_lock", lambda *args, **kwargs: None)
-    monkeypatch.setattr(live, "_record_delivery_log", lambda **kwargs: None)
+    monkeypatch.setattr(
+        live,
+        "_record_delivery_log",
+        lambda **kwargs: delivery_logs.append(kwargs),
+    )
 
     first_result = asyncio.run(
         live._send_recovered_delivery_without_sid(
@@ -652,11 +874,17 @@ def test_compensation_entry_preserves_uncertain_anchor_and_does_not_resend(
         )
     )
 
-    first_finalization = manager.get_delivery_finalization_state(order_id, 1)
     assert first_result is False
-    assert first_finalization["status"] == "sent"
-    assert first_finalization["delivery_meta"]["claim_verification_required"] is True
+    assert manager.get_delivery_finalization_state(order_id, 1) is None
     assert orchestration_state(manager, order_id)[0] == "sending"
+    _, send_started_at, verification_required = orchestration_send_safety(
+        manager,
+        order_id,
+    )
+    assert send_started_at is not None
+    assert verification_required == 1
+
+    delivery_logs.clear()
 
     second_result = asyncio.run(
         live._send_recovered_delivery_without_sid(
@@ -668,9 +896,12 @@ def test_compensation_entry_preserves_uncertain_anchor_and_does_not_resend(
         )
     )
 
-    assert second_result is True
+    assert second_result is False
     assert len(send_calls) == 1
-    assert orchestration_state(manager, order_id)[0] == "sent"
+    assert manager.get_delivery_finalization_state(order_id, 1) is None
+    assert orchestration_state(manager, order_id)[0] == "sending"
+    assert [entry["status"] for entry in delivery_logs] == ["skipped"]
+    assert "待人工核实" in delivery_logs[0]["reason"]
 
 
 @pytest.mark.parametrize(
@@ -683,12 +914,17 @@ def test_compensation_entry_preserves_uncertain_anchor_and_does_not_resend(
         "token_wrong_type",
         "token_stale",
         "card_id_missing",
+        "card_id_mismatch",
         "order_scope_mismatch",
         "item_scope_invalid",
         "order_line_missing",
         "quantity_missing",
+        "quantity_mismatch",
         "mode_missing",
+        "mode_mismatch",
         "idempotency_key_missing",
+        "idempotency_key_mismatch",
+        "item_scope_mismatch",
         "user_scope_invalid",
         "account_scope_invalid",
     ],
@@ -718,6 +954,8 @@ def test_configured_send_validates_complete_claim_scope_before_sender(
         delivery_meta["_orchestration_private"]["claim_token"] = exposed_token
     elif invalid_case == "card_id_missing":
         delivery_meta["card_id"] = None
+    elif invalid_case == "card_id_mismatch":
+        delivery_meta["card_id"] += 1
     elif invalid_case == "order_scope_mismatch":
         delivery_meta["order_id"] = "different-order"
     elif invalid_case == "item_scope_invalid":
@@ -726,10 +964,18 @@ def test_configured_send_validates_complete_claim_scope_before_sender(
         delivery_meta["order_line_id"] = ""
     elif invalid_case == "quantity_missing":
         delivery_meta["quantity"] = None
+    elif invalid_case == "quantity_mismatch":
+        delivery_meta["quantity"] = 2
     elif invalid_case == "mode_missing":
         delivery_meta["mode"] = ""
+    elif invalid_case == "mode_mismatch":
+        delivery_meta["mode"] = "provider_api"
     elif invalid_case == "idempotency_key_missing":
         delivery_meta["idempotency_key"] = ""
+    elif invalid_case == "idempotency_key_mismatch":
+        delivery_meta["idempotency_key"] = "different-idempotency-key"
+    elif invalid_case == "item_scope_mismatch":
+        send_item_id = "different-item"
     elif invalid_case == "user_scope_invalid":
         live.user_id = 0
     elif invalid_case == "account_scope_invalid":
@@ -777,7 +1023,7 @@ def test_only_explicit_configured_false_uses_legacy_sender_without_claim(runtime
     assert sender_calls == [True]
 
 
-def test_short_configured_send_renews_before_sender_without_blocking_event_loop(
+def test_short_configured_send_begin_send_does_not_block_event_loop(
     runtime,
     monkeypatch,
 ):
@@ -785,13 +1031,13 @@ def test_short_configured_send_renews_before_sender_without_blocking_event_loop(
     order_id = "order-immediate-renew-nonblocking"
     delivery_meta = prepare_fixed_link_claim(live, manager, order_id)
     events = []
-    real_renew_claim = DeliveryOrchestrationService.renew_claim
+    real_begin_send = DeliveryOrchestrationService.begin_send
 
-    def slow_renewal(service, request, claim_token):
-        events.append("renew-start")
+    def slow_begin_send(service, request, claim_token):
+        events.append("begin-start")
         time.sleep(0.12)
-        result = real_renew_claim(service, request, claim_token)
-        events.append("renew-end")
+        result = real_begin_send(service, request, claim_token)
+        events.append("begin-end")
         return result
 
     async def sender():
@@ -802,7 +1048,11 @@ def test_short_configured_send_renews_before_sender_without_blocking_event_loop(
         await asyncio.sleep(0.02)
         events.append("tick")
 
-    monkeypatch.setattr(DeliveryOrchestrationService, "renew_claim", slow_renewal)
+    monkeypatch.setattr(
+        DeliveryOrchestrationService,
+        "begin_send",
+        slow_begin_send,
+    )
 
     async def exercise():
         send_task = asyncio.create_task(
@@ -817,8 +1067,8 @@ def test_short_configured_send_renews_before_sender_without_blocking_event_loop(
         return await send_task
 
     assert asyncio.run(exercise()) == "sent"
-    assert events.index("renew-start") < events.index("tick") < events.index("renew-end")
-    assert events.index("renew-end") < events.index("sender")
+    assert events.index("begin-start") < events.index("tick") < events.index("begin-end")
+    assert events.index("begin-end") < events.index("sender")
 
 
 @pytest.mark.parametrize("operation", ["mark_sent", "mark_failed"])
@@ -974,6 +1224,183 @@ def test_main_auto_delivery_conflict_has_zero_prepare_send_or_success_notificati
     assert orchestration_count == 0
     assert send_calls == []
     assert notifications == []
+
+
+def test_main_auto_delivery_verification_required_has_zero_send_finalize_or_notification(
+    runtime,
+    monkeypatch,
+):
+    live, manager = runtime
+    order_id = "order-main-verification-required"
+    live._order_locks = defaultdict(asyncio.Lock)
+    live._lock_usage_times = {}
+    live.order_status_handler = None
+    send_calls = []
+    finalize_calls = []
+    notifications = []
+    delivery_logs = []
+
+    async def return_plan(*args, **kwargs):
+        return 1, [{
+            "unit_index": 1,
+            "quantity": 1,
+            "order_line_id": ITEM_ID,
+            "binding_snapshot": {},
+        }]
+
+    async def verification_result(*args, **kwargs):
+        return {
+            "success": False,
+            "configured": True,
+            "content": None,
+            "delivery_steps": [],
+            "disposition": "verification_required",
+            "error": "发货结果待人工核实，已阻止自动重发和确认发货",
+        }
+
+    async def record_send(*args, **kwargs):
+        send_calls.append((args, kwargs))
+
+    async def record_finalize(*args, **kwargs):
+        finalize_calls.append((args, kwargs))
+        return {"success": True}
+
+    async def record_notification(*args, **kwargs):
+        notifications.append((args, kwargs))
+
+    monkeypatch.setattr(live, "_check_buyer_blacklist_for_action", lambda **kwargs: False)
+    monkeypatch.setattr(live, "_extract_order_id", lambda *args: order_id)
+    monkeypatch.setattr(live, "_is_trustworthy_buyer_id", lambda value: False)
+    monkeypatch.setattr(live, "is_lock_held", lambda value: False)
+    monkeypatch.setattr(live, "can_auto_delivery", lambda value: True)
+    monkeypatch.setattr(live, "_build_order_auto_delivery_preparation_plan", return_plan)
+    monkeypatch.setattr(live, "_auto_delivery", verification_result)
+    monkeypatch.setattr(live, "_send_delivery_steps", record_send)
+    monkeypatch.setattr(live, "_finalize_delivery_after_send", record_finalize)
+    monkeypatch.setattr(live, "send_delivery_failure_notification", record_notification)
+    monkeypatch.setattr(
+        live,
+        "_record_delivery_log",
+        lambda **kwargs: delivery_logs.append(kwargs),
+    )
+    monkeypatch.setattr(
+        manager,
+        "get_order_by_id",
+        lambda value: {
+            "order_id": value,
+            "buyer_id": "buyer-1",
+            "item_id": ITEM_ID,
+            "quantity": "1",
+        },
+    )
+    monkeypatch.setattr(
+        manager,
+        "get_delivery_progress_summary",
+        lambda *args, **kwargs: {
+            "coverage_conflict": False,
+            "aggregate_status": "pending",
+        },
+    )
+
+    asyncio.run(
+        live._handle_auto_delivery(
+            object(),
+            {},
+            "买家",
+            "buyer-1",
+            "未知商品",
+            "chat-1",
+            "now",
+        )
+    )
+
+    assert send_calls == []
+    assert finalize_calls == []
+    assert notifications == []
+    assert [entry["status"] for entry in delivery_logs] == ["skipped"]
+    assert "verification_required" in delivery_logs[0]["reason"]
+    assert "待人工核实" in delivery_logs[0]["reason"]
+
+
+def test_simple_auto_delivery_verification_required_has_zero_send_finalize_or_notification(
+    runtime,
+    monkeypatch,
+):
+    live, manager = runtime
+    create_binding(manager)
+    order_id = "order-simple-verification-required"
+    live._order_locks = defaultdict(asyncio.Lock)
+    live._lock_usage_times = {}
+    send_calls = []
+    finalize_calls = []
+    notifications = []
+    delivery_logs = []
+
+    async def owned_item(*args, **kwargs):
+        return True
+
+    async def verification_result(*args, **kwargs):
+        return {
+            "success": False,
+            "configured": True,
+            "content": None,
+            "delivery_steps": [],
+            "disposition": "verification_required",
+            "error": "发货结果待人工核实，已阻止自动重发和确认发货",
+        }
+
+    async def record_send(*args, **kwargs):
+        send_calls.append((args, kwargs))
+
+    async def record_finalize(*args, **kwargs):
+        finalize_calls.append((args, kwargs))
+        return {"success": True}
+
+    async def record_notification(*args, **kwargs):
+        notifications.append((args, kwargs))
+
+    monkeypatch.setattr(live, "_ensure_item_owned_by_current_account", owned_item)
+    monkeypatch.setattr(live, "_check_buyer_blacklist_for_action", lambda **kwargs: False)
+    monkeypatch.setattr(live, "is_lock_held", lambda value: False)
+    monkeypatch.setattr(live, "can_auto_delivery", lambda value: True)
+    monkeypatch.setattr(live, "_auto_delivery", verification_result)
+    monkeypatch.setattr(live, "_send_delivery_steps", record_send)
+    monkeypatch.setattr(live, "_finalize_delivery_after_send", record_finalize)
+    monkeypatch.setattr(live, "send_delivery_failure_notification", record_notification)
+    monkeypatch.setattr(
+        live,
+        "_record_delivery_log",
+        lambda **kwargs: delivery_logs.append(kwargs),
+    )
+    monkeypatch.setattr(
+        manager,
+        "get_order_by_id",
+        lambda value: {
+            "order_id": value,
+            "buyer_id": "buyer-1",
+            "item_id": ITEM_ID,
+            "quantity": "1",
+        },
+    )
+
+    asyncio.run(
+        live._handle_simple_message_auto_delivery(
+            object(),
+            order_id,
+            ITEM_ID,
+            "buyer-1",
+            "chat-1",
+            "now",
+            "message-1",
+        )
+    )
+
+    assert send_calls == []
+    assert finalize_calls == []
+    assert notifications == []
+    assert [entry["status"] for entry in delivery_logs] == ["skipped"]
+    assert "verification_required" in delivery_logs[0]["reason"]
+    assert "待人工核实" in delivery_logs[0]["reason"]
 
 
 def test_main_auto_delivery_wraps_external_send_with_claim(runtime, monkeypatch):

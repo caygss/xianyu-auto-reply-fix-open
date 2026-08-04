@@ -282,6 +282,60 @@ class DBManager:
             return normalized_current
 
         return normalized_incoming
+
+    def _migrate_delivery_orchestration_send_state(self, cursor) -> None:
+        columns = {
+            row[1]
+            for row in cursor.execute(
+                "PRAGMA table_info(delivery_orchestration_states)"
+            ).fetchall()
+        }
+        column_definitions = {
+            "claim_token": "TEXT",
+            "claimed_at": "TIMESTAMP",
+            "terminal_claim_token": "TEXT",
+            "item_id": "TEXT",
+            "send_started_at": "TIMESTAMP",
+            "verification_required": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column_name, definition in column_definitions.items():
+            if column_name not in columns:
+                cursor.execute(
+                    f"ALTER TABLE delivery_orchestration_states "
+                    f"ADD COLUMN {column_name} {definition}"
+                )
+
+        historical_rows = cursor.execute(
+            """
+            SELECT item_id, delivery_meta
+            FROM delivery_finalization_states
+            WHERE status = 'sent' AND delivery_meta IS NOT NULL
+            """
+        ).fetchall()
+        for row in historical_rows:
+            try:
+                metadata = json.loads(row[1] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(metadata, dict) or not metadata.get(
+                "claim_verification_required"
+            ):
+                continue
+            idempotency_key = str(metadata.get("idempotency_key") or "").strip()
+            if not idempotency_key:
+                continue
+            item_id = str(row[0] or metadata.get("item_id") or "").strip() or None
+            cursor.execute(
+                """
+                UPDATE delivery_orchestration_states
+                SET item_id = COALESCE(NULLIF(item_id, ''), ?),
+                    send_started_at = COALESCE(send_started_at, CURRENT_TIMESTAMP),
+                    verification_required = 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE idempotency_key = ? AND status = 'sending'
+                """,
+                (item_id, idempotency_key),
+            )
     
     def init_db(self):
         """初始化数据库表结构"""
@@ -748,6 +802,9 @@ class DBManager:
                 claim_token TEXT,
                 claimed_at TIMESTAMP,
                 terminal_claim_token TEXT,
+                item_id TEXT,
+                send_started_at TIMESTAMP,
+                verification_required INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'paused', 'reserved', 'sending', 'sent', 'failed')),
                 result_meta TEXT NOT NULL DEFAULT '{}',
@@ -760,24 +817,20 @@ class DBManager:
                 UNIQUE (idempotency_key)
             )
             ''')
-            orchestration_columns = {
-                row[1]
-                for row in cursor.execute(
-                    "PRAGMA table_info(delivery_orchestration_states)"
-                ).fetchall()
-            }
-            if "claim_token" not in orchestration_columns:
+            cursor.execute("SAVEPOINT delivery_orchestration_send_state_migration")
+            try:
+                self._migrate_delivery_orchestration_send_state(cursor)
+            except Exception:
                 cursor.execute(
-                    "ALTER TABLE delivery_orchestration_states ADD COLUMN claim_token TEXT"
+                    "ROLLBACK TO SAVEPOINT delivery_orchestration_send_state_migration"
                 )
-            if "claimed_at" not in orchestration_columns:
                 cursor.execute(
-                    "ALTER TABLE delivery_orchestration_states ADD COLUMN claimed_at TIMESTAMP"
+                    "RELEASE SAVEPOINT delivery_orchestration_send_state_migration"
                 )
-            if "terminal_claim_token" not in orchestration_columns:
+                raise
+            else:
                 cursor.execute(
-                    "ALTER TABLE delivery_orchestration_states "
-                    "ADD COLUMN terminal_claim_token TEXT"
+                    "RELEASE SAVEPOINT delivery_orchestration_send_state_migration"
                 )
             self._execute_sql(
                 cursor,

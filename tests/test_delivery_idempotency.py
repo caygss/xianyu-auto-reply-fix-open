@@ -28,7 +28,7 @@ def test_duplicate_callback_returns_existing_result_without_sending_again(servic
 def test_order_line_fallback_matches_item_id_for_idempotency(services):
     service, _, dispatcher, manager = services
     first_request = make_request(1, order_line_id=None, item_id="item-7")
-    second_request = make_request(1, order_line_id="item-7", item_id="different-item")
+    second_request = make_request(1, order_line_id="item-7", item_id="item-7")
 
     first = service.prepare(first_request)
     second = service.prepare(second_request)
@@ -45,6 +45,167 @@ def test_order_line_fallback_matches_item_id_for_idempotency(services):
 
 def _request_for_card(request, card_id):
     return request.__class__(**{**request.__dict__, "card_id": card_id})
+
+
+def _request_with(request, **changes):
+    return request.__class__(**{**request.__dict__, **changes})
+
+
+def test_begin_send_is_one_shot_and_durably_blocks_stale_reclaim(services):
+    service, _, _, manager = services
+    service.claim_lease_seconds = 1
+    request = make_request(
+        1,
+        order_line_id="line-durable-send-started",
+        item_id="item-durable-send-started",
+    )
+    prepared = service.prepare(request)
+    claim_token = prepared["_orchestration_private"]["claim_token"]
+
+    assert service.begin_send(request, claim_token) is True
+    assert service.begin_send(request, claim_token) is False
+
+    with manager.lock:
+        manager.conn.execute(
+            """
+            UPDATE delivery_orchestration_states
+            SET claimed_at = datetime('now', '-10 minutes')
+            WHERE order_line_id = ?
+            """,
+            ("line-durable-send-started",),
+        )
+        manager.conn.commit()
+
+    retried = service.prepare_retry(request)
+    row = manager.conn.execute(
+        """
+        SELECT item_id, send_started_at, verification_required, claim_token
+        FROM delivery_orchestration_states
+        WHERE order_line_id = ?
+        """,
+        ("line-durable-send-started",),
+    ).fetchone()
+
+    assert retried["status"] == "in_progress"
+    assert retried.get("claimed") is not True
+    assert retried["verification_required"] is True
+    assert row[0] == "item-durable-send-started"
+    assert row[1] is not None
+    assert row[2] == 1
+    assert row[3] == claim_token
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["quantity", "mode", "item_id", "idempotency_key", "card_id"],
+)
+def test_begin_send_rejects_any_persisted_claim_payload_mismatch(
+    services,
+    mismatch,
+):
+    service, _, _, manager = services
+    request = make_request(
+        1,
+        order_line_id=f"line-begin-send-mismatch-{mismatch}",
+        item_id="item-begin-send-scope",
+    )
+    prepared = service.prepare(request)
+    claim_token = prepared["_orchestration_private"]["claim_token"]
+    candidate = request
+
+    if mismatch == "quantity":
+        candidate = _request_with(request, quantity=2)
+    elif mismatch == "mode":
+        candidate = _request_with(
+            request,
+            delivery_config={"mode": "provider_api"},
+        )
+    elif mismatch == "item_id":
+        candidate = _request_with(request, item_id="different-item")
+    elif mismatch == "card_id":
+        candidate = _request_for_card(request, 8)
+    else:
+        with manager.lock:
+            manager.conn.execute(
+                """
+                UPDATE delivery_orchestration_states
+                SET idempotency_key = 'persisted-mismatched-key'
+                WHERE order_line_id = ?
+                """,
+                (f"line-begin-send-mismatch-{mismatch}",),
+            )
+            manager.conn.commit()
+
+    with pytest.raises(DeliveryOrchestrationError) as error_info:
+        service.begin_send(candidate, claim_token)
+
+    assert error_info.value.code == "claim_scope_mismatch"
+    assert claim_token not in str(error_info.value)
+    row = manager.conn.execute(
+        """
+        SELECT send_started_at, verification_required
+        FROM delivery_orchestration_states
+        WHERE order_line_id = ?
+        """,
+        (f"line-begin-send-mismatch-{mismatch}",),
+    ).fetchone()
+    assert row == (None, 0)
+
+
+def test_mark_failed_clears_send_barrier_and_retries_same_reservation(services):
+    service, inventory, _, manager = services
+    inventory.import_items(7, 1, "account-a", ["durable-a", "durable-b"])
+    request = make_request(
+        2,
+        order_line_id="line-begin-send-failed",
+        item_id="item-begin-send-failed",
+        mode="imported_card",
+    )
+    prepared = service.prepare(request)
+    claim_token = prepared["_orchestration_private"]["claim_token"]
+
+    assert service.begin_send(request, claim_token) is True
+    failed = service.mark_failed(request, claim_token, RuntimeError("sender failed"))
+    retried = service.prepare_retry(request)
+
+    row = manager.conn.execute(
+        """
+        SELECT send_started_at, verification_required
+        FROM delivery_orchestration_states
+        WHERE order_line_id = ?
+        """,
+        ("line-begin-send-failed",),
+    ).fetchone()
+    assert failed["status"] == "failed"
+    assert row == (None, 0)
+    assert retried["status"] == "sending"
+    assert retried["reservation_id"] == prepared["reservation_id"]
+    assert retried["contents"] == prepared["contents"]
+
+
+def test_mark_sent_clears_send_barrier_terminally(services):
+    service, _, _, manager = services
+    request = make_request(
+        1,
+        order_line_id="line-begin-send-sent",
+        item_id="item-begin-send-sent",
+    )
+    prepared = service.prepare(request)
+    claim_token = prepared["_orchestration_private"]["claim_token"]
+
+    assert service.begin_send(request, claim_token) is True
+    sent = service.mark_sent(request, claim_token)
+
+    row = manager.conn.execute(
+        """
+        SELECT status, send_started_at, verification_required
+        FROM delivery_orchestration_states
+        WHERE order_line_id = ?
+        """,
+        ("line-begin-send-sent",),
+    ).fetchone()
+    assert sent["status"] == "sent"
+    assert row == ("sent", None, 0)
 
 
 def test_rebound_card_cannot_create_second_state_for_same_order_line(services):

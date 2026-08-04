@@ -15763,7 +15763,11 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
 
             delivery_meta['delivery_unit_index'] = unit_index
 
-            if delivery_disposition in {'noop_sent', 'defer_in_progress'}:
+            if delivery_disposition in {
+                'noop_sent',
+                'defer_in_progress',
+                'verification_required',
+            }:
                 db_manager.create_delivery_log(
                     user_id=user_id,
                     cookie_id=cookie_id,
