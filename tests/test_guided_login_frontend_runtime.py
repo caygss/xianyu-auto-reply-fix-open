@@ -161,6 +161,22 @@ assert.equal(ready.step, 6);
 assert.equal(ready.action, 'finish');
 assert.equal(ready.ready, true);
 
+const noItemsCopy = guided.getGuidedSetupCopy(
+  5,
+  { guidedStatus: { step_id: 'no_items', title: '先准备商品', message: '请先同步商品。' } },
+  { action: 'go_to_item_management' },
+);
+assert.equal(noItemsCopy.title, '先准备商品');
+assert.match(noItemsCopy.message, /同步商品/);
+
+const republishCopy = guided.getGuidedSetupCopy(
+  5,
+  { guidedStatus: { step_id: 'republish_config', title: '开启自动重新上架', message: '请开启自动重新上架。' } },
+  { action: 'go_to_republish_config' },
+);
+assert.equal(republishCopy.title, '开启自动重新上架');
+assert.match(republishCopy.message, /自动重新上架/);
+
 const setupSnapshotReady = guided.getGuidedSetupStatusViewModel(
   { primary_action: 'finish', step_index: 6, runtime_ready: true, technical_status: 'connected' },
   null,

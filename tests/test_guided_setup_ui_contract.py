@@ -56,6 +56,32 @@ def test_guided_setup_copy_is_chinese_and_task_focused():
         assert phrase in INDEX or phrase in APP
     assert "599.3" not in INDEX
     assert "599.3" not in APP
+    assert "人工验证或等待退避" not in INDEX
+
+
+def test_guided_setup_delivery_actions_navigate_and_focus_existing_item_controls():
+    for action in (
+        "go_to_item_management",
+        "go_to_delivery_config",
+        "go_to_republish_config",
+        "target_item_id",
+        "showSection('items')",
+        "itemCookieFilter",
+        "openDeliveryConfigForItem",
+        "openRepublishConfig",
+        "scrollIntoView",
+        "guided-setup-target",
+    ):
+        assert action in APP or action in CSS
+    assert "商品发布" in APP
+    assert "未找到目标商品" in APP
+
+
+def test_guided_setup_target_controls_are_keyboard_and_aria_friendly():
+    assert "tabindex=\"-1\"" in APP
+    assert "aria-label" in APP
+    assert "focus({" in APP
+    assert "role=\"status\"" in INDEX
 
 
 def test_guided_setup_uses_server_deadline_and_refreshes_after_countdown():

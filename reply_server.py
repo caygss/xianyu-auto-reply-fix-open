@@ -5037,7 +5037,23 @@ class GuidedSetupActionRequest(BaseModel):
 
 
 def _get_guided_delivery_summary(cookie_id: str) -> Dict[str, Any]:
-    """Read only a safe completion flag from the existing delivery template store."""
+    """Build a bounded setup summary without returning any delivery content."""
+    try:
+        raw_items = db_manager.get_items_by_cookie(cookie_id)
+    except Exception as exc:
+        logger.warning(f"读取向导商品摘要失败: {type(exc).__name__}")
+        raw_items = []
+    items = []
+    for item in raw_items if isinstance(raw_items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        item_id = re.sub(r"[^A-Za-z0-9_.:-]", "", str(item.get("item_id") or "").strip())
+        if not item_id or len(item_id) > 128:
+            continue
+        title = re.sub(r"[\x00-\x1f\x7f]+", " ", str(item.get("item_title") or "")).strip()
+        items.append({"item_id": item_id, "item_title": title[:80]})
+    item_by_id = {item["item_id"]: item for item in items}
+
     try:
         templates = _get_republish_store().list_templates(cookie_id=cookie_id)
     except Exception as exc:
@@ -5047,22 +5063,26 @@ def _get_guided_delivery_summary(cookie_id: str) -> Dict[str, Any]:
         templates = []
 
     configured = False
+    delivery_item_ids = []
+    active_republish_item_ids = []
     for template in templates if isinstance(templates, list) else []:
-        if not bool(getattr(template, 'auto_delivery', False)):
-            continue
-        delivery_choice = getattr(template, 'delivery_choice', None)
-        if not isinstance(delivery_choice, str) or not delivery_choice.strip():
-            continue
-        delivery_content = getattr(template, 'delivery_content', None)
+        item_id = str(getattr(template, "current_item_id", "") or "").strip()
+        auto_delivery = bool(getattr(template, "auto_delivery", False))
+        delivery_choice = getattr(template, "delivery_choice", None)
+        has_choice = isinstance(delivery_choice, str) and bool(delivery_choice.strip())
+        delivery_content = getattr(template, "delivery_content", None)
         has_default_content = isinstance(delivery_content, str) and bool(delivery_content.strip())
-        sku_delivery = getattr(template, 'sku_delivery', None)
+        sku_delivery = getattr(template, "sku_delivery", None)
         has_sku_content = isinstance(sku_delivery, dict) and any(
-            isinstance(value, str) and bool(value.strip())
-            for value in sku_delivery.values()
+            isinstance(value, str) and bool(value.strip()) for value in sku_delivery.values()
         )
-        if has_default_content or has_sku_content:
+        if item_id in item_by_id and auto_delivery and has_choice and (has_default_content or has_sku_content):
             configured = True
-            break
+            delivery_item_ids.append(item_id)
+        if item_id in item_by_id and bool(getattr(template, "auto_republish", False)) and not bool(
+            getattr(template, "paused", False)
+        ):
+            active_republish_item_ids.append(item_id)
     config_count = 0
     try:
         account_details = db_manager.get_cookie_details(cookie_id) or {}
@@ -5071,10 +5091,27 @@ def _get_guided_delivery_summary(cookie_id: str) -> Dict[str, Any]:
         )
     except Exception as exc:
         logger.warning(f"读取向导交付配置摘要失败: {type(exc).__name__}")
+    delivery_configured = configured or config_count > 0
+    republish_configured = bool(active_republish_item_ids)
+    target_item_id = (
+        active_republish_item_ids[0]
+        if active_republish_item_ids
+        else delivery_item_ids[0]
+        if delivery_item_ids
+        else items[0]["item_id"]
+        if items
+        else None
+    )
+    target_title = item_by_id.get(target_item_id, {}).get("item_title", "") if target_item_id else ""
     return {
-        'configured': configured or config_count > 0,
-        'template_count': len(templates) if isinstance(templates, list) else 0,
-        'config_count': config_count,
+        "configured": delivery_configured,
+        "delivery_configured": delivery_configured,
+        "republish_configured": republish_configured,
+        "item_count": len(items),
+        "target_item_id": target_item_id,
+        "target_item_title": target_title,
+        "template_count": len(templates) if isinstance(templates, list) else 0,
+        "config_count": config_count,
     }
 
 
@@ -5235,7 +5272,9 @@ def _perform_guided_setup_action_impl(
         'refresh_status',
         'open_manual_verification',
         'complete_manual_verification',
+        'go_to_item_management',
         'go_to_delivery_config',
+        'go_to_republish_config',
         'finish',
     }
     action = str(request.action or '').strip()
@@ -5307,12 +5346,17 @@ def _perform_guided_setup_action_impl(
             'action': action,
             **_build_guided_setup_status_payload(current_user),
         }
-    if action == 'go_to_delivery_config':
+    if action in {'go_to_item_management', 'go_to_delivery_config', 'go_to_republish_config'}:
+        messages = {
+            'go_to_item_management': '请进入商品管理，先同步已有商品；如果确实没有商品，请前往商品发布。',
+            'go_to_delivery_config': '请在商品管理中打开“设置交付方式”，完成当前商品的交付配置。',
+            'go_to_republish_config': '请在商品管理中打开“自动发货 / 重新上架配置”，并开启自动重新上架。',
+        }
         return {
             'success': True,
             'action': action,
-            'message': '请进入交付配置页面，设置买家收到的内容。',
-            'next_step': 'delivery_config',
+            'message': messages[action],
+            'next_step': action.removeprefix('go_to_'),
         }
     return {
         'success': True,

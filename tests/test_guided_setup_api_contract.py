@@ -90,7 +90,7 @@ def test_setup_status_returns_safe_guided_json_and_reuses_cookie_details(authent
     assert payload["success"] is True
     assert payload["accounts"][0]["cookie_id"] == "account-1"
     assert payload["accounts"][0]["runtime_ready"] is True
-    assert payload["accounts"][0]["guided_status"]["step_id"] == "delivery_config"
+    assert payload["accounts"][0]["guided_status"]["step_id"] == "no_items"
     assert "cookie-secret" not in response.text
     assert "token-secret" not in response.text
     assert "password-secret" not in response.text
@@ -198,7 +198,7 @@ def test_setup_action_rejects_unknown_action_and_keeps_allowed_actions(authentic
     unknown = authenticated_client.post("/setup/action", json={"action": "delete_everything"})
     assert unknown.status_code == 400
 
-    for action in ("refresh_status", "go_to_delivery_config"):
+    for action in ("refresh_status", "go_to_item_management", "go_to_delivery_config", "go_to_republish_config"):
         response = authenticated_client.post("/setup/action", json={"action": action})
         assert response.status_code == 200
         assert response.json()["action"] == action
@@ -227,22 +227,30 @@ def test_setup_finish_is_blocked_until_account_is_running_and_delivery_is_config
     assert response.status_code == 200
     payload = response.json()
     assert payload["success"] is False
-    assert payload["next_action"] == "go_to_delivery_config"
-    assert payload["guided_status"]["primary_action"] == "go_to_delivery_config"
+    assert payload["next_action"] == "go_to_item_management"
+    assert payload["guided_status"]["primary_action"] == "go_to_item_management"
 
 
 def test_setup_finish_uses_configured_delivery_summary_and_can_complete(authenticated_client, monkeypatch):
     monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"account-1": "masked"})
+    monkeypatch.setattr(
+        reply_server.db_manager,
+        "get_items_by_cookie",
+        lambda cookie_id: [{"item_id": "item-1", "item_title": "测试商品"}],
+    )
     monkeypatch.setattr(
         reply_server,
         "_get_republish_store",
         lambda: SimpleNamespace(
             list_templates=lambda cookie_id: [
                 SimpleNamespace(
+                    current_item_id="item-1",
                     auto_delivery=True,
                     delivery_content="delivery-secret",
                     sku_delivery={},
                     delivery_choice="digital",
+                    auto_republish=True,
+                    paused=False,
                 )
             ]
         ),

@@ -8,7 +8,7 @@ CSS = (ROOT / "static/css/guided-setup.css").read_text(encoding="utf-8")
 
 
 def test_first_login_wizard_has_six_chinese_steps_and_accessible_status_region():
-    expected_steps = ["准备登录", "扫码", "等待稳定", "人工验证或等待退避", "连接成功", "验证可用"]
+    expected_steps = ["准备登录", "扫码", "等待稳定", "人工验证或等待冷却", "连接成功", "验证可用"]
 
     assert 'id="guidedSetupPanel"' in INDEX
     assert 'id="guidedSetupSteps"' in INDEX

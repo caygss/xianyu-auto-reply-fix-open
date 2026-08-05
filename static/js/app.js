@@ -177,6 +177,18 @@ function selectGuidedSetupAccount(accounts, selectedAccountId = '') {
 function getGuidedSetupCopy(step, account, viewModel = {}) {
     const guidedStatus = account?.guidedStatus || {};
     const hasActiveBrowser = isGuidedManualBrowserAvailable(account?.runtimeStatus, guidedStatus);
+    if (['no_items', 'delivery_config', 'republish_config'].includes(guidedStatus.step_id)) {
+        const notices = {
+            no_items: '请先同步商品；如果确实没有商品，可以从商品发布开始。',
+            delivery_config: '请完成交付方式配置后再继续，系统不会替你保存内容。',
+            republish_config: '请打开配置框并开启自动重新上架，保存前请确认开关状态。',
+        };
+        return {
+            title: guidedStatus.title || '继续配置商品',
+            message: guidedStatus.message || '请按提示完成商品配置。',
+            notice: notices[guidedStatus.step_id] || '请按提示完成当前配置。',
+        };
+    }
     const copies = {
         1: {
             title: '准备登录',
@@ -460,8 +472,14 @@ function renderGuidedSetupStatus() {
         primary.textContent = '重新检查状态';
         primary.dataset.guidedAction = 'refresh_status';
     } else if (viewModel.action === 'go_to_delivery_config') {
-        primary.textContent = '完成首次登录';
+        primary.textContent = '设置交付方式';
         primary.dataset.guidedAction = 'go_to_delivery_config';
+    } else if (viewModel.action === 'go_to_item_management') {
+        primary.textContent = '去商品管理';
+        primary.dataset.guidedAction = 'go_to_item_management';
+    } else if (viewModel.action === 'go_to_republish_config') {
+        primary.textContent = '开启自动重新上架';
+        primary.dataset.guidedAction = 'go_to_republish_config';
     } else if (viewModel.action === 'finish') {
         primary.textContent = '确认并完成首次登录';
         primary.dataset.guidedAction = 'finish';
@@ -479,6 +497,89 @@ function toggleGuidedSetup(visible) {
     renderGuidedSetupStatus();
     if (visible && !guidedSetupState.accounts.length && !guidedSetupState.guidedStatus) {
         loadGuidedSetupStatus();
+    }
+}
+
+function highlightGuidedSetupTarget(element) {
+    if (!element) return false;
+    element.classList.add('guided-setup-target');
+    element.setAttribute('data-guided-target', 'true');
+    element.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+    try {
+        if (typeof element.focus === 'function') element.focus({ preventScroll: true });
+    } catch (error) {
+        if (typeof element.focus === 'function') element.focus();
+    }
+    window.setTimeout(() => {
+        element.classList.remove('guided-setup-target');
+        element.removeAttribute('data-guided-target');
+    }, 2200);
+    return true;
+}
+
+function guidedSetupTargetItem(accountId, guidedStatus) {
+    const normalizedAccountId = String(accountId || '').trim();
+    const targetItemId = String(guidedStatus?.target_item_id || '').trim();
+    return allItemsData.find(item => (
+        String(item?.cookie_id || '').trim() === normalizedAccountId
+        && String(item?.item_id || '').trim() === targetItemId
+    )) || null;
+}
+
+function findGuidedSetupTargetRow(item) {
+    return [...(document.querySelectorAll?.('#itemsTableBody tr[data-guided-item-id]') || [])]
+        .find(row => String(row.dataset.guidedItemId || '') === String(item?.item_id || '')) || null;
+}
+
+async function navigateGuidedSetupAction(action, accountId, guidedStatus) {
+    const normalizedAccountId = String(accountId || '').trim();
+    const navigation = showSection('items');
+    if (navigation && typeof navigation.then === 'function') await navigation;
+    else await loadItems();
+
+    const accountFilter = document.getElementById('itemCookieFilter');
+    if (accountFilter && normalizedAccountId) {
+        accountFilter.value = normalizedAccountId;
+        await loadItemsByCookie();
+        highlightGuidedSetupTarget(accountFilter);
+    }
+
+    if (!allItemsData.some(item => String(item?.cookie_id || '').trim() === normalizedAccountId)) {
+        if (action === 'go_to_item_management') {
+            document.querySelectorAll?.('[data-guided-no-items-target]').forEach(highlightGuidedSetupTarget);
+            showToast('当前账号没有本地商品，请先同步；若确实没有商品，请前往“商品发布”。', 'warning');
+            return;
+        }
+        showToast('未找到目标商品，请先同步商品后再从列表手动操作。', 'warning');
+        return;
+    }
+
+    if (action === 'go_to_item_management') {
+        document.querySelectorAll?.('[data-guided-no-items-target]').forEach(highlightGuidedSetupTarget);
+        showToast('请先同步当前账号的商品；如果确实没有商品，请前往“商品发布”。', 'info');
+        return;
+    }
+
+    const item = guidedSetupTargetItem(normalizedAccountId, guidedStatus);
+    if (!item) {
+        showToast('未找到目标商品，请先刷新或同步商品后再手动选择。', 'warning');
+        return;
+    }
+    const targetIndex = filteredItemsData.findIndex(candidate => (
+        String(candidate?.cookie_id || '') === normalizedAccountId
+        && String(candidate?.item_id || '') === String(item.item_id || '')
+    ));
+    if (targetIndex >= 0) goToItemsPage(Math.floor(targetIndex / itemsPerPage) + 1);
+    const row = findGuidedSetupTargetRow(item);
+    highlightGuidedSetupTarget(row);
+    if (action === 'go_to_delivery_config') {
+        await openDeliveryConfigForItem(item.cookie_id, item.item_id, item.item_title);
+        highlightGuidedSetupTarget(document.getElementById('deliveryConfigPanel'));
+    } else if (action === 'go_to_republish_config') {
+        await openRepublishConfig(item.cookie_id, item.item_id);
+        const modal = document.getElementById('republishConfigModal');
+        highlightGuidedSetupTarget(modal);
+        highlightGuidedSetupTarget(document.getElementById('republishAutoRepublish'));
     }
 }
 
@@ -544,6 +645,9 @@ async function handleGuidedSetupAction(action) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: selectedAction, cookie_id: cookieId || undefined }),
         });
+        if (['go_to_item_management', 'go_to_delivery_config', 'go_to_republish_config'].includes(selectedAction)) {
+            await navigateGuidedSetupAction(selectedAction, cookieId, response?.guided_status || guidedSetupState.guidedStatus);
+        }
         if (response?.guided_status && cookieId) {
             guidedSetupState.guidedStatus = response.guided_status;
         }
@@ -665,6 +769,7 @@ function showSection(sectionName) {
     }
 
     // 根据不同section加载对应数据
+    let sectionLoadPromise = null;
     switch(sectionName) {
     case 'dashboard':        // 【仪表盘菜单】
         loadDashboard();
@@ -676,7 +781,7 @@ function showSection(sectionName) {
         loadItemPublish();
         break;
     case 'items':           // 【商品管理菜单】
-        loadItems();
+        sectionLoadPromise = loadItems();
         initItemsSearch(); // 确保搜索功能已初始化
         break;
     case 'items-reply':           // 【商品回复管理菜单】
@@ -773,6 +878,7 @@ function showSection(sectionName) {
         clearTimeout(aboutRuntimeRetryTimer);
         aboutRuntimeRetryTimer = null;
     }
+    return sectionLoadPromise;
 }
 
 function getAuthToken() {
@@ -13740,7 +13846,7 @@ function displayCurrentPageItems() {
             '<span class="badge bg-secondary">已关闭</span>';
 
         return `
-            <tr>
+            <tr data-guided-item-id="${escapeHtml(item.item_id)}" data-guided-item-cookie-id="${escapeHtml(item.cookie_id)}" tabindex="-1" aria-label="商品 ${escapeHtml(item.item_title || item.item_id)}">
             <td>
                 <input type="checkbox" name="itemCheckbox"
                         data-cookie-id="${escapeHtml(item.cookie_id)}"
@@ -25848,6 +25954,7 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         getGuidedDeadlineSeconds,
         getGuidedManualPrimaryAction,
+        getGuidedSetupCopy,
         getGuidedSetupStatusViewModel,
         isGuidedRuntimeReady,
         isGuidedManualBrowserAvailable,

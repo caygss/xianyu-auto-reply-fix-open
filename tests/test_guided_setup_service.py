@@ -80,7 +80,7 @@ def test_connected_account_with_delivery_ready_can_wait_for_order():
     assert status["step_index"] == 6
     assert status["step_total"] == 6
     assert status["needs_user_action"] is False
-    assert status["message"] == "账号已连接，交付配置已完成，现在可以等待买家下单。"
+    assert status["message"] == "自动发货和重新上架已可用，可以等待买家下单。"
 
 
 @pytest.mark.parametrize(

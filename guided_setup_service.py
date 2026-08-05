@@ -341,10 +341,39 @@ def _coerce_configured(value: Any) -> bool:
 def _delivery_configured(delivery_summary: Optional[Mapping[str, Any]]) -> bool:
     if not isinstance(delivery_summary, Mapping):
         return False
-    for key in ("configured", "is_configured", "complete", "ready"):
+    for key in ("delivery_configured", "configured", "is_configured", "complete", "ready"):
         if key in delivery_summary:
             return _coerce_configured(delivery_summary[key])
     return False
+
+
+def _republish_configured(delivery_summary: Optional[Mapping[str, Any]]) -> bool:
+    if not isinstance(delivery_summary, Mapping):
+        return False
+    if "republish_configured" in delivery_summary:
+        return _coerce_configured(delivery_summary["republish_configured"])
+    # Keep the old boolean-only contract usable for callers that have not yet
+    # started returning the expanded summary.
+    return "item_count" not in delivery_summary and _delivery_configured(delivery_summary)
+
+
+def _guided_summary_fields(delivery_summary: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+    if not isinstance(delivery_summary, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    item_count = delivery_summary.get("item_count")
+    if isinstance(item_count, int) and not isinstance(item_count, bool) and item_count >= 0:
+        result["item_count"] = item_count
+    for key in ("delivery_configured", "republish_configured"):
+        if key in delivery_summary:
+            result[key] = _coerce_configured(delivery_summary[key])
+    target_item_id = str(delivery_summary.get("target_item_id") or "").strip()
+    if target_item_id:
+        result["target_item_id"] = target_item_id[:128]
+    target_item_title = str(delivery_summary.get("target_item_title") or "").strip()
+    if target_item_title:
+        result["target_item_title"] = re.sub(r"[\x00-\x1f\x7f]+", " ", target_item_title)[:80].strip()
+    return result
 
 
 def _safe_status_value(value: Any) -> str:
@@ -391,7 +420,7 @@ def _guided_step_index(
         return RECONNECT_STEP_INDEX
     if action == "finish":
         return READY_STEP_INDEX
-    if action == "go_to_delivery_config":
+    if action in {"go_to_item_management", "go_to_delivery_config", "go_to_republish_config"}:
         return DELIVERY_STEP_INDEX
     if technical_status == "qr_login_grace_wait":
         return QR_STABILIZING_STEP_INDEX
@@ -440,6 +469,7 @@ def build_guided_status(
             in {"processing", "active", "ready", "opened"}
         ),
     }
+    status.update(_guided_summary_fields(delivery_summary))
 
     _, connection_state = _normalized_runtime_status(runtime_status)
     active_deadline = retry_at is not None and format_remaining_seconds(retry_at) > 0
@@ -452,31 +482,53 @@ def build_guided_status(
         or active_deadline
     )
     if connection_state == "connected" and not blocking_runtime_state:
-        configured = _delivery_configured(delivery_summary)
-        if configured:
+        delivery_configured = _delivery_configured(delivery_summary)
+        republish_configured = _republish_configured(delivery_summary)
+        item_count = delivery_summary.get("item_count") if isinstance(delivery_summary, Mapping) else None
+        if isinstance(item_count, int) and not isinstance(item_count, bool) and item_count <= 0:
+            status.update(
+                {
+                    "step_id": "no_items",
+                    "step_index": DELIVERY_STEP_INDEX,
+                    "title": "先准备商品",
+                    "message": "当前账号还没有本地商品，请先同步已有商品；如果确实没有商品，请前往商品发布。",
+                    "needs_user_action": True,
+                    "primary_action": "go_to_item_management",
+                }
+            )
+        elif not delivery_configured:
+            status.update(
+                {
+                    "step_id": "delivery_config",
+                    "step_index": DELIVERY_STEP_INDEX,
+                    "title": "设置交付方式",
+                    "message": "请在商品管理中选择一个商品，打开“设置交付方式”并完成配置。",
+                    "needs_user_action": True,
+                    "primary_action": "go_to_delivery_config",
+                }
+            )
+        elif not republish_configured:
+            status.update(
+                {
+                    "step_id": "republish_config",
+                    "step_index": DELIVERY_STEP_INDEX,
+                    "title": "开启自动重新上架",
+                    "message": "请在商品管理中打开“自动发货 / 重新上架配置”，并开启自动重新上架。",
+                    "needs_user_action": True,
+                    "primary_action": "go_to_republish_config",
+                }
+            )
+        else:
             status.update(
                 {
                     "step_id": "ready_to_wait_for_order",
                     "step_index": READY_STEP_INDEX,
                     "title": "可以等待买家下单",
-                    "message": "账号已连接，交付配置已完成，现在可以等待买家下单。",
+                    "message": "自动发货和重新上架已可用，可以等待买家下单。",
                     "needs_user_action": False,
                     "primary_action": "finish",
                 }
             )
-        elif configured is False:
-            status.update(
-                {
-                    "step_id": "delivery_config",
-                    "step_index": DELIVERY_STEP_INDEX,
-                    "title": "请配置交付内容",
-                    "message": "账号已连接，请先配置交付内容。",
-                    "needs_user_action": True,
-                    "primary_action": "go_to_delivery_config",
-                }
-            )
-        else:
-            status["step_id"] = "account_connected"
     elif connection_state == "connected" and active_deadline and status["primary_action"] == "finish":
         status.update(
             {

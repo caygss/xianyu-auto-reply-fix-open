@@ -190,6 +190,13 @@
     outline-offset: 2px;
 }
 
+.guided-setup-target {
+    outline: 3px solid color-mix(in srgb, var(--primary-color) 70%, transparent);
+    outline-offset: 3px;
+    box-shadow: 0 0 0 0.35rem color-mix(in srgb, var(--primary-color) 18%, transparent);
+    transition: outline-color 160ms ease, box-shadow 160ms ease;
+}
+
 .guided-setup-reopen-wrap {
     margin-bottom: .75rem;
 }
