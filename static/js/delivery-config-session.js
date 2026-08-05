@@ -16,6 +16,16 @@
     return value.trim();
   }
 
+  function normalizeCardId(value) {
+    if (typeof value === 'number') {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new TypeError('cardId is required');
+      }
+      return String(value);
+    }
+    return trimRequired(value, 'cardId');
+  }
+
   function normalizeSelection(selection) {
     if (!selection || typeof selection !== 'object') {
       throw new TypeError('selection is required');
@@ -86,7 +96,7 @@
         accountId: operation.selection.accountId,
         itemId: operation.selection.itemId,
         itemTitle: operation.selection.itemTitle,
-        cardId: trimRequired(cardId, 'cardId'),
+        cardId: normalizeCardId(cardId),
       });
       activeContext = context;
       return context;

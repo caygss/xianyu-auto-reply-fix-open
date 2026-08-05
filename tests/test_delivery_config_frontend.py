@@ -8,7 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def test_delivery_config_static_load_and_identity_contract():
     index_html = (PROJECT_ROOT / "static" / "index.html").read_text(encoding="utf-8")
-    coordinator = '<script src="/static/js/delivery-config-session.js?v=1"></script>'
+    coordinator = '<script src="/static/js/delivery-config-session.js?v=2"></script>'
     app = '<script src="/static/js/app.js?v=1.2.10"></script>'
 
     assert coordinator in index_html

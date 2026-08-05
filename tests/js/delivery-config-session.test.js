@@ -94,6 +94,17 @@ test('only current load commits immutable normalized context', () => {
   assert.equal(context.itemTitle, 'B');
 });
 
+test('current load accepts the positive integer card id returned by the API', () => {
+  const coordinator = createDeliveryConfigSessionCoordinator();
+  const operation = coordinator.beginLoad(selection('A')).operation;
+
+  const context = coordinator.commitLoad(operation, 42);
+
+  assert.equal(context.cardId, '42');
+  assert.ok(Object.isFrozen(context));
+  assert.strictEqual(coordinator.getActiveContext(), context);
+});
+
 test('stale load cannot finish current load', () => {
   const coordinator = createDeliveryConfigSessionCoordinator();
   const first = coordinator.beginLoad(selection('A')).operation;
@@ -197,6 +208,8 @@ test('current load requires a non-empty card id while stale load returns null', 
   const first = coordinator.beginLoad(selection('A')).operation;
 
   assert.throws(() => coordinator.commitLoad(first, '  '), TypeError);
+  assert.throws(() => coordinator.commitLoad(first, 0), TypeError);
+  assert.throws(() => coordinator.commitLoad(first, -1), TypeError);
   assert.equal(first.isCurrent(), true);
 
   coordinator.beginLoad(selection('B'));
