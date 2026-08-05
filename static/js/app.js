@@ -25973,6 +25973,7 @@ if (typeof module !== 'undefined' && module.exports) {
         getGuidedSetupCopy,
         getGuidedSetupStatusViewModel,
         findGuidedSetupTargetRow,
+        handleGuidedSetupAction,
         isGuidedRuntimeReady,
         isGuidedManualBrowserAvailable,
         loadGuidedSetupStatus,

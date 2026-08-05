@@ -231,6 +231,29 @@ def test_batch_binding_query_returns_only_scoped_marker_bindings(binding_state):
     )
 
 
+def test_batch_binding_query_uses_bounded_chunks(binding_state, monkeypatch):
+    _call_endpoint(item_id="item-100")
+    observed = []
+    original_execute = binding_state._execute_sql
+
+    def bounded_execute(cursor, sql, params=()):
+        if "FROM item_delivery_bindings b" in sql:
+            observed.append(tuple(params))
+            assert len(params) <= 502
+            assert "b.user_id = ? AND b.account_id = ?" in sql
+        return original_execute(cursor, sql, params)
+
+    monkeypatch.setattr(binding_state, "_execute_sql", bounded_execute)
+    item_ids = [f"item-{index}" for index in range(501)]
+
+    bindings = binding_state.get_item_delivery_bindings(
+        OWNER["user_id"], "account-a", item_ids + ["item-100"]
+    )
+
+    assert set(bindings) == {"item-100"}
+    assert [len(params) for params in observed] == [502, 3]
+
+
 def test_first_create_and_repeat_return_one_user_isolated_internal_card(binding_state):
     first = _call_endpoint()
     second = _call_endpoint()

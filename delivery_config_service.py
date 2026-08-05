@@ -20,6 +20,7 @@ MAX_PROVIDER_ENDPOINT_BYTES = 2048
 MAX_PROVIDER_TIMEOUT_SECONDS = 30
 MAX_PROVIDER_RETRIES = 3
 MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024
+DELIVERY_CONFIG_CARD_ID_BATCH_SIZE = 500
 
 
 class DeliveryConfigError(ValueError):
@@ -345,28 +346,31 @@ class DeliveryConfigService:
         if not normalized_card_ids:
             return set()
 
-        placeholders = ", ".join("?" for _ in normalized_card_ids)
+        valid_card_ids = set()
         try:
             with self._transaction() as cursor:
-                rows = cursor.execute(
-                    f"""
-                    SELECT card_id, mode, config_text
-                    FROM item_delivery_configs
-                    WHERE user_id = ? AND account_id = ? AND card_id IN ({placeholders})
-                    """,
-                    (user_id, account_id, *normalized_card_ids),
-                ).fetchall()
+                for offset in range(0, len(normalized_card_ids), DELIVERY_CONFIG_CARD_ID_BATCH_SIZE):
+                    card_id_chunk = normalized_card_ids[
+                        offset:offset + DELIVERY_CONFIG_CARD_ID_BATCH_SIZE
+                    ]
+                    placeholders = ", ".join("?" for _ in card_id_chunk)
+                    rows = cursor.execute(
+                        f"""
+                        SELECT card_id, mode, config_text
+                        FROM item_delivery_configs
+                        WHERE user_id = ? AND account_id = ? AND card_id IN ({placeholders})
+                        """,
+                        (user_id, account_id, *card_id_chunk),
+                    ).fetchall()
+                    for card_id, mode, config_text in rows:
+                        try:
+                            config = json.loads(self.db._decrypt_secret(config_text))
+                            self._validate_config(mode, config)
+                        except Exception:
+                            continue
+                        valid_card_ids.add(int(card_id))
         except Exception:
             return set()
-
-        valid_card_ids = set()
-        for card_id, mode, config_text in rows:
-            try:
-                config = json.loads(self.db._decrypt_secret(config_text))
-                self._validate_config(mode, config)
-            except Exception:
-                continue
-            valid_card_ids.add(int(card_id))
         return valid_card_ids
 
     def delete(self, user_id, card_id, account_id):

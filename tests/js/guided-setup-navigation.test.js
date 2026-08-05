@@ -107,6 +107,44 @@ function createHarness() {
   };
 }
 
+function createHandlerHarness(response) {
+  const events = [];
+  const sandbox = {
+    __events: events,
+    __fetchJSON: async () => response,
+    __showSection: () => events.push('showSection'),
+    __loadItems: async () => events.push('loadItems'),
+    __loadItemsByCookie: async () => events.push('loadItemsByCookie'),
+    __openDeliveryConfigForItem: async () => events.push('openDeliveryConfigForItem'),
+    __openRepublishConfig: async () => events.push('openRepublishConfig'),
+  };
+
+  vm.runInNewContext(`
+    const apiBase = '';
+    const GUIDED_SETUP_ACTION_ENDPOINT = '/api/guided-setup/action';
+    const guidedSetupState = { requestInFlight: false, guidedStatus: null };
+    const getGuidedSetupElements = () => ({ primary: null });
+    const getGuidedSetupAccount = () => ({ id: 'account-A' });
+    const renderGuidedSetupStatus = () => undefined;
+    const loadGuidedSetupStatus = async () => undefined;
+    const fetchJSON = (...args) => globalThis.__fetchJSON(...args);
+    const showSection = (...args) => globalThis.__showSection(...args);
+    const loadItems = (...args) => globalThis.__loadItems(...args);
+    const loadItemsByCookie = (...args) => globalThis.__loadItemsByCookie(...args);
+    const openDeliveryConfigForItem = (...args) => globalThis.__openDeliveryConfigForItem(...args);
+    const openRepublishConfig = (...args) => globalThis.__openRepublishConfig(...args);
+    ${extractFunction('shouldNavigateGuidedSetupAction')}
+    ${extractFunction('navigateGuidedSetupAction')}
+    ${extractFunction('handleGuidedSetupAction')}
+    globalThis.guidedHandlerApi = { handleGuidedSetupAction };
+  `, sandbox);
+
+  return {
+    api: sandbox.guidedHandlerApi,
+    events,
+  };
+}
+
 test('CommonJS app export exposes guided setup navigation behavior', () => {
   const script = `
     const assert = require('node:assert/strict');
@@ -126,6 +164,7 @@ test('CommonJS app export exposes guided setup navigation behavior', () => {
     global.fetch = async () => ({ ok: true, status: 200, json: async () => ({}) });
     const app = require(${JSON.stringify(appPath)});
     assert.equal(typeof app.navigateGuidedSetupAction, 'function');
+    assert.equal(typeof app.handleGuidedSetupAction, 'function');
   `;
   const result = spawnSync(process.execPath, ['-e', script], {
     cwd: path.dirname(appPath),
@@ -207,6 +246,32 @@ test('rejects unsuccessful or mismatched guided setup responses', () => {
     ),
     false,
   );
+});
+
+test('does not navigate on stale guided setup action responses', async () => {
+  const responses = [
+    {
+      success: false,
+      action: 'go_to_delivery_config',
+      guided_status: { primary_action: 'go_to_delivery_config' },
+    },
+    {
+      success: true,
+      action: 'go_to_item_management',
+      guided_status: { primary_action: 'go_to_delivery_config' },
+    },
+    {
+      success: true,
+      action: 'go_to_delivery_config',
+      guided_status: { primary_action: 'go_to_item_management' },
+    },
+  ];
+
+  for (const response of responses) {
+    const harness = createHandlerHarness(response);
+    await harness.api.handleGuidedSetupAction('go_to_delivery_config');
+    assert.deepEqual(harness.events, []);
+  }
 });
 
 test('finds a guided setup row by both account and item id', () => {

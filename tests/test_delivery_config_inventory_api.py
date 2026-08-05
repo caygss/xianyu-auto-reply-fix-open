@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 import pytest
 from fastapi import HTTPException
@@ -496,3 +497,34 @@ def test_batch_delivery_validation_returns_only_valid_scoped_card_ids(api_state)
     )
 
     assert valid_ids == {binding["card_id"]}
+
+
+def test_batch_delivery_validation_uses_bounded_chunks(api_state, monkeypatch):
+    _put_config({"mode": "fixed_link", "config": {"url": "https://valid.example/path"}})
+    service = reply_server.DeliveryConfigService(api_state)
+    observed = []
+    original_transaction = service._transaction
+
+    @contextmanager
+    def bounded_transaction():
+        with original_transaction() as cursor:
+            class RecordingCursor:
+                def execute(self, sql, params=()):
+                    if "FROM item_delivery_configs" in sql:
+                        observed.append(tuple(params))
+                        assert len(params) <= 502
+                        assert "WHERE user_id = ? AND account_id = ?" in sql
+                    return cursor.execute(sql, params)
+
+                def fetchall(self):
+                    return cursor.fetchall()
+
+            yield RecordingCursor()
+
+    monkeypatch.setattr(service, "_transaction", bounded_transaction)
+    card_ids = [7, *range(1, 502)]
+
+    valid_ids = service.valid_card_ids_for_delivery(USER["user_id"], "cookie-a", card_ids)
+
+    assert valid_ids == {7}
+    assert [len(params) for params in observed] == [502, 3]
