@@ -473,3 +473,26 @@ def test_setup_delivery_summary_ignores_orphan_and_damaged_configs(api_state, mo
     damaged_summary = reply_server._get_guided_delivery_summary("cookie-a")
     assert damaged_summary["delivery_configured"] is False
     assert "damaged.example" not in json.dumps(damaged_summary, ensure_ascii=False)
+
+
+def test_batch_delivery_validation_returns_only_valid_scoped_card_ids(api_state):
+    binding = api_state.get_or_create_item_delivery_card(
+        USER["user_id"], "cookie-a", "item-100", "测试商品"
+    )
+    _put_config(
+        {"mode": "fixed_link", "config": {"url": "https://valid.example/path"}},
+        card_id=binding["card_id"],
+    )
+    _put_config({"mode": "fixed_link", "config": {"url": "https://broken.example/path"}})
+    with api_state.lock:
+        api_state.conn.execute(
+            "UPDATE item_delivery_configs SET config_text = ? WHERE user_id = ? AND card_id = ? AND account_id = ?",
+            ("bad-ciphertext", USER["user_id"], 7, "cookie-a"),
+        )
+        api_state.conn.commit()
+
+    valid_ids = reply_server.DeliveryConfigService(api_state).valid_card_ids_for_delivery(
+        USER["user_id"], "cookie-a", [binding["card_id"], 7, 999999]
+    )
+
+    assert valid_ids == {binding["card_id"]}

@@ -5091,17 +5091,28 @@ def _get_guided_delivery_summary(cookie_id: str) -> Dict[str, Any]:
         logger.warning(f"读取向导账号归属失败: {type(exc).__name__}")
         user_id = 0
 
-    if user_id > 0:
-        delivery_service = DeliveryConfigService(db_manager)
-        for item in items:
-            try:
-                binding = db_manager.get_item_delivery_binding(user_id, cookie_id, item["item_id"])
-                if not isinstance(binding, dict) or binding.get("card_id") is None:
-                    continue
-                delivery_service.get_for_delivery(user_id, binding["card_id"], cookie_id)
-                delivery_item_ids.append(item["item_id"])
-            except Exception as exc:
-                logger.warning(f"读取向导商品交付配置失败: {type(exc).__name__}")
+    if user_id > 0 and items:
+        item_ids = [item["item_id"] for item in items]
+        try:
+            bindings = db_manager.get_item_delivery_bindings(user_id, cookie_id, item_ids)
+        except Exception as exc:
+            logger.warning(f"批量读取向导商品交付绑定失败: {type(exc).__name__}")
+            bindings = {}
+        bindings = bindings if isinstance(bindings, dict) else {}
+        card_ids = {
+            binding.get("card_id")
+            for binding in bindings.values()
+            if isinstance(binding, dict) and binding.get("card_id") is not None
+        }
+        valid_card_ids = DeliveryConfigService(db_manager).valid_card_ids_for_delivery(
+            user_id, cookie_id, card_ids
+        )
+        invalid_card_count = len(card_ids - valid_card_ids)
+        if invalid_card_count:
+            logger.warning(f"向导批量交付配置校验失败，已跳过 {invalid_card_count} 个配置")
+        for item_id, binding in bindings.items():
+            if isinstance(binding, dict) and binding.get("card_id") in valid_card_ids:
+                delivery_item_ids.append(item_id)
 
     delivery_configured = configured or bool(delivery_item_ids)
     republish_configured = bool(active_republish_item_ids)

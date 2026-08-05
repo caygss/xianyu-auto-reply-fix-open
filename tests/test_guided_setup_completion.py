@@ -146,13 +146,14 @@ def test_orphan_or_other_item_delivery_config_does_not_configure_current_item(mo
     monkeypatch.setattr(reply_server.db_manager, "get_cookie_details", lambda cookie_id: {"user_id": 7})
     monkeypatch.setattr(
         reply_server.db_manager,
-        "get_item_delivery_binding",
-        lambda user_id, account_id, item_id: calls.append((user_id, account_id, item_id)) or None,
+        "get_item_delivery_bindings",
+        lambda user_id, account_id, item_ids: calls.append((user_id, account_id, item_ids)) or {},
     )
     monkeypatch.setattr(
         reply_server,
         "DeliveryConfigService",
         lambda db: SimpleNamespace(
+            valid_card_ids_for_delivery=lambda *args: set(),
             count_for_account=lambda *args: (_ for _ in ()).throw(AssertionError("must not count account rows")),
             get_for_delivery=lambda *args: (_ for _ in ()).throw(AssertionError("must not read without binding")),
         ),
@@ -165,7 +166,7 @@ def test_orphan_or_other_item_delivery_config_does_not_configure_current_item(mo
 
     summary = reply_server._get_guided_delivery_summary("account-1")
 
-    assert calls == [(7, "account-1", "item-1")]
+    assert calls == [(7, "account-1", ["item-1"])]
     assert summary["delivery_configured"] is False
 
 
@@ -178,16 +179,14 @@ def test_damaged_bound_delivery_config_does_not_configure_current_item(monkeypat
     monkeypatch.setattr(reply_server.db_manager, "get_cookie_details", lambda cookie_id: {"user_id": 7})
     monkeypatch.setattr(
         reply_server.db_manager,
-        "get_item_delivery_binding",
-        lambda user_id, account_id, item_id: {"card_id": 11},
+        "get_item_delivery_bindings",
+        lambda user_id, account_id, item_ids: {"item-1": {"card_id": 11}},
     )
     monkeypatch.setattr(
         reply_server,
         "DeliveryConfigService",
         lambda db: SimpleNamespace(
-            get_for_delivery=lambda user_id, card_id, account_id: (_ for _ in ()).throw(
-                ValueError("password=secret https://private.example")
-            )
+            valid_card_ids_for_delivery=lambda user_id, account_id, card_ids: set(),
         ),
     )
     monkeypatch.setattr(
@@ -204,7 +203,6 @@ def test_damaged_bound_delivery_config_does_not_configure_current_item(monkeypat
 
 
 def test_valid_bound_delivery_config_configures_current_item_without_returning_config(monkeypatch):
-    calls = []
     monkeypatch.setattr(
         reply_server.db_manager,
         "get_items_by_cookie",
@@ -213,16 +211,14 @@ def test_valid_bound_delivery_config_configures_current_item_without_returning_c
     monkeypatch.setattr(reply_server.db_manager, "get_cookie_details", lambda cookie_id: {"user_id": 7})
     monkeypatch.setattr(
         reply_server.db_manager,
-        "get_item_delivery_binding",
-        lambda user_id, account_id, item_id: {"card_id": 11},
+        "get_item_delivery_bindings",
+        lambda user_id, account_id, item_ids: {"item-1": {"card_id": 11}},
     )
     monkeypatch.setattr(
         reply_server,
         "DeliveryConfigService",
         lambda db: SimpleNamespace(
-            get_for_delivery=lambda user_id, card_id, account_id: calls.append(
-                (user_id, card_id, account_id)
-            ) or {"mode": "fixed_link", "config": {"url": "https://private.example/secret"}}
+            valid_card_ids_for_delivery=lambda user_id, account_id, card_ids: {11},
         ),
     )
     monkeypatch.setattr(
@@ -233,7 +229,6 @@ def test_valid_bound_delivery_config_configures_current_item_without_returning_c
 
     summary = reply_server._get_guided_delivery_summary("account-1")
 
-    assert calls == [(7, 11, "account-1")]
     assert summary["delivery_configured"] is True
     assert "private.example" not in repr(summary)
 

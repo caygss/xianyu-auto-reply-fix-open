@@ -210,6 +210,27 @@ def test_get_or_create_replaces_cross_user_or_non_marker_binding(binding_state):
     assert owner_card["description"].startswith(ITEM_DELIVERY_BINDING_MARKER)
 
 
+def test_batch_binding_query_returns_only_scoped_marker_bindings(binding_state):
+    with binding_state.lock:
+        binding_state.conn.execute(
+            "INSERT OR IGNORE INTO item_info (cookie_id, item_id, item_title) VALUES (?, ?, ?)",
+            ("account-a", "item-101", "第二个商品"),
+        )
+        binding_state.conn.commit()
+    _call_endpoint(item_id="item-100")
+    _call_endpoint(item_id="item-101")
+
+    bindings = binding_state.get_item_delivery_bindings(
+        OWNER["user_id"], "account-a", ["item-100", "item-101", "missing-item"]
+    )
+
+    assert set(bindings) == {"item-100", "item-101"}
+    assert all(
+        set(binding) == {"user_id", "account_id", "item_id", "card_id"}
+        for binding in bindings.values()
+    )
+
+
 def test_first_create_and_repeat_return_one_user_isolated_internal_card(binding_state):
     first = _call_endpoint()
     second = _call_endpoint()

@@ -323,6 +323,52 @@ class DeliveryConfigService:
             "config": config,
         }
 
+    def valid_card_ids_for_delivery(self, user_id, account_id, card_ids):
+        """批量验证已保存交付配置，只返回通过校验的卡券 ID。"""
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            return set()
+        account_id = str(account_id or "").strip()
+        if user_id <= 0 or not account_id:
+            return set()
+        normalized_card_ids = []
+        for card_id in card_ids or []:
+            if isinstance(card_id, bool):
+                continue
+            try:
+                normalized_card_id = int(card_id)
+            except (TypeError, ValueError):
+                continue
+            if normalized_card_id > 0 and normalized_card_id not in normalized_card_ids:
+                normalized_card_ids.append(normalized_card_id)
+        if not normalized_card_ids:
+            return set()
+
+        placeholders = ", ".join("?" for _ in normalized_card_ids)
+        try:
+            with self._transaction() as cursor:
+                rows = cursor.execute(
+                    f"""
+                    SELECT card_id, mode, config_text
+                    FROM item_delivery_configs
+                    WHERE user_id = ? AND account_id = ? AND card_id IN ({placeholders})
+                    """,
+                    (user_id, account_id, *normalized_card_ids),
+                ).fetchall()
+        except Exception:
+            return set()
+
+        valid_card_ids = set()
+        for card_id, mode, config_text in rows:
+            try:
+                config = json.loads(self.db._decrypt_secret(config_text))
+                self._validate_config(mode, config)
+            except Exception:
+                continue
+            valid_card_ids.add(int(card_id))
+        return valid_card_ids
+
     def delete(self, user_id, card_id, account_id):
         user_id, card_id, account_id = self._scope(user_id, card_id, account_id)
         with self._transaction() as cursor:

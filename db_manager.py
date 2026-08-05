@@ -5424,6 +5424,56 @@ Cookie数量: {cookie_count}
                 (user_id, str(account_id), str(item_id)),
             )
 
+    def get_item_delivery_bindings(
+        self,
+        user_id: int,
+        account_id: str,
+        item_ids,
+    ) -> Dict[str, Dict[str, Any]]:
+        """一次读取同账号、同用户下商品的有效内部交付绑定。"""
+        try:
+            normalized_user_id = int(user_id)
+        except (TypeError, ValueError):
+            return {}
+        normalized_account_id = str(account_id or "").strip()
+        if normalized_user_id <= 0 or not normalized_account_id:
+            return {}
+        if isinstance(item_ids, (str, bytes)):
+            item_ids = [item_ids]
+        normalized_item_ids = list(dict.fromkeys(
+            str(item_id or "").strip() for item_id in (item_ids or []) if str(item_id or "").strip()
+        ))
+        if not normalized_item_ids:
+            return {}
+
+        placeholders = ", ".join("?" for _ in normalized_item_ids)
+        with self.lock:
+            cursor = self.get_connection().cursor()
+            self._execute_sql(
+                cursor,
+                f"""
+                SELECT b.user_id, b.account_id, b.item_id, b.card_id, c.description
+                FROM item_delivery_bindings b
+                INNER JOIN cards c ON c.id = b.card_id AND c.user_id = b.user_id
+                WHERE b.user_id = ? AND b.account_id = ? AND b.item_id IN ({placeholders})
+                """,
+                (normalized_user_id, normalized_account_id, *normalized_item_ids),
+            )
+            rows = cursor.fetchall()
+
+        bindings = {}
+        for row in rows:
+            if not self._is_item_delivery_binding_description(row[4]):
+                continue
+            item_id = str(row[2])
+            bindings[item_id] = {
+                "user_id": int(row[0]),
+                "account_id": str(row[1]),
+                "item_id": item_id,
+                "card_id": int(row[3]),
+            }
+        return bindings
+
     def get_item_delivery_binding_for_card(
         self,
         card_id: int,
