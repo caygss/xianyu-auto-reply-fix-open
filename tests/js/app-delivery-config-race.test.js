@@ -236,10 +236,10 @@ function identity(harness) {
 async function settleSuccessfulB(harness, load) {
   harness.respond('/api/items/item-B/delivery-card', { card_id: 'card-B' });
   await tick();
-  harness.respond('/delivery-config', { mode: 'generated_card' });
-  harness.respond('/inventory/settings', { settings: { stock_ceiling: 99, generator_prefix: 'B-' } });
-  harness.respond('/inventory?', { inventory: { available: 7, shortage: 0 } });
-  harness.respond('/inventory/preview', { items: ['B***'] });
+  harness.respond('/api/cards/card-B/delivery-config?account_id=account-B', { mode: 'generated_card' });
+  harness.respond('/api/cards/card-B/inventory/settings?account_id=account-B', { settings: { stock_ceiling: 99, generator_prefix: 'B-' } });
+  harness.respond('/api/cards/card-B/inventory?account_id=account-B', { inventory: { available: 7, shortage: 0 } });
+  harness.respond('/api/cards/card-B/inventory/preview?account_id=account-B', { items: ['B***'] });
   await load;
 }
 
@@ -284,23 +284,48 @@ test('initDeliveryConfigUi disables writes without a ready context', () => {
 test('slow A cannot overwrite fast B or release B loading state', async () => {
   const harness = createHarness({ honorAbort: false });
   const a = harness.api.openDeliveryConfigForItem('account-A', 'item-A', '商品 A');
-  const b = harness.api.openDeliveryConfigForItem('account-B', 'item-B', '商品 B');
-
-  assert.deepEqual(identity(harness), ['账号：account-B', '商品：商品 B', '商品 ID：item-B']);
-  assert.equal(harness.elements.get('deliveryConfigPanel').getAttribute('aria-busy'), 'true');
   harness.respond('/api/items/item-A/delivery-card', { card_id: 'card-A' });
   await tick();
+  assert.equal(harness.requests.filter((request) => request.url.includes('/api/cards/card-A/')).length, 4);
+
+  const b = harness.api.openDeliveryConfigForItem('account-B', 'item-B', '商品 B');
   assert.deepEqual(identity(harness), ['账号：account-B', '商品：商品 B', '商品 ID：item-B']);
   assert.equal(harness.elements.get('deliveryConfigPanel').getAttribute('aria-busy'), 'true');
 
   await settleSuccessfulB(harness, b);
   assert.equal(harness.elements.get('deliveryCurrentItemIdentity').getAttribute('data-ready'), 'true');
   assert.equal(harness.elements.get('deliveryMethodSelect').value, 'generated_card');
+  assert.equal(harness.elements.get('inventoryStockCeiling').value, 99);
+  assert.equal(harness.elements.get('cardGeneratorPrefix').value, 'B-');
   assert.equal(String(harness.inventoryDds[1].textContent), '7');
   assert.deepEqual(harness.elements.get('inventoryPreviewList').children.map((row) => row.textContent), ['B***']);
   assert.deepEqual(identity(harness), ['账号：account-B', '商品：商品 B', '商品 ID：item-B']);
   assert.equal(harness.elements.get('deliveryConfigPanel').getAttribute('aria-busy'), 'false');
   assert.equal(harness.api.state().context.itemId, 'item-B');
+  assert.equal(harness.elements.get('deliveryConfigStatus').textContent,
+    '已加载“商品 B”的交付配置，请确认后点击“保存当前商品配置”。');
+  assert.ok(writeButtonIds.every((id) => !harness.elements.get(id).disabled));
+  assert.ok(harness.deliveryItemButtons.every((button) => !button.disabled));
+
+  harness.respond('/api/cards/card-A/delivery-config?account_id=account-A', { mode: 'fixed_link' });
+  harness.respond('/api/cards/card-A/inventory/settings?account_id=account-A', { settings: { stock_ceiling: 10, generator_prefix: 'A-' } });
+  harness.respond('/api/cards/card-A/inventory?account_id=account-A', { inventory: { available: 3, shortage: 2 } });
+  harness.respond('/api/cards/card-A/inventory/preview?account_id=account-A', { items: ['A***'] });
+  await a;
+
+  assert.equal(harness.elements.get('deliveryCurrentItemIdentity').getAttribute('data-ready'), 'true');
+  assert.equal(harness.elements.get('deliveryMethodSelect').value, 'generated_card');
+  assert.equal(harness.elements.get('inventoryStockCeiling').value, 99);
+  assert.equal(harness.elements.get('cardGeneratorPrefix').value, 'B-');
+  assert.equal(String(harness.inventoryDds[1].textContent), '7');
+  assert.deepEqual(harness.elements.get('inventoryPreviewList').children.map((row) => row.textContent), ['B***']);
+  assert.deepEqual(identity(harness), ['账号：account-B', '商品：商品 B', '商品 ID：item-B']);
+  assert.equal(harness.elements.get('deliveryConfigStatus').textContent,
+    '已加载“商品 B”的交付配置，请确认后点击“保存当前商品配置”。');
+  assert.equal(harness.elements.get('deliveryConfigPanel').getAttribute('aria-busy'), 'false');
+  assert.equal(harness.api.state().context.itemId, 'item-B');
+  assert.ok(writeButtonIds.every((id) => !harness.elements.get(id).disabled));
+  assert.ok(harness.deliveryItemButtons.every((button) => !button.disabled));
 });
 
 test('loaded existing config names the exact save button action', async () => {
@@ -456,14 +481,16 @@ test('config failure preserves inputs, skips inventory, and gives A a safe actio
   harness.elements.get('providerToken').value = 'keep-this-secret';
 
   const save = harness.api.saveCurrentDeliveryConfig();
-  harness.respond('/delivery-config', { detail: '固定链接格式不正确' }, 400);
+  harness.respond('/delivery-config', {
+    detail: { code: 'invalid_config', message: '固定链接格式不正确' },
+  }, 400);
   await save;
 
   assert.equal(harness.elements.get('fixedLinkInput').value, 'https://buyer.example/code');
   assert.equal(harness.elements.get('providerEndpoint').value, 'https://provider.example/deliver');
   assert.equal(harness.elements.get('providerToken').value, 'keep-this-secret');
   assert.equal(harness.requests.filter((request) => request.options.method === 'PUT' && request.url.includes('/inventory/settings')).length, 0);
-  assert.equal(harness.elements.get('deliveryConfigStatus').textContent, '“商品 A”的交付配置保存失败：固定链接格式不正确。请检查后再次保存。');
+  assert.equal(harness.elements.get('deliveryConfigStatus').textContent, '“商品 A”的交付配置保存失败：交付配置无效。请检查后再次保存。');
   assert.equal(harness.elements.get('deliveryConfigStatus').dataset.status, 'error');
   assert.ok(writeButtonIds.every((id) => !harness.elements.get(id).disabled));
   assert.equal(harness.elements.get('deliveryConfigPanel').getAttribute('aria-busy'), 'false');
@@ -620,7 +647,11 @@ test('delivery labels, safe errors, live status, and disabled styles meet the UI
   const harness = createHarness();
   assert.equal(harness.api.deliveryItemLabel({ itemTitle: ' 商品 A ', itemId: 'item-A' }), '“商品 A”');
   assert.equal(harness.api.deliveryItemLabel({ itemTitle: '', itemId: ' item-A ' }), '“item-A”');
-  assert.equal(harness.api.deliverySafeErrorMessage(new Error(`  ${'可见原因'.repeat(60)}  `), '安全提示').length, 160);
+  assert.equal(harness.api.deliverySafeErrorMessage(new Error('api_key=sk-live-secret password=hunter2'), '安全提示'), '安全提示');
+  const unknownCode = new Error('服务端原始错误');
+  unknownCode.deliveryCode = 'unknown_delivery_code';
+  assert.equal(harness.api.deliverySafeErrorMessage(unknownCode, '安全提示'), '安全提示');
+  assert.equal(harness.api.deliverySafeErrorMessage('任意字符串错误', '安全提示'), '安全提示');
   assert.equal(harness.api.deliverySafeErrorMessage(new Error('Bearer token in /api/private generation stack'), '请稍后重试'), '请稍后重试');
   assert.equal(harness.api.deliverySafeErrorMessage(new Error('failed at src/private/worker.js'), '安全提示'), '安全提示');
   assert.equal(harness.api.deliverySafeErrorMessage(new Error('{"detail":"raw server data"}'), '安全提示'), '安全提示');

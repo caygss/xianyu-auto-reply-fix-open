@@ -12858,6 +12858,35 @@ async function checkRepublishNow(templateId) {
 const DELIVERY_UI_STATE_KEY = 'deliveryConfigUiState';
 const DELIVERY_DEFAULT_CONTENT_KEY = 'deliveryDefaultContent';
 const DELIVERY_CARD_BATCH_NOTES_KEY = 'deliveryCardBatchNotes';
+const DELIVERY_SAFE_ERROR_MESSAGES = Object.freeze({
+    invalid_scope: '商品或账号信息无效',
+    invalid_config: '交付配置无效',
+    invalid_mode: '交付方式无效',
+    config_not_found: '交付配置不存在',
+    invalid_request: '请求内容无效',
+    invalid_settings: '库存设置无效',
+    invalid_input: '导入内容无效',
+    invalid_quantity: '数量设置无效',
+    generation_failed: '卡密生成失败',
+    inventory_ceiling_exceeded: '操作后将超过库存上限',
+    reservation_not_found: '库存预留记录不存在',
+    scope_mismatch: '库存预留记录与当前商品不匹配',
+    insufficient_inventory: '可用库存不足',
+    invalid_state_transition: '库存状态已变化，请刷新后重试',
+    idempotency_conflict: '请求状态冲突，请刷新后重试',
+    invalid_order: '订单信息无效',
+    reservation_required: '卡密库存预留信息缺失',
+    card_content_unavailable: '卡密内容暂不可用',
+    provider_field_missing: '第三方交付请求字段不完整',
+    provider_field_mapping_conflict: '第三方交付字段映射冲突',
+    provider_response_field_missing: '第三方交付服务响应缺少交付内容',
+    provider_response_invalid: '第三方交付服务响应无效',
+    provider_response_too_large: '第三方交付服务响应过大',
+    provider_http_error: '第三方交付服务请求失败',
+    provider_transport_error: '第三方交付服务暂时不可用',
+    provider_timeout: '第三方交付服务响应超时',
+    dispatch_failed: '交付处理失败'
+});
 const deliveryConfigSessionApi = (() => {
     if (typeof DeliveryConfigSession !== 'undefined' && DeliveryConfigSession) return DeliveryConfigSession;
     if (typeof module !== 'undefined' && module.exports && typeof require === 'function') {
@@ -13061,10 +13090,10 @@ function deliveryItemLabel(context) {
 function deliverySafeErrorMessage(error, fallback = '操作失败，请稍后重试') {
     const defaultFallback = '操作失败，请稍后重试';
     const safeFallback = String(fallback || defaultFallback).trim().slice(0, 160) || defaultFallback;
-    const message = String(typeof error === 'string' ? error : (error?.message || '')).trim();
-    const unsafePattern = /AbortError|https?:\/\/|\/api\/|authorization|bearer|token|generation|stack|raw\s+response|response\s+body|[\\/]|[{}\[\]]|<[^>]*>/i;
-    if (!message || unsafePattern.test(message)) return safeFallback;
-    return message.slice(0, 160);
+    const code = typeof error?.deliveryCode === 'string' ? error.deliveryCode.trim() : '';
+    return Object.prototype.hasOwnProperty.call(DELIVERY_SAFE_ERROR_MESSAGES, code)
+        ? DELIVERY_SAFE_ERROR_MESSAGES[code]
+        : safeFallback;
 }
 
 function renderDeliveryCurrentItemIdentity(selection, ready = false) {
@@ -13113,6 +13142,13 @@ async function deliveryConfigFetch(path, options = {}) {
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
         const error = new Error(deliveryConfigErrorMessage(payload));
+        const detailCode = payload?.detail && typeof payload.detail === 'object'
+            ? payload.detail.code
+            : undefined;
+        const deliveryCode = typeof detailCode === 'string'
+            ? detailCode.trim()
+            : (typeof payload?.code === 'string' ? payload.code.trim() : '');
+        if (deliveryCode) error.deliveryCode = deliveryCode;
         error.status = response.status;
         throw error;
     }
