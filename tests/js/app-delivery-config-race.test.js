@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const vm = require('node:vm');
 
 const {
@@ -199,6 +200,33 @@ function createHarness({ honorAbort = true } = {}) {
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const writeButtonIds = ['deliveryConfigSaveButton', 'deliveryConfigDeleteButton', 'cardImportButton', 'cardGenerateButton', 'cardReplenishButton', 'cardContinueButton'];
+
+test('CommonJS app loading resolves the delivery session dependency', () => {
+  const script = `
+    const assert = require('node:assert/strict');
+    global.localStorage = { getItem: () => '', setItem: () => {}, removeItem: () => {} };
+    global.location = { origin: 'http://test', hostname: 'test' };
+    global.window = { location: global.location, open: () => null, addEventListener: () => {} };
+    global.document = {
+      addEventListener: () => {},
+      getElementById: () => null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      createElement: () => ({ style: {}, appendChild: () => {}, setAttribute: () => {} }),
+      getElementsByTagName: () => [],
+      head: { appendChild: () => {} },
+      body: { appendChild: () => {} },
+    };
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({}) });
+    const app = require('./static/js/app.js');
+    assert.equal(typeof app.getGuidedDeadlineSeconds, 'function');
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    cwd: path.join(__dirname, '../..'),
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+});
 
 function identity(harness) {
   return ['deliveryCurrentAccountIdentity', 'deliveryCurrentTitleIdentity', 'deliveryCurrentIdIdentity']

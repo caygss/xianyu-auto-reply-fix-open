@@ -12858,8 +12858,22 @@ async function checkRepublishNow(templateId) {
 const DELIVERY_UI_STATE_KEY = 'deliveryConfigUiState';
 const DELIVERY_DEFAULT_CONTENT_KEY = 'deliveryDefaultContent';
 const DELIVERY_CARD_BATCH_NOTES_KEY = 'deliveryCardBatchNotes';
+const deliveryConfigSessionApi = (() => {
+    if (typeof DeliveryConfigSession !== 'undefined' && DeliveryConfigSession) return DeliveryConfigSession;
+    if (typeof module !== 'undefined' && module.exports && typeof require === 'function') {
+        try {
+            return require('./delivery-config-session.js');
+        } catch {
+            throw new Error('DeliveryConfigSession 依赖加载失败');
+        }
+    }
+    throw new Error('DeliveryConfigSession 依赖未加载，请先加载 delivery-config-session.js');
+})();
+if (typeof deliveryConfigSessionApi.createDeliveryConfigSessionCoordinator !== 'function') {
+    throw new Error('DeliveryConfigSession 依赖未正确初始化');
+}
 const deliveryConfigSession =
-    DeliveryConfigSession.createDeliveryConfigSessionCoordinator();
+    deliveryConfigSessionApi.createDeliveryConfigSessionCoordinator();
 let deliveryConfigContext = null;
 let deliveryLoadUiOwner = null;
 let deliveryWriteUiOwner = null;
