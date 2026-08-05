@@ -13265,7 +13265,7 @@ async function openDeliveryConfigForItem(accountId, itemId, itemTitle) {
         deliveryConfigReady = true;
         renderDeliveryCurrentItemIdentity(operation.selection, true);
         restoreDeliveryCardBatchNote(context);
-        setDeliveryConfigStatus(config ? `已加载${itemLabel}的交付配置，请确认后点击保存。` : `请为${itemLabel}选择交付方式，然后点击保存。`);
+        setDeliveryConfigStatus(config ? `已加载${itemLabel}的交付配置，请确认后点击“保存当前商品配置”。` : `请为${itemLabel}选择交付方式，然后点击“保存当前商品配置”。`);
         loadSucceeded = true;
     } catch (error) {
         if (!operation.isCurrent() || error?.name === 'AbortError') return;

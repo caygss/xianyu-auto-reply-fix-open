@@ -275,6 +275,38 @@ test('slow A cannot overwrite fast B or release B loading state', async () => {
   assert.equal(harness.api.state().context.itemId, 'item-B');
 });
 
+test('loaded existing config names the exact save button action', async () => {
+  const harness = createHarness();
+  const load = harness.api.openDeliveryConfigForItem('account-A', 'item-A', '商品 A');
+  harness.respond('/api/items/item-A/delivery-card', { card_id: 'card-A' });
+  await tick();
+  harness.respond('/delivery-config', { mode: 'fixed_link' });
+  harness.respond('/inventory/settings', { settings: {} });
+  harness.respond('/inventory?', { inventory: {} });
+  harness.respond('/inventory/preview', { items: [] });
+
+  await load;
+
+  assert.equal(harness.elements.get('deliveryConfigStatus').textContent,
+    '已加载“商品 A”的交付配置，请确认后点击“保存当前商品配置”。');
+});
+
+test('loaded item without config names the exact save button action', async () => {
+  const harness = createHarness();
+  const load = harness.api.openDeliveryConfigForItem('account-A', 'item-A', '商品 A');
+  harness.respond('/api/items/item-A/delivery-card', { card_id: 'card-A' });
+  await tick();
+  harness.respond('/delivery-config', { detail: 'not found' }, 404);
+  harness.respond('/inventory/settings', { settings: {} });
+  harness.respond('/inventory?', { inventory: {} });
+  harness.respond('/inventory/preview', { items: [] });
+
+  await load;
+
+  assert.equal(harness.elements.get('deliveryConfigStatus').textContent,
+    '请为“商品 A”选择交付方式，然后点击“保存当前商品配置”。');
+});
+
 test('aborted A is silent while real B failure is actionable', async () => {
   const harness = createHarness();
   harness.elements.get('fixedLinkInput').value = 'old-value';
