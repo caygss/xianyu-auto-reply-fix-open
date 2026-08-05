@@ -12959,7 +12959,8 @@ function setDeliveryConfigWriteControlsDisabled(disabled) {
 }
 
 function setDeliveryConfigBusy(busy) {
-    if (!busy && (deliveryLoadUiOwner || deliveryWriteUiOwner)) return false;
+    const hasOwner = Boolean(deliveryLoadUiOwner || deliveryWriteUiOwner);
+    if ((busy && !hasOwner) || (!busy && hasOwner)) return false;
     const panel = document.getElementById('deliveryConfigPanel');
     panel?.setAttribute('aria-busy', String(busy));
     setDeliveryConfigWriteControlsDisabled(busy || !deliveryConfigReady);
@@ -12990,7 +12991,7 @@ function setDeliveryLoadBusy(operation, busy) {
 function setDeliveryWriteBusy(operation, busy) {
     const panel = document.getElementById('deliveryConfigPanel');
     const itemButtons = document.querySelectorAll('[data-delivery-item-index]');
-    const switchBlockedTitle = '当前商品正在处理中，完成后才能切换';
+    const switchBlockedTitle = '正在处理当前商品，完成后可以切换';
     if (busy) {
         if (!deliveryConfigSession.isWriteCurrent(operation)) return false;
         deliveryWriteUiOwner = operation;
@@ -13014,6 +13015,7 @@ function setDeliveryWriteBusy(operation, busy) {
 }
 
 function beginDeliveryWrite(kind) {
+    if (deliveryConfigSession.isWriteActive()) return null;
     const operation = deliveryConfigSession.beginWrite(kind);
     if (!operation) {
         setDeliveryConfigStatus('当前商品尚未加载完成，请稍候', 'error');
@@ -13035,7 +13037,20 @@ function setDeliveryWriteStatus(operation, message, type = 'info') {
 }
 
 function deliveryCurrentItemLabel(selection) {
-    return selection.itemTitle || selection.itemId;
+    return String(selection?.itemTitle || selection?.itemId || '').trim();
+}
+
+function deliveryItemLabel(context) {
+    return `“${deliveryCurrentItemLabel(context) || '当前商品'}”`;
+}
+
+function deliverySafeErrorMessage(error, fallback = '操作失败，请稍后重试') {
+    const defaultFallback = '操作失败，请稍后重试';
+    const safeFallback = String(fallback || defaultFallback).trim().slice(0, 160) || defaultFallback;
+    const message = String(typeof error === 'string' ? error : (error?.message || '')).trim();
+    const unsafePattern = /AbortError|https?:\/\/|\/api\/|authorization|bearer|token|generation|stack|raw\s+response|response\s+body|[\\/]|[{}\[\]]|<[^>]*>/i;
+    if (!message || unsafePattern.test(message)) return safeFallback;
+    return message.slice(0, 160);
 }
 
 function renderDeliveryCurrentItemIdentity(selection, ready = false) {
@@ -13207,12 +13222,11 @@ async function openDeliveryConfigForItem(accountId, itemId, itemTitle) {
     });
     const started = deliveryConfigSession.beginLoad(selection);
     if (!started.accepted) {
-        const target = deliveryCurrentItemLabel(started.context);
-        setDeliveryConfigStatus(`商品“${target}”的交付配置正在保存，需完成后才能切换。`, 'error');
+        setDeliveryConfigStatus(`正在处理${deliveryItemLabel(started.context)}，完成后可以切换商品。`, 'error');
         return;
     }
     const operation = started.operation;
-    const displayName = deliveryCurrentItemLabel(operation.selection);
+    const itemLabel = deliveryItemLabel(operation.selection);
     let loadSucceeded = false;
     deliveryConfigContext = null;
     deliveryConfigReady = false;
@@ -13220,7 +13234,7 @@ async function openDeliveryConfigForItem(accountId, itemId, itemTitle) {
     renderDeliveryCurrentItemIdentity(operation.selection, false);
     clearDeliveryConfigLoadValues();
     setDeliveryLoadBusy(operation, true);
-    setDeliveryConfigStatus(`正在加载“${displayName}”的交付配置…`);
+    setDeliveryConfigStatus(`正在加载${itemLabel}的交付配置…`);
     document.getElementById('deliveryConfigPanel')?.scrollIntoView({ behavior: 'auto', block: 'start' });
     try {
         const resolved = await deliveryConfigFetch(
@@ -13251,7 +13265,7 @@ async function openDeliveryConfigForItem(accountId, itemId, itemTitle) {
         deliveryConfigReady = true;
         renderDeliveryCurrentItemIdentity(operation.selection, true);
         restoreDeliveryCardBatchNote(context);
-        setDeliveryConfigStatus(config ? `已加载“${displayName}”的交付配置，请确认后点击保存。` : `请为“${displayName}”选择交付方式，然后点击保存。`);
+        setDeliveryConfigStatus(config ? `已加载${itemLabel}的交付配置，请确认后点击保存。` : `请为${itemLabel}选择交付方式，然后点击保存。`);
         loadSucceeded = true;
     } catch (error) {
         if (!operation.isCurrent() || error?.name === 'AbortError') return;
@@ -13260,7 +13274,7 @@ async function openDeliveryConfigForItem(accountId, itemId, itemTitle) {
         renderDeliveryCurrentItemIdentity(operation.selection, false);
         clearDeliveryConfigLoadValues();
         setDeliveryConfigBusy(true);
-        setDeliveryConfigStatus(`“${displayName}”加载失败，请重新点击商品列表中的“设置交付方式”。`, 'error');
+        setDeliveryConfigStatus(`${itemLabel}加载失败，请重新点击商品列表中的“设置交付方式”。`, 'error');
     } finally {
         if (operation.isCurrent()) {
             if (loadSucceeded) {
@@ -13324,12 +13338,6 @@ function buildInventorySettingsPayload() {
     };
 }
 
-function requireDeliveryConfigContext() {
-    if (deliveryConfigContext) return deliveryConfigContext;
-    setDeliveryConfigStatus('请先从商品列表点击“设置交付方式”', 'error');
-    return null;
-}
-
 async function saveInventorySettings(context, payload = buildInventorySettingsPayload()) {
     const paths = deliveryCardPaths(context.cardId, context.accountId);
     return deliveryConfigFetch(paths.settings, {
@@ -13365,20 +13373,33 @@ async function saveCurrentDeliveryConfig() {
     const operation = beginDeliveryWrite('save');
     if (!operation) return;
     const { context } = operation;
-    setDeliveryWriteStatus(operation, '正在保存当前商品配置…');
+    const itemLabel = deliveryItemLabel(context);
+    const usesInventory = payload.mode === 'imported_card' || payload.mode === 'generated_card';
+    setDeliveryWriteStatus(operation, `正在保存${itemLabel}的交付配置…`);
     try {
         const paths = deliveryCardPaths(context.cardId, context.accountId);
-        await deliveryConfigFetch(paths.config, {
-            method: 'PUT', body: JSON.stringify(payload)
-        });
-        if (!deliveryConfigSession.isWriteCurrent(operation)) return;
-        if (payload.mode === 'imported_card' || payload.mode === 'generated_card') {
-            await saveInventorySettings(context, inventoryPayload);
+        try {
+            await deliveryConfigFetch(paths.config, {
+                method: 'PUT', body: JSON.stringify(payload)
+            });
+        } catch (error) {
+            const reason = deliverySafeErrorMessage(error, '暂时无法保存');
+            setDeliveryWriteStatus(operation, `${itemLabel}的交付配置保存失败：${reason}。请检查后再次保存。`, 'error');
+            return;
         }
         if (!deliveryConfigSession.isWriteCurrent(operation)) return;
-        setDeliveryWriteStatus(operation, '当前商品交付配置已保存', 'success');
-    } catch (error) {
-        setDeliveryWriteStatus(operation, `保存失败：${error.message}`, 'error');
+        if (usesInventory) {
+            try {
+                await saveInventorySettings(context, inventoryPayload);
+            } catch (error) {
+                setDeliveryWriteStatus(operation, `${itemLabel}的交付方式已保存，但库存设置保存失败，请再次保存。`, 'warning');
+                return;
+            }
+        }
+        if (!deliveryConfigSession.isWriteCurrent(operation)) return;
+        setDeliveryWriteStatus(operation, usesInventory
+            ? `${itemLabel}的交付配置和库存设置已保存。`
+            : `${itemLabel}的交付配置已保存。`, 'success');
     } finally {
         finishDeliveryWrite(operation);
     }
@@ -13388,13 +13409,16 @@ async function deleteCurrentDeliveryConfig() {
     const operation = beginDeliveryWrite('delete');
     if (!operation) return;
     const { context } = operation;
+    const itemLabel = deliveryItemLabel(context);
+    setDeliveryWriteStatus(operation, `正在删除${itemLabel}的交付配置，完成后可以重新选择交付方式。`);
     try {
         await deliveryConfigFetch(deliveryCardPaths(context.cardId, context.accountId).config, { method: 'DELETE' });
         if (!deliveryConfigSession.isWriteCurrent(operation)) return;
         applyDeliveryConfig(null);
-        setDeliveryWriteStatus(operation, '当前商品交付配置已删除', 'success');
+        setDeliveryWriteStatus(operation, `${itemLabel}的交付配置已删除，请重新选择交付方式后保存。`, 'success');
     } catch (error) {
-        setDeliveryWriteStatus(operation, `删除失败：${error.message}`, 'error');
+        const reason = deliverySafeErrorMessage(error, '暂时无法删除');
+        setDeliveryWriteStatus(operation, `${itemLabel}的交付配置删除失败：${reason}。请再次删除。`, 'error');
     } finally {
         finishDeliveryWrite(operation);
     }
@@ -13448,17 +13472,24 @@ async function importCardInventory() {
     const operation = beginDeliveryWrite('import');
     if (!operation) return;
     const { context } = operation;
+    const itemLabel = deliveryItemLabel(context);
+    let imported = false;
+    setDeliveryWriteStatus(operation, `正在为${itemLabel}导入卡密，完成后将刷新库存预览。`);
     try {
         await deliveryConfigFetch(deliveryCardPaths(context.cardId, context.accountId).importItems, {
             method: 'POST', body: JSON.stringify({ secrets })
         });
         if (!deliveryConfigSession.isWriteCurrent(operation)) return;
-        document.getElementById('cardImportInput').value = '';
+        imported = true;
         await refreshDeliveryInventory(context, operation);
         if (!deliveryConfigSession.isWriteCurrent(operation)) return;
-        setDeliveryWriteStatus(operation, '卡密已导入，页面仅显示脱敏预览', 'success');
+        document.getElementById('cardImportInput').value = '';
+        setDeliveryWriteStatus(operation, `${itemLabel}的卡密已导入，脱敏库存预览已刷新，可以继续处理订单。`, 'success');
     } catch (error) {
-        setDeliveryWriteStatus(operation, `导入失败：${error.message}`, 'error');
+        const reason = deliverySafeErrorMessage(error, imported ? '暂时无法刷新库存' : '暂时无法导入');
+        setDeliveryWriteStatus(operation, imported
+            ? `${itemLabel}的卡密已导入，但库存刷新失败：${reason}。请再次点击“继续处理”。`
+            : `${itemLabel}的卡密导入失败：${reason}。请检查内容后再次导入。`, imported ? 'warning' : 'error');
     } finally {
         finishDeliveryWrite(operation);
     }
@@ -13469,16 +13500,23 @@ async function generateCardInventory() {
     const operation = beginDeliveryWrite('generate');
     if (!operation) return;
     const { context } = operation;
+    const itemLabel = deliveryItemLabel(context);
+    let generated = false;
+    setDeliveryWriteStatus(operation, `正在为${itemLabel}保存生成设置并生成卡密，完成后将刷新库存。`);
     try {
         await saveInventorySettings(context, inventoryPayload);
         if (!deliveryConfigSession.isWriteCurrent(operation)) return;
         await deliveryConfigFetch(deliveryCardPaths(context.cardId, context.accountId).generate, { method: 'POST' });
         if (!deliveryConfigSession.isWriteCurrent(operation)) return;
+        generated = true;
         await refreshDeliveryInventory(context, operation);
         if (!deliveryConfigSession.isWriteCurrent(operation)) return;
-        setDeliveryWriteStatus(operation, '库存已按当前生成设置补充', 'success');
+        setDeliveryWriteStatus(operation, `${itemLabel}的卡密已生成，库存已刷新，可以继续处理订单。`, 'success');
     } catch (error) {
-        setDeliveryWriteStatus(operation, `生成失败：${error.message}`, 'error');
+        const reason = deliverySafeErrorMessage(error, generated ? '暂时无法刷新库存' : '暂时无法生成');
+        setDeliveryWriteStatus(operation, generated
+            ? `${itemLabel}的卡密已生成，但库存刷新失败：${reason}。请再次点击“继续处理”。`
+            : `${itemLabel}的卡密生成失败：${reason}。生成设置已保留，请检查后再次生成。`, generated ? 'warning' : 'error');
     } finally {
         finishDeliveryWrite(operation);
     }
@@ -13502,12 +13540,15 @@ async function continueDeliveryProcessing() {
     const operation = beginDeliveryWrite('continue');
     if (!operation) return;
     const { context } = operation;
+    const itemLabel = deliveryItemLabel(context);
+    setDeliveryWriteStatus(operation, `正在刷新${itemLabel}的库存状态，完成后请确认是否仍然缺货。`);
     try {
         await refreshDeliveryInventory(context, operation);
         if (!deliveryConfigSession.isWriteCurrent(operation)) return;
-        setDeliveryWriteStatus(operation, '库存状态已刷新；补足后系统将重试');
+        setDeliveryWriteStatus(operation, `${itemLabel}的库存状态已刷新；如已补足，系统将继续处理。`, 'success');
     } catch (error) {
-        setDeliveryWriteStatus(operation, `刷新库存失败：${error.message}`, 'error');
+        const reason = deliverySafeErrorMessage(error, '暂时无法刷新库存');
+        setDeliveryWriteStatus(operation, `${itemLabel}的库存刷新失败：${reason}。请再次点击“继续处理”。`, 'error');
     } finally {
         finishDeliveryWrite(operation);
     }
@@ -13667,7 +13708,7 @@ function displayCurrentPageItems() {
         <td>${formatDateTime(item.updated_at)}</td>
             <td>
                 <div class="d-flex flex-wrap gap-1" role="group">
-                <button type="button" class="btn btn-sm btn-outline-success" data-delivery-item-index="${itemIndex}"${deliveryConfigSession.isWriteActive() ? ' disabled title="当前商品正在处理中，完成后才能切换"' : ''}>
+                <button type="button" class="btn btn-sm btn-outline-success" data-delivery-item-index="${itemIndex}"${deliveryConfigSession.isWriteActive() ? ' disabled title="正在处理当前商品，完成后可以切换"' : ''}>
                     设置交付方式
                 </button>
                 <button class="btn btn-sm btn-outline-primary" onclick="editItem('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}')" title="编辑详情">

@@ -86,6 +86,14 @@
   color: var(--text-color);
 }
 
+.delivery-config-primary-button:disabled,
+.delivery-config-secondary-button:disabled {
+  border-color: var(--border-color);
+  background: var(--light-color);
+  color: var(--text-secondary);
+  cursor: not-allowed;
+}
+
 .delivery-config-icon-button {
   flex: 0 0 44px;
   padding: 0;
@@ -290,9 +298,30 @@
 .delivery-config-status {
   margin-top: 16px;
   padding: 12px;
+  border: 1px solid transparent;
   border-radius: 8px;
   background: var(--light-color);
   color: var(--text-secondary);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.delivery-config-status[data-status="success"] {
+  border-color: color-mix(in srgb, var(--success-color) 35%, var(--border-color));
+  background: color-mix(in srgb, var(--success-color) 8%, var(--card-bg));
+  color: var(--text-color);
+}
+
+.delivery-config-status[data-status="warning"] {
+  border-color: color-mix(in srgb, var(--warning-color) 35%, var(--border-color));
+  background: color-mix(in srgb, var(--warning-color) 8%, var(--card-bg));
+  color: var(--text-color);
+}
+
+.delivery-config-status[data-status="error"] {
+  border-color: color-mix(in srgb, var(--danger-color) 35%, var(--border-color));
+  background: color-mix(in srgb, var(--danger-color) 8%, var(--card-bg));
+  color: var(--text-color);
 }
 
 .delivery-config-save-actions {
