@@ -416,14 +416,60 @@ def test_setup_delivery_summary_includes_task5_config_without_leaking_config(api
         "get_cookie_details",
         lambda cookie_id: {"user_id": 1} if cookie_id == "cookie-a" else None,
     )
+    binding = api_state.get_or_create_item_delivery_card(
+        USER["user_id"], "cookie-a", "item-100", "测试商品"
+    )
     _put_config(
         {
             "mode": "fixed_link",
             "config": {"url": "https://private.example/s/secret?pwd=abc"},
-        }
+        },
+        card_id=binding["card_id"],
     )
 
     summary = reply_server._get_guided_delivery_summary("cookie-a")
-    assert summary["configured"] is True
-    assert summary["config_count"] == 1
+    assert set(summary) == {
+        "item_count",
+        "delivery_configured",
+        "republish_configured",
+        "target_item_id",
+        "target_item_title",
+    }
+    assert summary["delivery_configured"] is True
+    assert summary["target_item_id"] == "item-100"
     assert "private.example" not in json.dumps(summary, ensure_ascii=False)
+
+
+def test_setup_delivery_summary_ignores_orphan_and_damaged_configs(api_state, monkeypatch):
+    class EmptyStore:
+        def list_templates(self, cookie_id):
+            return []
+
+    monkeypatch.setattr(reply_server, "_get_republish_store", lambda: EmptyStore())
+    monkeypatch.setattr(
+        api_state,
+        "get_cookie_details",
+        lambda cookie_id: {"user_id": 1} if cookie_id == "cookie-a" else None,
+    )
+
+    _put_config({"mode": "fixed_link", "config": {"url": "https://orphan.example/secret"}})
+    orphan_summary = reply_server._get_guided_delivery_summary("cookie-a")
+    assert orphan_summary["delivery_configured"] is False
+
+    binding = api_state.get_or_create_item_delivery_card(
+        USER["user_id"], "cookie-a", "item-100", "测试商品"
+    )
+    _put_config(
+        {"mode": "fixed_link", "config": {"url": "https://damaged.example/secret"}},
+        card_id=binding["card_id"],
+    )
+    with api_state.lock:
+        api_state.conn.execute(
+            "UPDATE item_delivery_configs SET config_text = ? WHERE user_id = ? AND card_id = ? AND account_id = ?",
+            ("broken-ciphertext", USER["user_id"], binding["card_id"], "cookie-a"),
+        )
+        api_state.conn.commit()
+
+    damaged_summary = reply_server._get_guided_delivery_summary("cookie-a")
+    assert damaged_summary["delivery_configured"] is False
+    assert "damaged.example" not in json.dumps(damaged_summary, ensure_ascii=False)

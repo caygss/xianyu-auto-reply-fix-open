@@ -75,6 +75,7 @@ def test_guided_setup_delivery_actions_navigate_and_focus_existing_item_controls
         assert action in APP or action in CSS
     assert "商品发布" in APP
     assert "未找到目标商品" in APP
+    assert "shouldNavigateGuidedSetupAction(response, selectedAction)" in APP
 
 
 def test_guided_setup_target_controls_are_keyboard_and_aria_friendly():

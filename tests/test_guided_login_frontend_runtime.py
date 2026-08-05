@@ -261,3 +261,56 @@ assert.equal(guided.getGuidedManualPrimaryAction(
         check=False,
     )
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_guided_navigation_requires_success_action_and_current_server_transition():
+    script = r"""
+const assert = require('node:assert/strict');
+global.localStorage = { getItem: () => '', setItem: () => {}, removeItem: () => {} };
+global.location = { origin: 'http://test', hostname: 'test' };
+global.window = { location: global.location, open: () => null, addEventListener: () => {}, setTimeout: () => 0 };
+global.document = {
+  addEventListener: () => {}, getElementById: () => null, querySelector: () => null,
+  querySelectorAll: () => [], createElement: () => ({ style: {}, appendChild: () => {}, setAttribute: () => {} }),
+  getElementsByTagName: () => [], head: { appendChild: () => {} }, body: { appendChild: () => {} },
+};
+global.fetch = async () => ({ ok: true, status: 200, json: async () => ({}) });
+const guided = require('./static/js/app.js');
+const action = 'go_to_delivery_config';
+const valid = { success: true, action, guided_status: { primary_action: action } };
+assert.equal(guided.shouldNavigateGuidedSetupAction(valid, action), true);
+assert.equal(guided.shouldNavigateGuidedSetupAction({ ...valid, success: false }, action), false);
+assert.equal(guided.shouldNavigateGuidedSetupAction({ ...valid, action: 'go_to_item_management' }, action), false);
+assert.equal(guided.shouldNavigateGuidedSetupAction({ ...valid, guided_status: { primary_action: 'refresh_status' } }, action), false);
+assert.equal(guided.shouldNavigateGuidedSetupAction(valid, 'finish'), false);
+"""
+    result = subprocess.run(["node", "-e", script], cwd=ROOT, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_guided_target_row_matches_account_and_item_together():
+    script = r"""
+const assert = require('node:assert/strict');
+const rows = [
+  { dataset: { guidedItemCookieId: 'account-a', guidedItemId: 'same-item' } },
+  { dataset: { guidedItemCookieId: 'account-b', guidedItemId: 'same-item' } },
+];
+global.localStorage = { getItem: () => '', setItem: () => {}, removeItem: () => {} };
+global.location = { origin: 'http://test', hostname: 'test' };
+global.window = { location: global.location, open: () => null, addEventListener: () => {} };
+global.document = {
+  addEventListener: () => {}, getElementById: () => null, querySelector: () => null,
+  querySelectorAll: selector => selector.includes('data-guided-item-id') ? rows : [],
+  createElement: () => ({ style: {}, appendChild: () => {}, setAttribute: () => {} }),
+  getElementsByTagName: () => [], head: { appendChild: () => {} }, body: { appendChild: () => {} },
+};
+global.fetch = async () => ({ ok: true, status: 200, json: async () => ({}) });
+const guided = require('./static/js/app.js');
+assert.equal(
+  guided.findGuidedSetupTargetRow({ cookie_id: 'account-b', item_id: 'same-item' }),
+  rows[1],
+);
+assert.equal(guided.findGuidedSetupTargetRow({ cookie_id: 'account-c', item_id: 'same-item' }), null);
+"""
+    result = subprocess.run(["node", "-e", script], cwd=ROOT, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr or result.stdout

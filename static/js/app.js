@@ -24,6 +24,11 @@ const GUIDED_SETUP_POLL_INTERVAL = 3000;
 const GUIDED_SETUP_STATUS_ENDPOINT = '/setup/status';
 const GUIDED_SETUP_ACTION_ENDPOINT = '/setup/action';
 const GUIDED_SETUP_ACTIVE_BROWSER_STATES = new Set(['processing', 'active', 'ready', 'opened']);
+const GUIDED_SETUP_NAVIGATION_ACTIONS = new Set([
+    'go_to_item_management',
+    'go_to_delivery_config',
+    'go_to_republish_config',
+]);
 let guidedSetupPollTimer = null;
 let guidedSetupCountdownTimer = null;
 let guidedSetupState = {
@@ -528,7 +533,18 @@ function guidedSetupTargetItem(accountId, guidedStatus) {
 
 function findGuidedSetupTargetRow(item) {
     return [...(document.querySelectorAll?.('#itemsTableBody tr[data-guided-item-id]') || [])]
-        .find(row => String(row.dataset.guidedItemId || '') === String(item?.item_id || '')) || null;
+        .find(row => (
+            String(row.dataset.guidedItemCookieId || '') === String(item?.cookie_id || '')
+            && String(row.dataset.guidedItemId || '') === String(item?.item_id || '')
+        )) || null;
+}
+
+function shouldNavigateGuidedSetupAction(response, selectedAction) {
+    const action = String(selectedAction || '').trim();
+    return GUIDED_SETUP_NAVIGATION_ACTIONS.has(action)
+        && response?.success === true
+        && response?.action === action
+        && response?.guided_status?.primary_action === action;
 }
 
 async function navigateGuidedSetupAction(action, accountId, guidedStatus) {
@@ -645,7 +661,7 @@ async function handleGuidedSetupAction(action) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: selectedAction, cookie_id: cookieId || undefined }),
         });
-        if (['go_to_item_management', 'go_to_delivery_config', 'go_to_republish_config'].includes(selectedAction)) {
+        if (shouldNavigateGuidedSetupAction(response, selectedAction)) {
             await navigateGuidedSetupAction(selectedAction, cookieId, response?.guided_status || guidedSetupState.guidedStatus);
         }
         if (response?.guided_status && cookieId) {
@@ -25956,11 +25972,13 @@ if (typeof module !== 'undefined' && module.exports) {
         getGuidedManualPrimaryAction,
         getGuidedSetupCopy,
         getGuidedSetupStatusViewModel,
+        findGuidedSetupTargetRow,
         isGuidedRuntimeReady,
         isGuidedManualBrowserAvailable,
         loadGuidedSetupStatus,
         normalizeGuidedRuntimeStatus,
         renderGuidedSetupStatus,
         selectGuidedSetupAccount,
+        shouldNavigateGuidedSetupAction,
     };
 }

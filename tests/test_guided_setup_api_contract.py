@@ -109,7 +109,13 @@ def test_setup_status_reuses_real_configured_delivery_summary(authenticated_clie
     monkeypatch.setattr(
         reply_server,
         "_get_guided_delivery_summary",
-        lambda cookie_id: summary_calls.append(cookie_id) or {"configured": True, "template_count": 1},
+        lambda cookie_id: summary_calls.append(cookie_id) or {
+            "item_count": 1,
+            "delivery_configured": True,
+            "republish_configured": True,
+            "target_item_id": "item-1",
+            "target_item_title": "测试商品",
+        },
     )
     monkeypatch.setattr(
         reply_server,
@@ -124,7 +130,13 @@ def test_setup_status_reuses_real_configured_delivery_summary(authenticated_clie
 
     assert response.status_code == 200
     assert summary_calls == ["account-1"]
-    assert captured == [{"configured": True, "template_count": 1}]
+    assert captured == [{
+        "item_count": 1,
+        "delivery_configured": True,
+        "republish_configured": True,
+        "target_item_id": "item-1",
+        "target_item_title": "测试商品",
+    }]
     guided_status = response.json()["accounts"][0]["guided_status"]
     assert guided_status["primary_action"] == "finish"
     assert guided_status["step_index"] == 6
@@ -135,7 +147,13 @@ def test_setup_status_keeps_unconfigured_account_before_completion(authenticated
     monkeypatch.setattr(
         reply_server,
         "_get_guided_delivery_summary",
-        lambda cookie_id: {"configured": False, "template_count": 0},
+        lambda cookie_id: {
+            "item_count": 1,
+            "delivery_configured": False,
+            "republish_configured": False,
+            "target_item_id": "item-1",
+            "target_item_title": "测试商品",
+        },
     )
     monkeypatch.setattr(
         reply_server,
@@ -170,7 +188,13 @@ def test_setup_status_does_not_finish_configured_account_with_unready_message_st
     monkeypatch.setattr(
         reply_server,
         "_get_guided_delivery_summary",
-        lambda cookie_id: {"configured": True, "template_count": 1},
+        lambda cookie_id: {
+            "item_count": 1,
+            "delivery_configured": True,
+            "republish_configured": True,
+            "target_item_id": "item-1",
+            "target_item_title": "测试商品",
+        },
     )
     monkeypatch.setattr(
         reply_server,
@@ -198,13 +222,135 @@ def test_setup_action_rejects_unknown_action_and_keeps_allowed_actions(authentic
     unknown = authenticated_client.post("/setup/action", json={"action": "delete_everything"})
     assert unknown.status_code == 400
 
-    for action in ("refresh_status", "go_to_item_management", "go_to_delivery_config", "go_to_republish_config"):
+    refresh = authenticated_client.post("/setup/action", json={"action": "refresh_status"})
+    assert refresh.status_code == 200
+    assert refresh.json()["action"] == "refresh_status"
+
+    for action in ("go_to_item_management", "go_to_delivery_config", "go_to_republish_config"):
         response = authenticated_client.post("/setup/action", json={"action": action})
-        assert response.status_code == 200
-        assert response.json()["action"] == action
+        assert response.status_code == 400
 
     finish_without_cookie = authenticated_client.post("/setup/action", json={"action": "finish"})
     assert finish_without_cookie.status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("summary", "action"),
+    [
+        (
+            {"item_count": 0, "delivery_configured": False, "republish_configured": False},
+            "go_to_item_management",
+        ),
+        (
+            {
+                "item_count": 1,
+                "delivery_configured": False,
+                "republish_configured": False,
+                "target_item_id": "item-1",
+                "target_item_title": "测试商品",
+            },
+            "go_to_delivery_config",
+        ),
+        (
+            {
+                "item_count": 1,
+                "delivery_configured": True,
+                "republish_configured": False,
+                "target_item_id": "item-1",
+                "target_item_title": "测试商品",
+            },
+            "go_to_republish_config",
+        ),
+    ],
+)
+def test_setup_navigation_action_succeeds_only_for_current_guided_transition(
+    authenticated_client, monkeypatch, summary, action
+):
+    monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"account-1": "masked"})
+    monkeypatch.setattr(
+        reply_server,
+        "_build_live_runtime_status",
+        lambda cookie_id: {"connection_state": "connected", "running": True, "message_stream_ready": True},
+    )
+    monkeypatch.setattr(reply_server, "_get_guided_delivery_summary", lambda cookie_id: summary)
+
+    response = authenticated_client.post(
+        "/setup/action",
+        json={"action": action, "cookie_id": "account-1"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["action"] == action
+    assert payload["guided_status"]["primary_action"] == action
+    assert "masked" not in response.text
+
+
+def test_setup_navigation_action_rejects_stale_transition_without_claiming_navigation(
+    authenticated_client, monkeypatch
+):
+    monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"account-1": "cookie-secret"})
+    monkeypatch.setattr(
+        reply_server,
+        "_build_live_runtime_status",
+        lambda cookie_id: {"connection_state": "connected", "running": True, "message_stream_ready": True},
+    )
+    monkeypatch.setattr(
+        reply_server,
+        "_get_guided_delivery_summary",
+        lambda cookie_id: {"item_count": 0, "delivery_configured": False, "republish_configured": False},
+    )
+
+    response = authenticated_client.post(
+        "/setup/action",
+        json={"action": "go_to_delivery_config", "cookie_id": "account-1"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["next_action"] == "go_to_item_management"
+    assert payload["guided_status"]["primary_action"] == "go_to_item_management"
+    assert "cookie-secret" not in response.text
+
+
+def test_setup_navigation_action_keeps_runtime_recovery_ahead_of_item_navigation(
+    authenticated_client, monkeypatch
+):
+    monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"account-1": "masked"})
+    monkeypatch.setattr(
+        reply_server,
+        "_build_live_runtime_status",
+        lambda cookie_id: {"connection_state": "reconnecting", "running": True, "message_stream_ready": True},
+    )
+    monkeypatch.setattr(
+        reply_server,
+        "_get_guided_delivery_summary",
+        lambda cookie_id: {"item_count": 0, "delivery_configured": False, "republish_configured": False},
+    )
+
+    response = authenticated_client.post(
+        "/setup/action",
+        json={"action": "go_to_item_management", "cookie_id": "account-1"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["next_action"] == "refresh_status"
+    assert payload["guided_status"]["primary_action"] == "refresh_status"
+
+
+def test_setup_navigation_action_denies_cross_account_access(authenticated_client, monkeypatch):
+    monkeypatch.setattr(reply_server, "_get_user_cookies_map", lambda current_user: {"account-1": "masked"})
+
+    response = authenticated_client.post(
+        "/setup/action",
+        json={"action": "go_to_item_management", "cookie_id": "account-2"},
+    )
+
+    assert response.status_code == 403
 
 
 def test_setup_finish_is_blocked_until_account_is_running_and_delivery_is_configured(

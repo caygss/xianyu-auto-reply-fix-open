@@ -5083,15 +5083,27 @@ def _get_guided_delivery_summary(cookie_id: str) -> Dict[str, Any]:
             getattr(template, "paused", False)
         ):
             active_republish_item_ids.append(item_id)
-    config_count = 0
+
     try:
         account_details = db_manager.get_cookie_details(cookie_id) or {}
-        config_count = DeliveryConfigService(db_manager).count_for_account(
-            account_details.get('user_id'), cookie_id
-        )
+        user_id = int(account_details.get("user_id"))
     except Exception as exc:
-        logger.warning(f"读取向导交付配置摘要失败: {type(exc).__name__}")
-    delivery_configured = configured or config_count > 0
+        logger.warning(f"读取向导账号归属失败: {type(exc).__name__}")
+        user_id = 0
+
+    if user_id > 0:
+        delivery_service = DeliveryConfigService(db_manager)
+        for item in items:
+            try:
+                binding = db_manager.get_item_delivery_binding(user_id, cookie_id, item["item_id"])
+                if not isinstance(binding, dict) or binding.get("card_id") is None:
+                    continue
+                delivery_service.get_for_delivery(user_id, binding["card_id"], cookie_id)
+                delivery_item_ids.append(item["item_id"])
+            except Exception as exc:
+                logger.warning(f"读取向导商品交付配置失败: {type(exc).__name__}")
+
+    delivery_configured = configured or bool(delivery_item_ids)
     republish_configured = bool(active_republish_item_ids)
     target_item_id = (
         active_republish_item_ids[0]
@@ -5104,14 +5116,11 @@ def _get_guided_delivery_summary(cookie_id: str) -> Dict[str, Any]:
     )
     target_title = item_by_id.get(target_item_id, {}).get("item_title", "") if target_item_id else ""
     return {
-        "configured": delivery_configured,
+        "item_count": len(items),
         "delivery_configured": delivery_configured,
         "republish_configured": republish_configured,
-        "item_count": len(items),
         "target_item_id": target_item_id,
         "target_item_title": target_title,
-        "template_count": len(templates) if isinstance(templates, list) else 0,
-        "config_count": config_count,
     }
 
 
@@ -5277,17 +5286,54 @@ def _perform_guided_setup_action_impl(
         'go_to_republish_config',
         'finish',
     }
+    navigation_actions = {
+        'go_to_item_management',
+        'go_to_delivery_config',
+        'go_to_republish_config',
+    }
     action = str(request.action or '').strip()
     if action not in allowed_actions:
         raise HTTPException(status_code=400, detail='不支持的向导操作')
 
     cookie_id = str(request.cookie_id or request.cid or '').strip()
-    if action == 'finish' and not cookie_id:
-        raise HTTPException(status_code=400, detail='完成操作需要指定账号')
+    if action in navigation_actions | {'finish'} and not cookie_id:
+        raise HTTPException(status_code=400, detail='该操作需要指定账号')
     if action in {'open_manual_verification', 'complete_manual_verification'}:
         if not cookie_id:
             raise HTTPException(status_code=400, detail='该操作需要指定账号')
         return _safe_manual_verification_action_response(cookie_id, action, current_user)
+
+    if action in navigation_actions:
+        cleaned_cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        runtime_status = _build_live_runtime_status(cleaned_cookie_id)
+        guided_status = build_guided_status(
+            runtime_status,
+            account_details={'id': cleaned_cookie_id},
+            delivery_summary=_get_guided_delivery_summary(cleaned_cookie_id),
+        )
+        current_action = guided_status.get('primary_action') or 'refresh_status'
+        if current_action != action:
+            return {
+                'success': False,
+                'action': action,
+                'cookie_id': cleaned_cookie_id,
+                'next_action': current_action,
+                'message': '当前状态已变化，请按最新提示继续。',
+                'guided_status': guided_status,
+            }
+        messages = {
+            'go_to_item_management': '请进入商品管理，先同步已有商品；如果确实没有商品，请前往商品发布。',
+            'go_to_delivery_config': '请在商品管理中打开“设置交付方式”，完成当前商品的交付配置。',
+            'go_to_republish_config': '请在商品管理中打开“自动发货 / 重新上架配置”，并开启自动重新上架。',
+        }
+        return {
+            'success': True,
+            'action': action,
+            'cookie_id': cleaned_cookie_id,
+            'message': messages[action],
+            'next_step': action.removeprefix('go_to_'),
+            'guided_status': guided_status,
+        }
 
     if cookie_id:
         cleaned_cookie_id = _ensure_cookie_access(cookie_id, current_user)
@@ -5345,18 +5391,6 @@ def _perform_guided_setup_action_impl(
             'success': True,
             'action': action,
             **_build_guided_setup_status_payload(current_user),
-        }
-    if action in {'go_to_item_management', 'go_to_delivery_config', 'go_to_republish_config'}:
-        messages = {
-            'go_to_item_management': '请进入商品管理，先同步已有商品；如果确实没有商品，请前往商品发布。',
-            'go_to_delivery_config': '请在商品管理中打开“设置交付方式”，完成当前商品的交付配置。',
-            'go_to_republish_config': '请在商品管理中打开“自动发货 / 重新上架配置”，并开启自动重新上架。',
-        }
-        return {
-            'success': True,
-            'action': action,
-            'message': messages[action],
-            'next_step': action.removeprefix('go_to_'),
         }
     return {
         'success': True,

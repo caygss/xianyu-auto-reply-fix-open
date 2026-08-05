@@ -352,9 +352,7 @@ def _republish_configured(delivery_summary: Optional[Mapping[str, Any]]) -> bool
         return False
     if "republish_configured" in delivery_summary:
         return _coerce_configured(delivery_summary["republish_configured"])
-    # Keep the old boolean-only contract usable for callers that have not yet
-    # started returning the expanded summary.
-    return "item_count" not in delivery_summary and _delivery_configured(delivery_summary)
+    return False
 
 
 def _guided_summary_fields(delivery_summary: Optional[Mapping[str, Any]]) -> dict[str, Any]:

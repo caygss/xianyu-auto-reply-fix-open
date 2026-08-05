@@ -25,6 +25,13 @@ REQUIRED_FIELDS = {
     "technical_detail",
 }
 
+COMPLETE_DELIVERY_SUMMARY = {
+    "item_count": 1,
+    "delivery_configured": True,
+    "republish_configured": True,
+    "target_item_id": "item-1",
+}
+
 
 @pytest.mark.parametrize(
     ("runtime_status", "expected_action", "expected_step"),
@@ -56,7 +63,7 @@ def test_guided_status_exposes_stable_fields_and_safe_chinese_copy(runtime_statu
             "password": "password-secret",
             "runtime_status": runtime_status,
         },
-        delivery_summary={"configured": True},
+        delivery_summary=COMPLETE_DELIVERY_SUMMARY,
     )
 
     assert REQUIRED_FIELDS <= status.keys()
@@ -73,7 +80,7 @@ def test_guided_status_exposes_stable_fields_and_safe_chinese_copy(runtime_statu
 def test_connected_account_with_delivery_ready_can_wait_for_order():
     status = build_guided_status(
         {"connection_state": "connected", "running": True, "message_stream_ready": True},
-        delivery_summary={"configured": True},
+        delivery_summary=COMPLETE_DELIVERY_SUMMARY,
     )
 
     assert status["step_id"] == "ready_to_wait_for_order"
@@ -122,7 +129,7 @@ def test_connected_account_with_delivery_ready_can_wait_for_order():
     ],
 )
 def test_configured_connected_account_with_unready_message_stream_stays_in_recovery(runtime_status):
-    status = build_guided_status(runtime_status, delivery_summary={"configured": True})
+    status = build_guided_status(runtime_status, delivery_summary=COMPLETE_DELIVERY_SUMMARY)
 
     assert status["primary_action"] == "refresh_status"
     assert status["step_index"] == 5
@@ -174,7 +181,7 @@ def test_connected_account_without_delivery_summary_must_go_to_delivery_config()
 def test_explicit_wait_or_manual_action_has_priority_over_connected(runtime_status, expected_action, monkeypatch):
     monkeypatch.setattr("guided_setup_service.time.time", lambda: 100)
 
-    status = build_guided_status(runtime_status, delivery_summary={"configured": True})
+    status = build_guided_status(runtime_status, delivery_summary=COMPLETE_DELIVERY_SUMMARY)
 
     assert status["primary_action"] == expected_action
     assert status["step_id"] != "ready_to_wait_for_order"
@@ -190,7 +197,7 @@ def test_active_runtime_deadline_has_priority_even_when_token_status_says_connec
             "qr_login_grace_until": 130,
             "message_stream_ready": True,
         },
-        delivery_summary={"configured": True},
+        delivery_summary=COMPLETE_DELIVERY_SUMMARY,
     )
 
     assert status["primary_action"] == "refresh_status"
@@ -207,7 +214,7 @@ def test_complete_pending_manual_verification_has_priority_over_connected():
             "manual_verification_action": "complete_pending",
             "message_stream_ready": True,
         },
-        delivery_summary={"configured": True},
+        delivery_summary=COMPLETE_DELIVERY_SUMMARY,
     )
 
     assert status["primary_action"] == "refresh_status"
@@ -322,7 +329,7 @@ def test_runtime_deadline_fields_drive_dynamic_remaining_seconds(monkeypatch):
 def test_guided_step_index_tracks_the_real_login_state(runtime_status, expected_step, monkeypatch):
     monkeypatch.setattr("guided_setup_service.time.time", lambda: 100)
 
-    status = build_guided_status(runtime_status, delivery_summary={"configured": True})
+    status = build_guided_status(runtime_status, delivery_summary=COMPLETE_DELIVERY_SUMMARY)
 
     assert status["step_index"] == expected_step
     assert 1 <= status["step_index"] <= 6
