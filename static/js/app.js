@@ -25976,6 +25976,7 @@ if (typeof module !== 'undefined' && module.exports) {
         isGuidedRuntimeReady,
         isGuidedManualBrowserAvailable,
         loadGuidedSetupStatus,
+        navigateGuidedSetupAction,
         normalizeGuidedRuntimeStatus,
         renderGuidedSetupStatus,
         selectGuidedSetupAccount,
