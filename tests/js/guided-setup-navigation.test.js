@@ -109,6 +109,10 @@ function createHarness() {
 
 function createHandlerHarness(response) {
   const events = [];
+  const rows = [{
+    id: 'account-A:item-1',
+    dataset: { guidedItemCookieId: 'account-A', guidedItemId: 'item-1' },
+  }];
   const sandbox = {
     __events: events,
     __fetchJSON: async () => response,
@@ -117,12 +121,29 @@ function createHandlerHarness(response) {
     __loadItemsByCookie: async () => events.push('loadItemsByCookie'),
     __openDeliveryConfigForItem: async () => events.push('openDeliveryConfigForItem'),
     __openRepublishConfig: async () => events.push('openRepublishConfig'),
+    __rows: rows,
   };
 
   vm.runInNewContext(`
     const apiBase = '';
     const GUIDED_SETUP_ACTION_ENDPOINT = '/api/guided-setup/action';
+    const GUIDED_SETUP_NAVIGATION_ACTIONS = new Set([
+      'go_to_item_management',
+      'go_to_delivery_config',
+      'go_to_republish_config',
+    ]);
     const guidedSetupState = { requestInFlight: false, guidedStatus: null };
+    let allItemsData = [{ cookie_id: 'account-A', item_id: 'item-1', item_title: '商品 1' }];
+    let filteredItemsData = allItemsData;
+    let itemsPerPage = 20;
+    let currentItemsPage = 1;
+    const rows = globalThis.__rows;
+    const document = {
+      getElementById: (id) => id === 'itemCookieFilter'
+        ? { id, value: '' }
+        : null,
+      querySelectorAll: (selector) => selector === '#itemsTableBody tr[data-guided-item-id]' ? rows : [],
+    };
     const getGuidedSetupElements = () => ({ primary: null });
     const getGuidedSetupAccount = () => ({ id: 'account-A' });
     const renderGuidedSetupStatus = () => undefined;
@@ -133,6 +154,15 @@ function createHandlerHarness(response) {
     const loadItemsByCookie = (...args) => globalThis.__loadItemsByCookie(...args);
     const openDeliveryConfigForItem = (...args) => globalThis.__openDeliveryConfigForItem(...args);
     const openRepublishConfig = (...args) => globalThis.__openRepublishConfig(...args);
+    const showToast = (...args) => globalThis.__showToast?.(...args);
+    const goToItemsPage = () => undefined;
+    const highlightGuidedSetupTarget = (element) => {
+      if (!element) return false;
+      globalThis.__events.push('highlight:' + element.id);
+      return true;
+    };
+    ${extractFunction('guidedSetupTargetItem')}
+    ${extractFunction('findGuidedSetupTargetRow')}
     ${extractFunction('shouldNavigateGuidedSetupAction')}
     ${extractFunction('navigateGuidedSetupAction')}
     ${extractFunction('handleGuidedSetupAction')}
@@ -246,6 +276,23 @@ test('rejects unsuccessful or mismatched guided setup responses', () => {
     ),
     false,
   );
+});
+
+test('navigates when the server confirms the requested guided setup action', async () => {
+  const harness = createHandlerHarness({
+    success: true,
+    action: 'go_to_delivery_config',
+    guided_status: {
+      primary_action: 'go_to_delivery_config',
+      target_item_id: 'item-1',
+    },
+  });
+
+  await harness.api.handleGuidedSetupAction('go_to_delivery_config');
+
+  assert.ok(harness.events.includes('showSection'));
+  assert.ok(harness.events.includes('loadItemsByCookie'));
+  assert.ok(harness.events.includes('openDeliveryConfigForItem'), JSON.stringify(harness.events));
 });
 
 test('does not navigate on stale guided setup action responses', async () => {
