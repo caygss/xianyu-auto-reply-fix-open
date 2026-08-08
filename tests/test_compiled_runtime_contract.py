@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import Start
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = ROOT / "tools" / "xianyu_auto_delivery.spec"
@@ -34,13 +36,13 @@ def test_compiled_exe_opens_dashboard_but_batch_launcher_avoids_duplicate_browse
     assert "XIANYU_AUTO_OPEN_BROWSER=0" in launcher_text
 
 
-def test_shortcut_helper_selects_only_the_startup_launcher():
+def test_shortcut_helper_targets_the_bundled_executable_directly():
     text = SHORTCUT.read_text(encoding="utf-8")
 
-    assert "start" in text.lower()
-    assert "/min" in text
-    assert "APP_EXE" in text
-    assert "Expected exactly one launcher" in text
+    assert "XianyuAutoDelivery.exe" in text
+    assert "$link.TargetPath = $executablePath" in text
+    assert "*.bat" not in text
+    assert "Get-ChildItem" not in text
 
 
 def test_distribution_contains_shortcut_helper_for_buyers():
@@ -48,3 +50,18 @@ def test_distribution_contains_shortcut_helper_for_buyers():
 
     assert "create_desktop_shortcut.ps1" in text
     assert 'Join-Path $stagingRoot "tools"' in text
+
+
+def test_distribution_builder_does_not_ship_batch_launchers():
+    text = DIST_BUILDER.read_text(encoding="utf-8")
+
+    assert '$launcherFiles = @(' not in text
+    assert 'Filter "*.bat"' not in text
+    assert "Expected exactly two compiled-package launcher batch files" not in text
+
+
+def test_configured_api_port_prefers_explicit_environment_override(monkeypatch):
+    monkeypatch.setenv("API_PORT", "8091")
+    monkeypatch.setattr(Start, "AUTO_REPLY", {"api": {"port": 8090}})
+
+    assert Start._configured_api_port() == 8091

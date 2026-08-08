@@ -10,7 +10,7 @@ Keep `data/`, `browser_data/`, `logs/`, and local configuration inside the insta
 
 ## 编译版安装包
 
-本项目的 Windows 分发形式是单目录编译包。安装包包含可执行文件、网页资源、Node.js、Playwright Chromium、启动脚本、许可证和 `SOURCE-CODE.md`，不包含 Python 源文件，也不要求使用 Docker。
+本项目的 Windows 分发形式是单目录编译包。安装包包含可执行文件、网页资源、Node.js、Playwright Chromium、许可证和 `SOURCE-CODE.md`，不包含 Python 源文件，也不要求使用 Docker。
 
 对应源码仓库、标签和提交号会写入安装包内的 `SOURCE-CODE.md`。安装包可以作为编译、打包、安装指导和技术支持服务的一部分收费，但不授予独占权，也不禁止买家修改和再次分发。
 
@@ -18,9 +18,8 @@ Keep `data/`, `browser_data/`, `logs/`, and local configuration inside the insta
 
 1. 将 zip 解压到有写入权限的文件夹，例如“文档”或“桌面”。
 2. 直接双击 `XianyuAutoDelivery.exe`，程序会自动创建运行目录并打开浏览器面板。
-3. 也可以双击 `启动闲鱼自动发货.bat`，它会先检查服务再打开面板；`首次安装闲鱼自动发货.bat` 仅作为可选的目录检查工具。
-4. 在面板中使用买家自己的闲鱼账号扫码登录，再同步自己的商品。
-5. 在“商品管理”中设置默认网盘链接和少量 SKU 专属链接。
+3. 在面板中使用买家自己的闲鱼账号扫码登录，再同步自己的商品。
+4. 在“商品管理”中设置默认网盘链接和少量 SKU 专属链接。
 
 安装包不会带入发布者的 Cookie、Token、数据库、日志、邮箱授权码、API 密钥或卖家专属网盘链接。买家必须使用自己的账号和本地数据。
 
@@ -32,7 +31,7 @@ Keep `data/`, `browser_data/`, `logs/`, and local configuration inside the insta
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\create_desktop_shortcut.ps1
 ```
 
-源码仓库中提供的快捷方式脚本只写入当前 Windows 用户的桌面，不写死开发者个人路径。若只分发编译包，可直接把 `启动闲鱼自动发货.bat` 发送给买家，或者在桌面手动创建快捷方式。
+快捷方式脚本只写入当前 Windows 用户的桌面，不写死开发者个人路径，并且直接指向 `XianyuAutoDelivery.exe`。不需要运行首次安装脚本或启动批处理文件。
 
 ## 构建流程
 
@@ -50,7 +49,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\build_windows_di
   -SourceCommit (git rev-parse HEAD)
 ```
 
-输出位于源码仓库的 `dist` 目录。构建脚本只复制已经编译的 payload、启动脚本、许可证和必要文档，并在压缩前检查 Python 源文件、数据库、日志、Cookie、Token 和密钥模式。
+输出位于源码仓库的 `dist` 目录。构建脚本只复制已经编译的 payload、快捷方式工具、许可证和必要文档，并在压缩前检查 Python 源文件、数据库、日志、Cookie、Token 和密钥模式。
 
 ## GitHub 发布
 

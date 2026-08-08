@@ -79,13 +79,15 @@ def test_distribution_guide_documents_recipient_and_github_workflows():
     text = GUIDE.read_text(encoding="utf-8")
 
     for phrase in (
-        "首次安装闲鱼自动发货.bat", "启动闲鱼自动发货.bat", "扫码登录", "GitHub",
+        "XianyuAutoDelivery.exe", "扫码登录", "GitHub",
         "源码仓库", "提交到 Git", "自己的闲鱼账号", "本地数据", "enabled: false",
         "dry_run: true", "低价验收", "Docker", "Cookie", "Token", "密码", "验证码",
         "完整敏感网盘链接",
     ):
         assert phrase in text, f"missing guide phrase: {phrase}"
 
+    assert "首次安装闲鱼自动发货.bat" not in text
+    assert "启动闲鱼自动发货.bat" not in text
     assert "C:\\Users\\" not in text
 
 

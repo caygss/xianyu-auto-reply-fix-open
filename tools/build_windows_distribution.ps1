@@ -122,19 +122,6 @@ try {
         Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $stagingRoot $requiredFile) -Force
     }
 
-    $launcherFiles = @(
-        Get-ChildItem -LiteralPath $repoRoot -Filter "*.bat" -File |
-            Where-Object {
-                [System.IO.File]::ReadAllText($_.FullName) -match "(?im)^.*XianyuAutoDelivery\.exe"
-            }
-    )
-    if ($launcherFiles.Count -ne 2) {
-        throw "Expected exactly two compiled-package launcher batch files, found $($launcherFiles.Count)."
-    }
-    foreach ($launcherFile in $launcherFiles) {
-        Copy-Item -LiteralPath $launcherFile.FullName -Destination (Join-Path $stagingRoot $launcherFile.Name) -Force
-    }
-
     $toolsRoot = Join-Path $stagingRoot "tools"
     New-Item -ItemType Directory -Path $toolsRoot -Force | Out-Null
     $shortcutTool = Join-Path $repoRoot "tools\create_desktop_shortcut.ps1"

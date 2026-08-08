@@ -8,31 +8,12 @@ function Stop-WithMessage([string]$message) {
     exit 1
 }
 
-$launcherCandidates = @(
-    Get-ChildItem -LiteralPath $projectRoot -Filter "*.bat" -File |
-        Where-Object {
-            $content = [System.IO.File]::ReadAllText($_.FullName)
-            # The startup launcher is the only batch file that starts the compiled EXE.
-            # Matching this behavior avoids confusing it with the first-run directory setup.
-            $content -match '(?im)^\s*start\s+""\s+/min\s+.*APP_EXE'
-        }
-)
-
-if ($launcherCandidates.Count -eq 0) {
-    Stop-WithMessage "No launcher batch file containing XianyuAutoDelivery.exe was found in $projectRoot."
-}
-
-if ($launcherCandidates.Count -ne 1) {
-    $names = ($launcherCandidates | ForEach-Object { $_.Name }) -join ", "
-    Stop-WithMessage "Expected exactly one launcher batch file containing XianyuAutoDelivery.exe, found $($launcherCandidates.Count): $names"
-}
-
-$launcherPath = [System.IO.Path]::GetFullPath($launcherCandidates[0].FullName)
+$executablePath = Join-Path $projectRoot "XianyuAutoDelivery.exe"
 $desktopPath = [Environment]::GetFolderPath("Desktop")
 $shortcutPath = Join-Path $desktopPath "Xianyu-Auto-Delivery.lnk"
 
-if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
-    Stop-WithMessage "Launcher not found: $launcherPath"
+if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
+    Stop-WithMessage "Application executable was not found: $executablePath"
 }
 
 if ([string]::IsNullOrWhiteSpace($desktopPath)) {
@@ -41,9 +22,9 @@ if ([string]::IsNullOrWhiteSpace($desktopPath)) {
 
 $shell = New-Object -ComObject WScript.Shell
 $link = $shell.CreateShortcut($shortcutPath)
-$link.TargetPath = $launcherPath
+$link.TargetPath = $executablePath
 $link.WorkingDirectory = $projectRoot
-$link.Description = "Start the Xianyu auto-delivery panel"
+$link.Description = "Open the Xianyu auto-delivery panel"
 $link.Save()
 
 Write-Host "Desktop shortcut created: $shortcutPath"

@@ -830,7 +830,11 @@ def build_republish_runtime(
 
 def _configured_api_port() -> int:
     api_conf = AUTO_REPLY.get('api', {})
-    port = int(os.getenv('API_PORT', '8090'))
+    environment_port = os.getenv('API_PORT')
+    if environment_port:
+        return int(environment_port)
+
+    port = 8090
     if 'port' in api_conf:
         port = int(api_conf['port'])
     elif 'url' in api_conf and 'host' not in api_conf and 'port' not in api_conf:

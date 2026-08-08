@@ -104,15 +104,14 @@ def test_installer_creates_runtime_directories_without_deleting_user_data():
     assert "del " not in installer
 
 
-def test_shortcut_uses_script_root_and_writes_only_to_current_users_desktop():
+def test_shortcut_uses_direct_executable_and_writes_only_to_current_users_desktop():
     shortcut = _read(SHORTCUT)
 
     assert "$PSScriptRoot" in shortcut
-    assert "Get-ChildItem" in shortcut
-    assert "*.bat" in shortcut
     assert "XianyuAutoDelivery.exe" in shortcut
-    assert "Count -eq 1" in shortcut or "Count -ne 1" in shortcut
-    assert "Launcher not found" in shortcut or "exactly one" in shortcut.lower()
+    assert "$link.TargetPath = $executablePath" in shortcut
+    assert "*.bat" not in shortcut
+    assert "Get-ChildItem" not in shortcut
     assert "CreateShortcut" in shortcut
     assert "Desktop" in shortcut
     assert "WorkingDirectory" in shortcut
