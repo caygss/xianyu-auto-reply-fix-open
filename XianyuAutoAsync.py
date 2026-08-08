@@ -24,7 +24,8 @@ from config import (
     TOKEN_REFRESH_INTERVAL, TOKEN_RETRY_INTERVAL,
     SESSION_KEEPALIVE_INTERVAL, SESSION_KEEPALIVE_RETRY_INTERVAL, COOKIES_STR,
     LOG_CONFIG, AUTO_REPLY, DEFAULT_HEADERS, WEBSOCKET_HEADERS,
-    APP_CONFIG, API_ENDPOINTS, YIFAN_API, RISK_CONTROL
+    APP_CONFIG, API_ENDPOINTS, YIFAN_API, RISK_CONTROL,
+    get_qr_login_grace_seconds
 )
 # from app.logging_config import setup_logging  # 已移除，模块不存在
 import sys
@@ -326,7 +327,7 @@ class XianyuLive:
 
     # 扫码登录后的短期缓冲状态：首轮 token 刷新命中风控时，先做浏览器侧稳定化再决定是否上滑块
     _qr_login_grace_state = {}  # {cookie_id: {'timestamp': float, 'captcha_buffer_used': bool, 'browser_stabilized': bool}}
-    _qr_login_grace_ttl = max(300, int(RISK_CONTROL.get('qr_login_grace_minutes', 15) or 15) * 60)
+    _qr_login_grace_ttl = get_qr_login_grace_seconds()
 
     @classmethod
     def _cleanup_auth_prewarmed_tokens(cls):
@@ -576,7 +577,7 @@ class XianyuLive:
 
     @classmethod
     def get_qr_login_grace_ttl_seconds(cls) -> int:
-        return max(300, int(RISK_CONTROL.get('qr_login_grace_minutes', 15) or 15) * 60)
+        return get_qr_login_grace_seconds()
 
     @classmethod
     def get_qr_login_grace(cls, cookie_id: str) -> Optional[Dict[str, Any]]:

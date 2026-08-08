@@ -123,11 +123,13 @@ YIFAN_API = config.get('YIFAN_API', {
     'callback_url': 'http://116.196.116.76/yifan.php',
     'query_url': 'http://116.196.116.76/yifan.php'
 })
+DEFAULT_QR_LOGIN_GRACE_MINUTES = 3
+MIN_QR_LOGIN_GRACE_MINUTES = 1
 RISK_CONTROL = config.get('RISK_CONTROL', {
     'night_mode_enabled': False,
     'night_start_hour': 1,
     'night_end_hour': 6,
-    'qr_login_grace_minutes': 15,
+    'qr_login_grace_minutes': DEFAULT_QR_LOGIN_GRACE_MINUTES,
     'night_keepalive_multiplier': 3,
     'night_cookie_refresh_multiplier': 2,
     'backoff_escalation_factor': 1.5,
@@ -142,6 +144,26 @@ RISK_CONTROL = config.get('RISK_CONTROL', {
     'soft_auth_token_preflight_timeout_seconds': 5.0,
     'soft_auth_token_preflight_qr_enabled': False,
 })
+
+
+def get_qr_login_grace_minutes() -> int:
+    configured_value = RISK_CONTROL.get(
+        'qr_login_grace_minutes',
+        DEFAULT_QR_LOGIN_GRACE_MINUTES,
+    )
+    if configured_value in (None, ''):
+        configured_value = DEFAULT_QR_LOGIN_GRACE_MINUTES
+    try:
+        configured_minutes = int(configured_value)
+    except (TypeError, ValueError):
+        configured_minutes = DEFAULT_QR_LOGIN_GRACE_MINUTES
+    return max(MIN_QR_LOGIN_GRACE_MINUTES, configured_minutes)
+
+
+def get_qr_login_grace_seconds() -> int:
+    return get_qr_login_grace_minutes() * 60
+
+
 _cookies_raw = config.get('COOKIES', [])
 if isinstance(_cookies_raw, list):
     COOKIES_LIST = _cookies_raw

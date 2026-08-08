@@ -30,7 +30,7 @@ from dataclasses import replace
 
 import cookie_manager
 from db_manager import db_manager
-from config import RISK_CONTROL
+from config import RISK_CONTROL, get_qr_login_grace_minutes
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
 from blacklist_service import blacklist_service
@@ -7980,7 +7980,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     real_cookies = updated_cookie_info['cookies_str']
                     log_with_user('info', f"已获取真实cookie，长度: {len(real_cookies)}", current_user)
 
-                    qr_login_grace_minutes = max(5, int(RISK_CONTROL.get('qr_login_grace_minutes', 15) or 15))
+                    qr_login_grace_minutes = get_qr_login_grace_minutes()
                     qr_login_grace_until = time.time() + (qr_login_grace_minutes * 60)
                     task_restarted = False
                     warning_message = None

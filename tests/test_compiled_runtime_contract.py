@@ -1,6 +1,8 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import Start
+import runtime_paths
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +18,27 @@ def test_compiled_spec_includes_runtime_javascript_files():
     assert '"gen_tfstk.js"' in text
     assert '"et_f.js"' in text
     assert '"utils"' in text
+
+
+def test_compiled_executable_uses_windowed_mode_without_a_terminal():
+    text = SPEC.read_text(encoding="utf-8")
+
+    assert "console=False" in text
+    assert "console=True" not in text
+
+
+def test_windowed_runtime_replaces_missing_standard_streams():
+    ensure_streams = getattr(runtime_paths, "ensure_standard_streams", None)
+    assert callable(ensure_streams)
+
+    streams = SimpleNamespace(stdout=None, stderr=None)
+    ensure_streams(streams)
+    try:
+        assert streams.stdout.write("stdout") == len("stdout")
+        assert streams.stderr.write("stderr") == len("stderr")
+    finally:
+        streams.stdout.close()
+        streams.stderr.close()
 
 
 def test_frozen_entrypoint_anchors_relative_runtime_data_to_package_root():

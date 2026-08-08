@@ -12,6 +12,9 @@ import inspect
 import math
 from pathlib import Path
 from typing import Any, Mapping
+from runtime_paths import ensure_standard_streams
+
+ensure_standard_streams()
 
 if getattr(sys, 'frozen', False):
     os.environ.setdefault('XIANYU_APP_ROOT', str(Path(sys.executable).resolve().parent))
