@@ -38,8 +38,10 @@ let guidedSetupState = {
     runtimeStatus: null,
     scanStarted: false,
     hiddenByUser: false,
+    requestDepth: 0,
     requestInFlight: false,
     expiredDeadline: '',
+    errorMessage: '',
 };
 const DASHBOARD_ANNOUNCEMENT_DISMISS_PREFIX = 'dashboard_announcement_dismissed_';
 let dashboardAnnouncementState = {
@@ -63,6 +65,16 @@ function getGuidedSetupElements() {
         error: document.getElementById('guidedSetupError'),
         technical: document.getElementById('guidedSetupTechnicalText'),
     };
+}
+
+function beginGuidedSetupRequest() {
+    guidedSetupState.requestDepth = Math.max(0, Number(guidedSetupState.requestDepth) || 0) + 1;
+    guidedSetupState.requestInFlight = true;
+}
+
+function endGuidedSetupRequest() {
+    guidedSetupState.requestDepth = Math.max(0, (Number(guidedSetupState.requestDepth) || 0) - 1);
+    guidedSetupState.requestInFlight = guidedSetupState.requestDepth > 0;
 }
 
 function getGuidedSetupAccounts(payload) {
@@ -435,8 +447,9 @@ function renderGuidedSetupStatus() {
     elements.message.textContent = copy.message;
     elements.notice.textContent = copy.notice;
     elements.technical.textContent = guidedStatus.technical_detail || '连接状态会在这里显示。';
-    elements.error.hidden = true;
-    elements.error.textContent = '';
+    const errorMessage = String(guidedSetupState.errorMessage || '').trim();
+    elements.error.hidden = !errorMessage;
+    elements.error.textContent = errorMessage;
 
     elements.steps?.querySelectorAll('[data-guided-step]').forEach(item => {
         const itemStep = Number(item.dataset.guidedStep || 0);
@@ -602,7 +615,9 @@ async function navigateGuidedSetupAction(action, accountId, guidedStatus) {
 async function loadGuidedSetupStatus(options = {}) {
     if (guidedSetupState.requestInFlight && !options.force) return;
     if (!document.getElementById('guidedSetupPanel')) return;
-    guidedSetupState.requestInFlight = true;
+    beginGuidedSetupRequest();
+    guidedSetupState.errorMessage = '';
+    renderGuidedSetupStatus();
     try {
         const payload = await fetchJSON(`${apiBase}${GUIDED_SETUP_STATUS_ENDPOINT}`);
         guidedSetupState.accounts = getGuidedSetupAccounts(payload);
@@ -616,16 +631,11 @@ async function loadGuidedSetupStatus(options = {}) {
         }
         renderGuidedSetupStatus();
     } catch (error) {
-        const { error: errorElement, panel, reopen } = getGuidedSetupElements();
-        if (panel && !guidedSetupState.hiddenByUser) panel.hidden = false;
-        if (reopen) reopen.hidden = guidedSetupState.hiddenByUser;
-        if (errorElement) {
-            errorElement.hidden = false;
-            errorElement.textContent = '暂时无法读取登录状态，请稍后重新检查。';
-        }
+        guidedSetupState.errorMessage = '暂时无法读取登录状态，请稍后重新检查。';
         scheduleGuidedSetupPoll();
     } finally {
-        guidedSetupState.requestInFlight = false;
+        endGuidedSetupRequest();
+        renderGuidedSetupStatus();
     }
 }
 
@@ -637,6 +647,7 @@ async function handleGuidedSetupAction(action) {
 
     if (selectedAction === 'start_scan') {
         guidedSetupState.scanStarted = true;
+        guidedSetupState.errorMessage = '';
         renderGuidedSetupStatus();
         showQRCodeLogin();
         return;
@@ -653,7 +664,8 @@ async function handleGuidedSetupAction(action) {
         renderGuidedSetupStatus();
         return;
     }
-    guidedSetupState.requestInFlight = true;
+    beginGuidedSetupRequest();
+    guidedSetupState.errorMessage = '';
     renderGuidedSetupStatus();
     try {
         const response = await fetchJSON(`${apiBase}${GUIDED_SETUP_ACTION_ENDPOINT}`, {
@@ -672,13 +684,9 @@ async function handleGuidedSetupAction(action) {
             toggleGuidedSetup(false);
         }
     } catch (error) {
-        const { error: errorElement } = getGuidedSetupElements();
-        if (errorElement) {
-            errorElement.hidden = false;
-            errorElement.textContent = '操作没有完成，请保持浏览器窗口打开后重新检查。';
-        }
+        guidedSetupState.errorMessage = '操作没有完成，请保持浏览器窗口打开后重新检查。';
     } finally {
-        guidedSetupState.requestInFlight = false;
+        endGuidedSetupRequest();
         renderGuidedSetupStatus();
     }
 }

@@ -14,7 +14,18 @@ function extractFunction(name) {
   const match = new RegExp(`(?:async\\s+)?function ${name}\\(`).exec(appSource);
   assert.ok(match, `${name} must exist in app.js`);
   const start = match.index;
-  const brace = appSource.indexOf('{', start);
+  const parametersStart = appSource.indexOf('(', start);
+  let parameterDepth = 0;
+  let parametersEnd = -1;
+  for (let index = parametersStart; index < appSource.length; index += 1) {
+    if (appSource[index] === '(') parameterDepth += 1;
+    if (appSource[index] === ')' && --parameterDepth === 0) {
+      parametersEnd = index;
+      break;
+    }
+  }
+  assert.notEqual(parametersEnd, -1, `could not parse ${name} parameters`);
+  const brace = appSource.indexOf('{', parametersEnd);
   let depth = 0;
   for (let index = brace; index < appSource.length; index += 1) {
     if (appSource[index] === '{') depth += 1;
@@ -132,7 +143,12 @@ function createHandlerHarness(response) {
       'go_to_delivery_config',
       'go_to_republish_config',
     ]);
-    const guidedSetupState = { requestInFlight: false, guidedStatus: null };
+    const guidedSetupState = {
+      requestDepth: 0,
+      requestInFlight: false,
+      errorMessage: '',
+      guidedStatus: null,
+    };
     let allItemsData = [{ cookie_id: 'account-A', item_id: 'item-1', item_title: '商品 1' }];
     let filteredItemsData = allItemsData;
     let itemsPerPage = 20;
@@ -165,6 +181,8 @@ function createHandlerHarness(response) {
     ${extractFunction('findGuidedSetupTargetRow')}
     ${extractFunction('shouldNavigateGuidedSetupAction')}
     ${extractFunction('navigateGuidedSetupAction')}
+    ${extractFunction('beginGuidedSetupRequest')}
+    ${extractFunction('endGuidedSetupRequest')}
     ${extractFunction('handleGuidedSetupAction')}
     globalThis.guidedHandlerApi = { handleGuidedSetupAction };
   `, sandbox);
@@ -173,6 +191,149 @@ function createHandlerHarness(response) {
     api: sandbox.guidedHandlerApi,
     events,
   };
+}
+
+function createStatusHarness(fetchJSON = async () => ({ accounts: [] })) {
+  const elements = {
+    panel: { hidden: false },
+    reopen: { hidden: true },
+    account: { textContent: '' },
+    steps: { querySelectorAll: () => [] },
+    step: { textContent: '' },
+    title: { textContent: '' },
+    message: { textContent: '' },
+    notice: { textContent: '' },
+    primary: { hidden: false, disabled: false, textContent: '', dataset: {} },
+    secondary: { hidden: true, disabled: false, textContent: '', dataset: {} },
+    countdown: { hidden: true, textContent: '' },
+    error: { hidden: true, textContent: '' },
+    technical: { textContent: '' },
+  };
+  const sandbox = {
+    __elements: elements,
+    __fetchJSON: fetchJSON,
+  };
+
+  vm.runInNewContext(`
+    const apiBase = '';
+    const GUIDED_SETUP_STATUS_ENDPOINT = '/setup/status';
+    const guidedSetupState = {
+      requestDepth: 0,
+      requestInFlight: false,
+      errorMessage: '',
+      accounts: [],
+      selectedAccountId: '',
+      guidedStatus: null,
+      runtimeStatus: null,
+      expiredDeadline: '',
+      hiddenByUser: false,
+    };
+    const document = {
+      getElementById: (id) => id === 'guidedSetupPanel' ? globalThis.__elements.panel : null,
+    };
+    const fetchJSON = (...args) => globalThis.__fetchJSON(...args);
+    const getGuidedSetupAccounts = (value) => value.accounts || [];
+    const getGuidedSetupAccount = () => null;
+    const getGuidedDeadlineSeconds = () => 0;
+    const getGuidedSetupElements = () => globalThis.__elements;
+    const getGuidedSetupStatusViewModel = () => ({
+      step: 1,
+      showPrimaryAction: true,
+      action: 'start_scan',
+    });
+    const getGuidedSetupCopy = () => ({
+      title: '准备登录',
+      message: '请打开闲鱼 App。',
+      notice: '不要重复扫码。',
+    });
+    const startGuidedSetupCountdown = () => undefined;
+    const scheduleGuidedSetupPoll = () => undefined;
+    ${extractFunction('beginGuidedSetupRequest')}
+    ${extractFunction('endGuidedSetupRequest')}
+    ${extractFunction('renderGuidedSetupStatus')}
+    ${extractFunction('loadGuidedSetupStatus')}
+    globalThis.guidedStatusApi = {
+      loadGuidedSetupStatus,
+      renderGuidedSetupStatus,
+    };
+  `, sandbox);
+
+  return {
+    api: sandbox.guidedStatusApi,
+    elements,
+  };
+}
+
+function createHandlerStatusHarness(statusResponse) {
+  let fetchCount = 0;
+  const elements = {
+    panel: { hidden: false },
+    reopen: { hidden: true },
+    account: { textContent: '' },
+    steps: { querySelectorAll: () => [] },
+    step: { textContent: '' },
+    title: { textContent: '' },
+    message: { textContent: '' },
+    notice: { textContent: '' },
+    primary: { hidden: false, disabled: false, textContent: '', dataset: {} },
+    secondary: { hidden: true, disabled: false, textContent: '', dataset: {} },
+    countdown: { hidden: true, textContent: '' },
+    error: { hidden: true, textContent: '' },
+    technical: { textContent: '' },
+  };
+  const sandbox = {
+    __elements: elements,
+    __fetchJSON: async () => {
+      fetchCount += 1;
+      if (fetchCount === 1) {
+        return { success: true, action: 'refresh_status', guided_status: { primary_action: 'refresh_status' } };
+      }
+      return statusResponse;
+    },
+  };
+
+  vm.runInNewContext(`
+    const apiBase = '';
+    const GUIDED_SETUP_STATUS_ENDPOINT = '/setup/status';
+    const GUIDED_SETUP_ACTION_ENDPOINT = '/setup/action';
+    const guidedSetupState = {
+      requestDepth: 0,
+      requestInFlight: false,
+      errorMessage: '',
+      accounts: [],
+      selectedAccountId: 'account-A',
+      guidedStatus: null,
+      runtimeStatus: null,
+      expiredDeadline: '',
+      hiddenByUser: false,
+    };
+    const document = {
+      getElementById: (id) => id === 'guidedSetupPanel' ? globalThis.__elements.panel : null,
+    };
+    const fetchJSON = (...args) => globalThis.__fetchJSON(...args);
+    const getGuidedSetupElements = () => globalThis.__elements;
+    const getGuidedSetupAccount = () => ({ id: 'account-A', guidedStatus: null, runtimeStatus: null });
+    const getGuidedSetupAccounts = (value) => value.accounts || [];
+    const getGuidedDeadlineSeconds = () => 0;
+    const getGuidedSetupStatusViewModel = () => ({ step: 5, showPrimaryAction: true, action: 'refresh_status' });
+    const getGuidedSetupCopy = () => ({ title: '检查状态', message: '请稍候。', notice: '窗口保持打开。' });
+    const startGuidedSetupCountdown = () => undefined;
+    const scheduleGuidedSetupPoll = () => undefined;
+    const shouldNavigateGuidedSetupAction = () => false;
+    const navigateGuidedSetupAction = async () => undefined;
+    const isGuidedRuntimeReady = () => false;
+    ${extractFunction('beginGuidedSetupRequest')}
+    ${extractFunction('endGuidedSetupRequest')}
+    ${extractFunction('renderGuidedSetupStatus')}
+    ${extractFunction('loadGuidedSetupStatus')}
+    ${extractFunction('handleGuidedSetupAction')}
+    globalThis.guidedHandlerStatusApi = {
+      handleGuidedSetupAction,
+      depth: () => guidedSetupState.requestDepth,
+    };
+  `, sandbox);
+
+  return { api: sandbox.guidedHandlerStatusApi, elements };
 }
 
 test('CommonJS app export exposes guided setup navigation behavior', () => {
@@ -201,6 +362,48 @@ test('CommonJS app export exposes guided setup navigation behavior', () => {
     encoding: 'utf8',
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
+test('status load disables the real primary button while pending and restores it after completion', async () => {
+  let resolveFetch;
+  const response = new Promise((resolve) => { resolveFetch = resolve; });
+  const harness = createStatusHarness(() => response);
+
+  const pending = harness.api.loadGuidedSetupStatus();
+  assert.equal(harness.elements.primary.disabled, true);
+
+  resolveFetch({ accounts: [] });
+  await pending;
+
+  assert.equal(harness.elements.primary.disabled, false);
+});
+
+test('status load keeps its Chinese error visible after releasing the busy state', async () => {
+  const harness = createStatusHarness(async () => { throw new Error('offline'); });
+
+  await harness.api.loadGuidedSetupStatus();
+
+  assert.equal(harness.elements.primary.disabled, false);
+  assert.equal(harness.elements.error.hidden, false);
+  assert.match(harness.elements.error.textContent, /[\u3400-\u9fff]/);
+});
+
+test('real guided action keeps the button locked through its nested forced status refresh', async () => {
+  let resolveStatus;
+  const statusResponse = new Promise((resolve) => { resolveStatus = resolve; });
+  const harness = createHandlerStatusHarness(statusResponse);
+
+  const pending = harness.api.handleGuidedSetupAction('refresh_status');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(harness.api.depth(), 2);
+  assert.equal(harness.elements.primary.disabled, true);
+
+  resolveStatus({ accounts: [] });
+  await pending;
+
+  assert.equal(harness.api.depth(), 0);
+  assert.equal(harness.elements.primary.disabled, false);
 });
 
 test('waits for showSection before loading the cookie and opening delivery config', async () => {

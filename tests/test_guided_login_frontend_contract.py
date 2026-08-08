@@ -68,7 +68,7 @@ def test_waiting_states_use_server_actionability_and_keep_waiting_without_rechec
 def test_finish_action_waits_for_server_acceptance_before_hiding_wizard():
     assert "response?.success === true" in APP
     handler_start = APP.index("async function handleGuidedSetupAction")
-    request_start = APP.index("guidedSetupState.requestInFlight = true", handler_start)
+    request_start = APP.index("beginGuidedSetupRequest()", handler_start)
     preflight = APP[handler_start:request_start]
     assert "toggleGuidedSetup(false)" not in preflight
 
